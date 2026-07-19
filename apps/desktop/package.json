@@ -12,6 +12,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@bioworld/contracts": "workspace:*",
+    "@bufbuild/protobuf": "2.12.1",
     "@tauri-apps/api": "2.11.1",
     "react": "19.2.7",
     "react-dom": "19.2.7"
