@@ -60,6 +60,39 @@ fn rejects_decision_without_rationale() {
 }
 
 #[test]
+fn rejects_decision_with_only_blank_rationale() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    assert_eq!(
+        DecisionRecord::try_new(
+            Uuid::now_v7(),
+            "COU-001".to_owned(),
+            Recommendation::Abstain,
+            evidence,
+            vec!["  ".to_owned(), "\t".to_owned()],
+        ),
+        Err(bioworld_domain::DomainError::MissingRationale),
+    );
+}
+
+#[test]
+fn accepts_decision_with_at_least_one_nonblank_rationale() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    let decision = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        vec!["  ".to_owned(), "Evidence is incomplete.".to_owned()],
+    );
+
+    assert!(decision.is_ok());
+}
+
+#[test]
 fn rejects_decision_json_with_invalid_evidence_digest() {
     let json = serde_json::json!({
         "id": Uuid::now_v7(),

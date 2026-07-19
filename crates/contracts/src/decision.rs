@@ -1,0 +1,134 @@
+use std::num::NonZeroU64;
+
+use bioworld_domain::{
+    DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
+    Recommendation as DomainRecommendation,
+};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::v2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionedDecisionRecord {
+    decision: DomainDecisionRecord,
+    aggregate_version: NonZeroU64,
+}
+
+impl VersionedDecisionRecord {
+    pub fn new(decision: DomainDecisionRecord, aggregate_version: NonZeroU64) -> Self {
+        Self {
+            decision,
+            aggregate_version,
+        }
+    }
+
+    pub fn decision(&self) -> &DomainDecisionRecord {
+        &self.decision
+    }
+
+    pub fn aggregate_version(&self) -> NonZeroU64 {
+        self.aggregate_version
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DecisionContractError {
+    #[error("decision_id must be a UUID")]
+    InvalidDecisionId,
+    #[error("cou_id is required")]
+    MissingCouId,
+    #[error("evidence is required")]
+    MissingEvidence,
+    #[error("evidence id is required")]
+    MissingEvidenceId,
+    #[error("legacy evidence_snapshot_id conflicts with evidence.id")]
+    ConflictingEvidenceIds,
+    #[error("aggregate_version must be greater than zero")]
+    InvalidAggregateVersion,
+    #[error("recommendation must not be unspecified")]
+    UnspecifiedRecommendation,
+    #[error("recommendation value {0} is unknown")]
+    UnknownRecommendation(i32),
+    #[error(transparent)]
+    InvalidDomain(#[from] DomainError),
+}
+
+#[allow(deprecated)]
+impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
+    type Error = DecisionContractError;
+
+    fn try_from(value: v2::DecisionRecord) -> Result<Self, Self::Error> {
+        let decision_id =
+            Uuid::parse_str(&value.decision_id).map_err(|_| Self::Error::InvalidDecisionId)?;
+        if value.cou_id.trim().is_empty() {
+            return Err(Self::Error::MissingCouId);
+        }
+
+        let evidence = value.evidence.ok_or(Self::Error::MissingEvidence)?;
+        if evidence.id.trim().is_empty() {
+            return Err(Self::Error::MissingEvidenceId);
+        }
+        if !value.evidence_snapshot_id.is_empty() && value.evidence_snapshot_id != evidence.id {
+            return Err(Self::Error::ConflictingEvidenceIds);
+        }
+
+        let aggregate_version =
+            NonZeroU64::new(value.aggregate_version).ok_or(Self::Error::InvalidAggregateVersion)?;
+        let recommendation = recommendation_from_wire(value.recommendation)?;
+        let evidence = EvidenceSnapshotRef::try_new(evidence.id, evidence.sha256)?;
+        let decision = DomainDecisionRecord::try_new(
+            decision_id,
+            value.cou_id,
+            recommendation,
+            evidence,
+            value.rationale,
+        )?;
+
+        Ok(Self::new(decision, aggregate_version))
+    }
+}
+
+#[allow(deprecated)]
+impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
+    fn from(value: &VersionedDecisionRecord) -> Self {
+        let decision = value.decision();
+        let evidence = decision.evidence();
+
+        Self {
+            decision_id: decision.id().to_string(),
+            cou_id: decision.cou_id().to_owned(),
+            evidence_snapshot_id: evidence.id().to_owned(),
+            recommendation: recommendation_to_wire(decision.recommendation()) as i32,
+            rationale: decision.rationale().to_vec(),
+            aggregate_version: value.aggregate_version().get(),
+            evidence: Some(v2::EvidenceSnapshotRef {
+                id: evidence.id().to_owned(),
+                sha256: evidence.sha256().to_owned(),
+            }),
+        }
+    }
+}
+
+fn recommendation_from_wire(value: i32) -> Result<DomainRecommendation, DecisionContractError> {
+    match v2::Recommendation::try_from(value)
+        .map_err(|_| DecisionContractError::UnknownRecommendation(value))?
+    {
+        v2::Recommendation::Unspecified => Err(DecisionContractError::UnspecifiedRecommendation),
+        v2::Recommendation::Promote => Ok(DomainRecommendation::Promote),
+        v2::Recommendation::Reject => Ok(DomainRecommendation::Reject),
+        v2::Recommendation::Abstain => Ok(DomainRecommendation::Abstain),
+        v2::Recommendation::Defer => Ok(DomainRecommendation::Defer),
+        v2::Recommendation::StopProgram => Ok(DomainRecommendation::StopProgram),
+    }
+}
+
+fn recommendation_to_wire(value: &DomainRecommendation) -> v2::Recommendation {
+    match value {
+        DomainRecommendation::Promote => v2::Recommendation::Promote,
+        DomainRecommendation::Reject => v2::Recommendation::Reject,
+        DomainRecommendation::Abstain => v2::Recommendation::Abstain,
+        DomainRecommendation::Defer => v2::Recommendation::Defer,
+        DomainRecommendation::StopProgram => v2::Recommendation::StopProgram,
+    }
+}
