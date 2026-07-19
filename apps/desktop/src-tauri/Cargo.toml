@@ -1,0 +1,14 @@
+[package]
+name = "bioworld-desktop"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tauri = { version = "2.11.2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+bioworld-domain = { path = "../../../crates/domain" }
+bioworld-desktop-core = { path = "../../../crates/desktop-core" }
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }

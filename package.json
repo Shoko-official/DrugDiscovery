@@ -1,0 +1,9 @@
+{
+  "name": "bioworld-decision-os",
+  "private": true,
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "desktop:dev": "pnpm --filter @bioworld/desktop dev",
+    "desktop:build": "pnpm --filter @bioworld/desktop build"
+  }
+}

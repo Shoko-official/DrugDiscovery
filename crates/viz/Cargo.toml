@@ -1,0 +1,11 @@
+[package]
+name = "bioworld-viz"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+wgpu-backend = ["dep:wgpu"]
+
+[dependencies]
+wgpu = { version = "30", optional = true }

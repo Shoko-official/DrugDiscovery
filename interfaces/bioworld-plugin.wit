@@ -1,0 +1,16 @@
+package bioworld:plugin@2.0.0;
+
+interface evidence {
+  record artifact-ref { id: string, sha256: string }
+  list-scoped-artifacts: func(project-id: string) -> list<artifact-ref>;
+}
+
+interface annotations {
+  write-draft: func(project-id: string, body: string) -> result<string, string>;
+}
+
+world bioworld-plugin {
+  import evidence;
+  import annotations;
+  export run: func(input: string) -> result<string, string>;
+}

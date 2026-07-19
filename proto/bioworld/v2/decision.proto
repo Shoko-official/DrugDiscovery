@@ -1,0 +1,34 @@
+syntax = "proto3";
+package bioworld.v2;
+
+service DecisionService {
+  rpc GetDecision(GetDecisionRequest) returns (DecisionRecord);
+  rpc ProposeDecision(ProposeDecisionRequest) returns (DecisionRecord);
+  rpc WatchDecision(WatchDecisionRequest) returns (stream DecisionEvent);
+}
+
+message GetDecisionRequest { string decision_id = 1; }
+message ProposeDecisionRequest {
+  string idempotency_key = 1;
+  string cou_id = 2;
+  string evidence_snapshot_id = 3;
+  Recommendation recommendation = 4;
+  repeated string rationale = 5;
+}
+message WatchDecisionRequest { string decision_id = 1; }
+message DecisionRecord {
+  string decision_id = 1;
+  string cou_id = 2;
+  string evidence_snapshot_id = 3;
+  Recommendation recommendation = 4;
+  repeated string rationale = 5;
+  uint64 aggregate_version = 6;
+}
+message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
+enum Recommendation {
+  RECOMMENDATION_UNSPECIFIED = 0;
+  RECOMMENDATION_PROMOTE = 1;
+  RECOMMENDATION_REJECT = 2;
+  RECOMMENDATION_ABSTAIN = 3;
+  RECOMMENDATION_DEFER = 4;
+}
