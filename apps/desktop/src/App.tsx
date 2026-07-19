@@ -1,27 +1,44 @@
-import React from "react";
+import { useState } from "react";
+import {
+  DecisionReview,
+  type DecisionReviewState,
+} from "./decision-review/DecisionReview";
+import { decisionPreviewFixture } from "./decision-review/decisionReviewFixture";
 
-type DecisionSummary = {
-  decisionId: string;
-  recommendation: "promote" | "reject" | "abstain" | "defer";
-  oodStatus: "in_domain" | "borderline" | "out_of_domain" | "unknown";
-  evidenceSnapshotId: string;
-};
+function initialDecisionReviewState(): DecisionReviewState {
+  if (!import.meta.env.DEV) {
+    return decisionPreviewFixture;
+  }
+
+  const requestedState = new URLSearchParams(window.location.search).get("state");
+  switch (requestedState) {
+    case "loading":
+      return { kind: "loading" };
+    case "empty":
+      return { kind: "empty" };
+    case "error":
+      return {
+        kind: "error",
+        message: "The local preview fixture could not be loaded.",
+      };
+    default:
+      return decisionPreviewFixture;
+  }
+}
 
 export function App(): React.JSX.Element {
-  const summary: DecisionSummary = {
-    decisionId: "DEC-001",
-    recommendation: "abstain",
-    oodStatus: "unknown",
-    evidenceSnapshotId: "ES-001",
-  };
+  const [state, setState] = useState<DecisionReviewState>(
+    initialDecisionReviewState,
+  );
+
   return (
-    <main aria-labelledby="app-title">
-      <h1 id="app-title">BioWorld Decision OS</h1>
-      <section aria-label="Decision status">
-        <strong>{summary.recommendation}</strong>
-        <span>OOD: {summary.oodStatus}</span>
-        <button type="button">Open evidence {summary.evidenceSnapshotId}</button>
-      </section>
-    </main>
+    <DecisionReview
+      state={state}
+      onRetry={
+        state.kind === "error"
+          ? () => setState(decisionPreviewFixture)
+          : undefined
+      }
+    />
   );
 }
