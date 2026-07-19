@@ -130,7 +130,11 @@ impl DecisionRecord {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.rationale.is_empty() {
+        if self
+            .rationale
+            .iter()
+            .all(|rationale| rationale.trim().is_empty())
+        {
             return Err(DomainError::MissingRationale);
         }
         self.evidence.validate()

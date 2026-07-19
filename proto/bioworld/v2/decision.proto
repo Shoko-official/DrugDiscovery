@@ -16,13 +16,18 @@ message ProposeDecisionRequest {
   repeated string rationale = 5;
 }
 message WatchDecisionRequest { string decision_id = 1; }
+message EvidenceSnapshotRef {
+  string id = 1;
+  string sha256 = 2;
+}
 message DecisionRecord {
   string decision_id = 1;
   string cou_id = 2;
-  string evidence_snapshot_id = 3;
+  string evidence_snapshot_id = 3 [deprecated = true];
   Recommendation recommendation = 4;
   repeated string rationale = 5;
   uint64 aggregate_version = 6;
+  EvidenceSnapshotRef evidence = 7;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {
@@ -31,4 +36,5 @@ enum Recommendation {
   RECOMMENDATION_REJECT = 2;
   RECOMMENDATION_ABSTAIN = 3;
   RECOMMENDATION_DEFER = 4;
+  RECOMMENDATION_STOP_PROGRAM = 5;
 }

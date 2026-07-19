@@ -1,0 +1,17 @@
+[package]
+name = "bioworld-contracts"
+version = "0.1.0"
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+bioworld-domain = { path = "../domain" }
+prost.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
