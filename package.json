@@ -7,7 +7,12 @@
     "contracts:check-generated": "node tools/check-generated-contracts.mjs",
     "contracts:generate": "buf generate",
     "desktop:dev": "corepack pnpm --filter @bioworld/desktop dev",
-    "desktop:build": "corepack pnpm --filter @bioworld/desktop build"
+    "desktop:build": "corepack pnpm --filter @bioworld/desktop build",
+    "desktop:icons:check": "node tools/validate-tauri-icons.mjs",
+    "desktop:tools:test": "node --test tools/native-desktop.test.mjs tools/tauri-icons.test.mjs",
+    "desktop:native:preflight": "node tools/native-desktop.mjs preflight",
+    "desktop:native:check": "node tools/native-desktop.mjs check",
+    "desktop:native:build": "node tools/native-desktop.mjs build"
   },
   "devDependencies": {
     "@bufbuild/buf": "1.72.0",
