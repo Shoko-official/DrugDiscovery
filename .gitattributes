@@ -5,3 +5,5 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+
+packages/contracts/src/gen/** whitespace=-blank-at-eof

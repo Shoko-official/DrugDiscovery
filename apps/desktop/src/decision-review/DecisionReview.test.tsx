@@ -63,4 +63,21 @@ describe("DecisionReview", () => {
     expect(markup).toContain("Evidence contents unavailable in preview.");
     expect(markup).not.toContain("Open evidence");
   });
+
+  it("renders the stop_program recommendation", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "preview",
+          decision: {
+            ...decisionPreviewFixture.decision,
+            recommendation: "stop_program",
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Stop program");
+    expect(markup).toContain('status status--negative">Stop program');
+  });
 });

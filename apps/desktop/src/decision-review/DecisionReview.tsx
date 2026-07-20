@@ -1,6 +1,11 @@
 import React from "react";
 
-export type Recommendation = "promote" | "reject" | "abstain" | "defer";
+export type Recommendation =
+  | "promote"
+  | "reject"
+  | "abstain"
+  | "defer"
+  | "stop_program";
 
 export type DomainAssessment =
   | "in_domain"
@@ -31,6 +36,7 @@ const recommendationLabels: Record<Recommendation, string> = {
   reject: "Reject",
   abstain: "Abstain",
   defer: "Defer",
+  stop_program: "Stop program",
 };
 
 const recommendationTones: Record<Recommendation, string> = {
@@ -38,6 +44,7 @@ const recommendationTones: Record<Recommendation, string> = {
   reject: "negative",
   abstain: "caution",
   defer: "neutral",
+  stop_program: "negative",
 };
 
 const assessmentLabels: Record<DomainAssessment, string> = {
