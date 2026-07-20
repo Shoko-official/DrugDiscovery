@@ -205,6 +205,43 @@ function operationResult(kind) {
   return result(0);
 }
 
+function assertRunsAllPostgresIntegrationTests(args) {
+  const cargoIndex = args.lastIndexOf("cargo");
+  assert.notEqual(cargoIndex, -1);
+  const cargoArgs = args.slice(cargoIndex + 1);
+  assert.equal(cargoArgs[0], "test");
+  const packageIndex = ["-p", "--package"]
+    .map((flag) => cargoArgs.lastIndexOf(flag))
+    .find((index) => index >= 0);
+  assert.notEqual(packageIndex, undefined);
+  assert.equal(
+    cargoArgs[packageIndex + 1],
+    "bioworld-event-store-postgres",
+  );
+
+  const namedTests = [];
+  for (let index = 0; index < cargoArgs.length; index += 1) {
+    if (cargoArgs[index] === "--test") {
+      namedTests.push(cargoArgs[index + 1]);
+    }
+  }
+
+  const runsAllPackageTargets =
+    !cargoArgs.includes("--test") &&
+    !cargoArgs.some((argument) =>
+      ["--lib", "--bins", "--examples", "--doc"].includes(argument),
+    );
+  const runsAllIntegrationTargets = cargoArgs.includes("--tests");
+  const runsBothNamedTargets =
+    namedTests.includes("postgres_writer") &&
+    namedTests.includes("postgres_reader");
+
+  assert.ok(
+    runsAllPackageTargets || runsAllIntegrationTargets || runsBothNamedTargets,
+    "cargo test command must cover postgres_writer and postgres_reader",
+  );
+}
+
 function runOptions(runCommand, time = clock(), overrides = {}) {
   return {
     migrations,
@@ -233,7 +270,28 @@ test("pins the exact Rust 1.95 Bookworm integration image digest", () => {
   assert.equal(RUST_INTEGRATION_IMAGE, EXPECTED_RUST_IMAGE);
 });
 
-test("builds writer tests without credentials and runs them only beside PostgreSQL", async () => {
+test("requires the exact event store package for PostgreSQL integration tests", () => {
+  assert.throws(() =>
+    assertRunsAllPostgresIntegrationTests([
+      "cargo",
+      "test",
+      "--package",
+      "different-package",
+      "--tests",
+    ]),
+  );
+  assert.doesNotThrow(() =>
+    assertRunsAllPostgresIntegrationTests([
+      "cargo",
+      "test",
+      "--package",
+      "bioworld-event-store-postgres",
+      "--tests",
+    ]),
+  );
+});
+
+test("builds PostgreSQL integration tests without credentials and runs them only beside PostgreSQL", async () => {
   const calls = [];
   const runCommand = async (command, args, options = {}) => {
     calls.push({ command, args, options });
@@ -300,6 +358,14 @@ test("builds writer tests without credentials and runs them only beside PostgreS
   assert.match(sourceCommand, /Cargo\.toml Cargo\.lock rust-toolchain\.toml/);
   assert.match(sourceCommand, /apps\/desktop\/src-tauri crates proto/);
   assert.match(sourceCommand, /tar --extract --no-same-owner/);
+  assert.match(
+    sourceCommand,
+    /crates\/event-store-postgres\/tests\/postgres_writer\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/event-store-postgres\/tests\/postgres_reader\.rs/,
+  );
 
   const fetch = calls.find(
     ({ args, options }) => commandKind(args, options) === "writer-fetch",
@@ -330,6 +396,7 @@ test("builds writer tests without credentials and runs them only beside PostgreS
   assert.ok(build.args.includes("RUSTUP_TOOLCHAIN=1.95.0"));
   assert.ok(build.args.includes("--offline"));
   assert.ok(build.args.includes("--no-run"));
+  assertRunsAllPostgresIntegrationTests(build.args);
   assert.equal(build.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD, undefined);
   assert.equal(build.options.env.POSTGRES_PASSWORD, undefined);
   assert.equal(build.options.env.PGPASSWORD, undefined);
@@ -352,10 +419,18 @@ test("builds writer tests without credentials and runs them only beside PostgreS
   assert.ok(runtime.args.includes("--offline"));
   assert.ok(!runtime.args.includes("--publish"));
   assert.ok(!runtime.args.includes("-p"));
+  assertRunsAllPostgresIntegrationTests(runtime.args);
   assert.equal(
     runtime.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD,
     WRITER_PASSWORD,
   );
+
+  for (const integrationCall of [sourceStage, fetch, build]) {
+    assert.equal(
+      integrationCall.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD,
+      undefined,
+    );
+  }
 
   const serializedArguments = calls
     .flatMap(({ args }) => args)

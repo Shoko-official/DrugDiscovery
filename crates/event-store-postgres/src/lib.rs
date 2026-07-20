@@ -1,5 +1,9 @@
 #![deny(unsafe_code)]
 
+mod reader;
+
+pub use reader::{PostgresDecisionEventReader, ReadDecisionEventError};
+
 use bioworld_contracts::v2::DecisionEvent;
 use bioworld_event_store_contracts::{
     DecisionEventMetadata, ScientificEventRow, project_decision_event,
@@ -153,7 +157,7 @@ async fn append_in_transaction(
     Ok(())
 }
 
-async fn verify_writer_identity(
+pub(crate) async fn verify_writer_identity(
     transaction: &Transaction<'_>,
 ) -> Result<(), AppendDecisionEventError> {
     let identity = transaction
@@ -221,7 +225,7 @@ fn writer_identity_is_valid(
         && !attributes.has_memberships
 }
 
-async fn set_tenant_context(
+pub(crate) async fn set_tenant_context(
     transaction: &Transaction<'_>,
     tenant_id: &str,
 ) -> Result<(), AppendDecisionEventError> {
@@ -242,7 +246,7 @@ async fn set_tenant_context(
     Ok(())
 }
 
-fn classify_database_error(error: &tokio_postgres::Error) -> AppendDecisionEventError {
+pub(crate) fn classify_database_error(error: &tokio_postgres::Error) -> AppendDecisionEventError {
     let code = error.code().map(SqlState::code);
     let constraint = error.as_db_error().and_then(|error| error.constraint());
     classify_server_failure(code, constraint, error.is_closed())
