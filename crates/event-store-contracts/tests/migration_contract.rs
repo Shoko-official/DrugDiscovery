@@ -2,9 +2,10 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use sqlparser::{
     ast::{
-        Action, AlterColumnOperation, AlterTableOperation, DataType, ExactNumberInfo,
-        FunctionReturnType, GrantObjects, GranteesType, Privileges, Statement, TableConstraint,
-        TriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
+        Action, AlterColumnOperation, AlterTableOperation, CreatePolicyCommand, CreatePolicyType,
+        DataType, ExactNumberInfo, FunctionReturnType, GrantObjects, GranteesType, Privileges,
+        Set as SetStatement, Statement, TableConstraint, TriggerEvent, TriggerObject,
+        TriggerObjectKind, TriggerPeriod,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -20,6 +21,12 @@ fn parse_migration(name: &str) -> Vec<Statement> {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
     Parser::parse_sql(&PostgreSqlDialect {}, &sql)
         .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+fn read_migration(name: &str) -> String {
+    let path = migrations_dir().join(name);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
 #[test]
@@ -213,5 +220,176 @@ fn decision_event_migration_enforces_the_storage_contract() {
         revoke.grantees.iter().any(|grantee| {
             grantee.grantee_type == GranteesType::Public && grantee.name.is_none()
         })
+    );
+}
+
+#[test]
+fn tenant_boundary_migration_is_role_agnostic_and_fail_closed() {
+    let sql = read_migration("0003_postgres_tenant_boundary.sql");
+    let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let statements = parse_migration("0003_postgres_tenant_boundary.sql");
+    let table_operations = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::AlterTable(value) if value.name.to_string() == "public.scientific_event" => {
+                Some(value.operations.iter())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    assert!(normalized.contains("REVOKE CREATE ON SCHEMA public FROM PUBLIC"));
+    assert!(normalized.contains("REVOKE ALL ON TABLE public.scientific_event FROM PUBLIC"));
+    assert!(normalized.contains(
+        "ALTER FUNCTION public.reject_scientific_event_mutation() SET search_path = pg_catalog"
+    ));
+
+    assert!(
+        table_operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::EnableRowLevelSecurity))
+    );
+    assert!(
+        table_operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::ForceRowLevelSecurity))
+    );
+    assert!(table_operations.iter().any(|operation| matches!(
+        operation,
+        AlterTableOperation::DropConstraint { name, .. }
+            if name.value == "scientific_event_pkey"
+    )));
+    assert!(table_operations.iter().any(|operation| matches!(
+        operation,
+        AlterTableOperation::RenameConstraint { old_name, new_name }
+            if old_name.value
+                == "scientific_event_tenant_id_aggregate_type_aggregate_id_aggr_key"
+                && new_name.value == "scientific_event_stream_version_key"
+    )));
+
+    let primary_key = table_operations
+        .iter()
+        .find_map(|operation| match operation {
+            AlterTableOperation::AddConstraint {
+                constraint: TableConstraint::PrimaryKey(primary_key),
+                ..
+            } => Some(primary_key),
+            _ => None,
+        })
+        .expect("tenant-scoped primary key is required");
+    assert_eq!(
+        primary_key.name.as_ref().map(|name| name.value.as_str()),
+        Some("scientific_event_pkey")
+    );
+    assert_eq!(
+        primary_key
+            .columns
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["tenant_id", "event_id"]
+    );
+
+    let policies = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::CreatePolicy(policy) => Some((policy.name.value.as_str(), policy)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(policies.len(), 3);
+
+    let expected_policies = [
+        (
+            "scientific_event_tenant_fence",
+            CreatePolicyType::Restrictive,
+            CreatePolicyCommand::All,
+            true,
+            true,
+        ),
+        (
+            "scientific_event_tenant_select",
+            CreatePolicyType::Permissive,
+            CreatePolicyCommand::Select,
+            true,
+            false,
+        ),
+        (
+            "scientific_event_tenant_insert",
+            CreatePolicyType::Permissive,
+            CreatePolicyCommand::Insert,
+            false,
+            true,
+        ),
+    ];
+
+    for (name, policy_type, command, has_using, has_with_check) in expected_policies {
+        let policy = policies.get(name).expect("tenant policy is required");
+        assert_eq!(policy.table_name.to_string(), "public.scientific_event");
+        assert_eq!(policy.policy_type, Some(policy_type));
+        assert_eq!(policy.command, Some(command));
+        assert_eq!(
+            policy
+                .to
+                .as_ref()
+                .map(|owners| owners.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            Some(vec!["PUBLIC".to_owned()])
+        );
+        assert_eq!(policy.using.is_some(), has_using);
+        assert_eq!(policy.with_check.is_some(), has_with_check);
+        for predicate in [policy.using.as_ref(), policy.with_check.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let expression = predicate.to_string();
+            assert!(expression.contains("tenant_id"));
+            assert!(expression.contains("pg_catalog.current_setting"));
+            assert!(expression.contains("'bioworld.tenant_id'"));
+            assert!(expression.contains("true"));
+            assert!(expression.contains("NULLIF"));
+            assert!(expression.contains("''"));
+        }
+    }
+
+    let uppercase = normalized.to_ascii_uppercase();
+    for forbidden in [
+        "CREATE ROLE",
+        "CREATE USER",
+        "ALTER ROLE",
+        "SET ROLE",
+        "PASSWORD",
+        " LOGIN",
+        "BIOWORLD_OWNER",
+        "BIOWORLD_MIGRATOR",
+        "BIOWORLD_WRITER",
+    ] {
+        assert!(
+            !uppercase.contains(forbidden),
+            "schema migrations must not provision runtime roles: {forbidden}"
+        );
+    }
+    assert!(!statements.iter().any(|statement| matches!(
+        statement,
+        Statement::CreateRole(_)
+            | Statement::CreateUser(_)
+            | Statement::AlterRole { .. }
+            | Statement::Set(SetStatement::SetRole { .. })
+            | Statement::Grant(_)
+    )));
+    let revokes = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::Revoke(revoke) => Some(revoke),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(revokes.len(), 3);
+    assert!(
+        revokes
+            .iter()
+            .all(|revoke| revoke.grantees.iter().all(|grantee| {
+                grantee.grantee_type == GranteesType::Public && grantee.name.is_none()
+            }))
     );
 }

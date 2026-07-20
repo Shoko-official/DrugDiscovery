@@ -14,6 +14,12 @@ export const POSTGRES_IMAGE =
 
 const DATABASE_NAME = "bioworld_migrations";
 const SUCCESS_MARKER = "bioworld_migrations_ready";
+const TENANT_SUCCESS_MARKER = "bioworld_tenant_access_ready";
+const OWNER_SUCCESS_MARKER = "bioworld_owner_boundary_ready";
+const POSTGRES_USER = "postgres";
+const OWNER_ROLE = "bioworld_owner";
+const MIGRATOR_ROLE = "bioworld_migrator";
+const WRITER_ROLE = "bioworld_writer";
 const MAX_BUFFER = 64 * 1024;
 const MAX_MIGRATION_BYTES = 1024 * 1024;
 const MAX_TOTAL_MIGRATION_BYTES = 8 * 1024 * 1024;
@@ -49,6 +55,11 @@ const SESSION_LIMITS = [
   "SET statement_timeout = '60s';",
   "SET lock_timeout = '10s';",
   "SET idle_in_transaction_session_timeout = '60s';",
+].join("\n");
+const TRANSACTION_LIMITS = [
+  "SET LOCAL statement_timeout = '60s';",
+  "SET LOCAL lock_timeout = '10s';",
+  "SET LOCAL idle_in_transaction_session_timeout = '60s';",
 ].join("\n");
 
 function appendBounded(current, chunk, maximumBytes) {
@@ -167,7 +178,7 @@ async function defaultRunCommand(
   });
 }
 
-function buildDockerEnvironment(environment, postgresPassword) {
+function buildDockerEnvironment(environment, injected = {}) {
   const child = {};
   for (const [key, value] of Object.entries(environment)) {
     if (
@@ -178,8 +189,15 @@ function buildDockerEnvironment(environment, postgresPassword) {
       child[key] = value;
     }
   }
-  if (postgresPassword !== undefined) {
-    child.POSTGRES_PASSWORD = postgresPassword;
+  for (const [key, value] of Object.entries(injected)) {
+    if (
+      typeof value !== "string" ||
+      value === "" ||
+      Buffer.byteLength(value, "utf8") > MAX_ENVIRONMENT_VALUE_BYTES
+    ) {
+      throw new Error("PostgreSQL command environment is invalid.");
+    }
+    child[key] = value;
   }
   return child;
 }
@@ -256,6 +274,8 @@ export function discoverMigrations(entries) {
 function psqlArgs(
   containerName,
   {
+    username = POSTGRES_USER,
+    environmentKeys = [],
     quiet = true,
     singleTransaction = false,
     tuplesOnly = false,
@@ -265,17 +285,24 @@ function psqlArgs(
   const args = [
     "exec",
     "--interactive",
+  ];
+  for (const key of environmentKeys) {
+    args.push("--env", key);
+  }
+  args.push(
     containerName,
     "psql",
+    "--host",
+    "127.0.0.1",
     "--username",
-    "postgres",
+    username,
     "--dbname",
     DATABASE_NAME,
     "--no-password",
     "--no-psqlrc",
     "--set",
     "ON_ERROR_STOP=1",
-  ];
+  );
   if (quiet) {
     args.push("--quiet");
   }
@@ -296,6 +323,16 @@ function transactionInput(name, sql) {
   return `-- ${name}\n${SESSION_LIMITS}\n${sql}`;
 }
 
+function ownerTransactionInput(name, sql) {
+  return [
+    `-- ${name}`,
+    `SET LOCAL ROLE ${OWNER_ROLE};`,
+    "SET LOCAL search_path = public, pg_catalog;",
+    TRANSACTION_LIMITS,
+    sql,
+  ].join("\n");
+}
+
 function registerSignalCancellation(abortController, setExitCode) {
   const createHandler = (exitCode) => () => {
     setExitCode(exitCode);
@@ -311,10 +348,10 @@ function registerSignalCancellation(abortController, setExitCode) {
   };
 }
 
-function sanitizeDiagnostic(result, postgresPassword) {
+function sanitizeDiagnostic(result, secrets) {
   const combined = redactText(
     `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
-    [postgresPassword],
+    secrets,
   ).trim();
   if (combined === "") {
     return "";
@@ -330,8 +367,15 @@ export async function runPostgresMigrations({
   migrations: migrationEntries,
   fixtureSql,
   verificationSql,
+  roleBootstrapSql,
+  writerAccessSql,
+  tenantVerificationSql,
+  ownerVerificationSql,
   nonce,
   postgresPassword,
+  migratorPassword,
+  writerPassword,
+  legacyUpgradeFromVersion,
   runCommand = defaultRunCommand,
   now = Date.now,
   sleep = (milliseconds) =>
@@ -340,6 +384,7 @@ export async function runPostgresMigrations({
   healthPollIntervalMs = 1_000,
   environment = process.env,
   reportDiagnostic,
+  signalRegistrar,
 } = {}) {
   const migrations = discoverMigrations(migrationEntries);
   const fixture = validateSql(fixtureSql, "PostgreSQL migration fixture");
@@ -347,13 +392,36 @@ export async function runPostgresMigrations({
     verificationSql,
     "PostgreSQL migration verification",
   );
+  const roleBootstrap = validateSql(
+    roleBootstrapSql,
+    "PostgreSQL role bootstrap",
+  );
+  const writerAccess = validateSql(
+    writerAccessSql,
+    "PostgreSQL writer access provisioning",
+  );
+  const tenantVerification = validateSql(
+    tenantVerificationSql,
+    "PostgreSQL tenant verification",
+  );
+  const ownerVerification = validateSql(
+    ownerVerificationSql,
+    "PostgreSQL owner verification",
+  );
   const containerName = createContainerName(nonce);
+  const legacyMigrationCount =
+    legacyUpgradeFromVersion === undefined ? 0 : legacyUpgradeFromVersion;
+  const passwords = [postgresPassword, migratorPassword, writerPassword];
   if (
-    typeof postgresPassword !== "string" ||
-    !/^[0-9a-f]{64}$/.test(postgresPassword) ||
-    postgresPassword === nonce
+    passwords.some(
+      (password) =>
+        typeof password !== "string" ||
+        !/^[0-9a-f]{64}$/.test(password) ||
+        password === nonce,
+    ) ||
+    new Set(passwords).size !== passwords.length
   ) {
-    throw new Error("PostgreSQL migration password is invalid.");
+    throw new Error("PostgreSQL role passwords are invalid.");
   }
   if (
     !Number.isSafeInteger(healthTimeoutMs) ||
@@ -363,7 +431,11 @@ export async function runPostgresMigrations({
     healthPollIntervalMs > healthTimeoutMs ||
     typeof now !== "function" ||
     typeof sleep !== "function" ||
-    typeof runCommand !== "function"
+    typeof runCommand !== "function" ||
+    (signalRegistrar !== undefined && typeof signalRegistrar !== "function") ||
+    !Number.isSafeInteger(legacyMigrationCount) ||
+    legacyMigrationCount < 0 ||
+    legacyMigrationCount >= migrations.length
   ) {
     throw new Error("PostgreSQL migration runner configuration is invalid.");
   }
@@ -371,10 +443,26 @@ export async function runPostgresMigrations({
   const dockerEnvironment = buildDockerEnvironment(environment);
   const startEnvironment = buildDockerEnvironment(
     environment,
-    postgresPassword,
+    { POSTGRES_PASSWORD: postgresPassword },
   );
+  const postgresEnvironment = buildDockerEnvironment(environment, {
+    PGPASSWORD: postgresPassword,
+  });
+  const bootstrapEnvironment = buildDockerEnvironment(environment, {
+    PGPASSWORD: postgresPassword,
+    BIOWORLD_MIGRATOR_PASSWORD: migratorPassword,
+    BIOWORLD_WRITER_PASSWORD: writerPassword,
+  });
+  const migratorEnvironment = buildDockerEnvironment(environment, {
+    PGPASSWORD: migratorPassword,
+  });
+  const writerEnvironment = buildDockerEnvironment(environment, {
+    PGPASSWORD: writerPassword,
+  });
   const diagnosticSecrets = [
     postgresPassword,
+    migratorPassword,
+    writerPassword,
     ...Object.entries(startEnvironment)
       .filter(
         ([key, value]) =>
@@ -384,7 +472,9 @@ export async function runPostgresMigrations({
       .map(([, value]) => value),
   ];
   const abortController =
-    runCommand === defaultRunCommand ? new AbortController() : undefined;
+    runCommand === defaultRunCommand || signalRegistrar !== undefined
+      ? new AbortController()
+      : undefined;
   let signalExitCode;
   const diagnosticReporter =
     typeof reportDiagnostic === "function"
@@ -399,7 +489,7 @@ export async function runPostgresMigrations({
       ...(abortController ? { signal: abortController.signal } : {}),
     });
   const reportResult = (result) => {
-    const diagnostic = sanitizeDiagnostic(result, postgresPassword);
+    const diagnostic = sanitizeDiagnostic(result, diagnosticSecrets);
     if (diagnostic !== "") {
       try {
         diagnosticReporter(diagnostic);
@@ -424,10 +514,33 @@ export async function runPostgresMigrations({
       }),
     );
   const unregisterSignals = abortController
-    ? registerSignalCancellation(abortController, (exitCode) => {
-        signalExitCode ??= exitCode;
-      })
+    ? (signalRegistrar ?? registerSignalCancellation)(
+        abortController,
+        (exitCode) => {
+          signalExitCode ??= exitCode;
+        },
+      )
     : () => {};
+  const bootstrapRoles = async () => {
+    const bootstrapped = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        environmentKeys: [
+          "PGPASSWORD",
+          "BIOWORLD_MIGRATOR_PASSWORD",
+          "BIOWORLD_WRITER_PASSWORD",
+        ],
+        singleTransaction: true,
+      }),
+      activeOptions(bootstrapEnvironment, {
+        input: transactionInput("bootstrap-roles.sql", roleBootstrap),
+      }),
+    );
+    if (bootstrapped.status !== 0) {
+      reportResult(bootstrapped);
+      throw new Error("PostgreSQL role bootstrap failed.");
+    }
+  };
   let primaryError;
 
   try {
@@ -465,8 +578,10 @@ export async function runPostgresMigrations({
           "exec",
           containerName,
           "pg_isready",
+          "--host",
+          "127.0.0.1",
           "--username",
-          "postgres",
+          POSTGRES_USER,
           "--dbname",
           DATABASE_NAME,
           "--quiet",
@@ -477,11 +592,12 @@ export async function runPostgresMigrations({
         const readiness = await invoke(
           runCommand,
           psqlArgs(containerName, {
+            environmentKeys: ["PGPASSWORD"],
             quiet: false,
             tuplesOnly: true,
             unaligned: true,
           }),
-          activeOptions(dockerEnvironment, {
+          activeOptions(postgresEnvironment, {
             input: "SELECT 1;\n",
             timeout: 10_000,
           }),
@@ -499,42 +615,134 @@ export async function runPostgresMigrations({
       throw new Error("PostgreSQL migration container did not become ready.");
     }
 
-    for (const migration of migrations) {
+    let rolesBootstrapped = false;
+    if (legacyMigrationCount === 0) {
+      await bootstrapRoles();
+      rolesBootstrapped = true;
+    }
+
+    for (const [index, migration] of migrations.entries()) {
+      if (!rolesBootstrapped && index === legacyMigrationCount) {
+        await bootstrapRoles();
+        rolesBootstrapped = true;
+      }
+      const legacyOwned = index < legacyMigrationCount;
       const migrated = await invoke(
         runCommand,
-        psqlArgs(containerName, { singleTransaction: true }),
-        activeOptions(dockerEnvironment, {
-          input: transactionInput(migration.name, migration.sql),
+        psqlArgs(containerName, {
+          username: legacyOwned ? POSTGRES_USER : MIGRATOR_ROLE,
+          environmentKeys: ["PGPASSWORD"],
+          singleTransaction: true,
+        }),
+        activeOptions(legacyOwned ? postgresEnvironment : migratorEnvironment, {
+          input: legacyOwned
+            ? transactionInput(migration.name, migration.sql)
+            : ownerTransactionInput(migration.name, migration.sql),
         }),
       );
       if (migrated.status !== 0) {
+        reportResult(migrated);
         throw new Error("PostgreSQL migrations failed.");
       }
       if (migration.name.startsWith("0001_")) {
         const seeded = await invoke(
           runCommand,
-          psqlArgs(containerName, { singleTransaction: true }),
-          activeOptions(dockerEnvironment, {
-            input: transactionInput("after-0001.sql", fixture),
+          psqlArgs(containerName, {
+            username: legacyOwned ? POSTGRES_USER : MIGRATOR_ROLE,
+            environmentKeys: ["PGPASSWORD"],
+            singleTransaction: true,
           }),
+          activeOptions(
+            legacyOwned ? postgresEnvironment : migratorEnvironment,
+            {
+              input: legacyOwned
+                ? transactionInput("after-0001.sql", fixture)
+                : ownerTransactionInput("after-0001.sql", fixture),
+            },
+          ),
         );
         if (seeded.status !== 0) {
+          reportResult(seeded);
           throw new Error("PostgreSQL migration fixture failed.");
         }
       }
     }
+    if (!rolesBootstrapped) {
+      throw new Error("PostgreSQL role bootstrap did not run.");
+    }
+
+    const writerProvisioned = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        username: MIGRATOR_ROLE,
+        environmentKeys: ["PGPASSWORD"],
+        singleTransaction: true,
+      }),
+      activeOptions(migratorEnvironment, {
+        input: ownerTransactionInput("grant-writer-access.sql", writerAccess),
+      }),
+    );
+    if (writerProvisioned.status !== 0) {
+      reportResult(writerProvisioned);
+      throw new Error("PostgreSQL writer access provisioning failed.");
+    }
 
     const verified = await invoke(
       runCommand,
-      psqlArgs(containerName, { tuplesOnly: true, unaligned: true }),
-      activeOptions(dockerEnvironment, { input: verification }),
+      psqlArgs(containerName, {
+        environmentKeys: ["PGPASSWORD"],
+        tuplesOnly: true,
+        unaligned: true,
+      }),
+      activeOptions(postgresEnvironment, { input: verification }),
     );
     if (verified.status !== 0) {
+      reportResult(verified);
       throw new Error("PostgreSQL migration verification failed.");
     }
     if (verified.stdout.trim() !== SUCCESS_MARKER) {
       throw new Error(
         "PostgreSQL migration verification returned an unexpected result.",
+      );
+    }
+
+    const tenantVerified = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        username: WRITER_ROLE,
+        environmentKeys: ["PGPASSWORD"],
+        tuplesOnly: true,
+        unaligned: true,
+      }),
+      activeOptions(writerEnvironment, { input: tenantVerification }),
+    );
+    if (tenantVerified.status !== 0) {
+      reportResult(tenantVerified);
+      throw new Error("PostgreSQL tenant access verification failed.");
+    }
+    if (tenantVerified.stdout.trim() !== TENANT_SUCCESS_MARKER) {
+      throw new Error(
+        "PostgreSQL tenant access verification returned an unexpected result.",
+      );
+    }
+
+    const ownerVerified = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        username: MIGRATOR_ROLE,
+        environmentKeys: ["PGPASSWORD"],
+        tuplesOnly: true,
+        unaligned: true,
+      }),
+      activeOptions(migratorEnvironment, { input: ownerVerification }),
+    );
+    if (ownerVerified.status !== 0) {
+      reportResult(ownerVerified);
+      throw new Error("PostgreSQL owner boundary verification failed.");
+    }
+    if (ownerVerified.stdout.trim() !== OWNER_SUCCESS_MARKER) {
+      throw new Error(
+        "PostgreSQL owner boundary verification returned an unexpected result.",
       );
     }
   } catch (error) {
@@ -621,8 +829,20 @@ function loadInputs(repositoryRoot) {
   return {
     migrations: entries,
     fixtureSql: readBoundedFile(resolve(toolsRoot, "after-0001.sql")),
+    roleBootstrapSql: readBoundedFile(
+      resolve(toolsRoot, "bootstrap-roles.sql"),
+    ),
+    writerAccessSql: readBoundedFile(
+      resolve(toolsRoot, "grant-writer-access.sql"),
+    ),
     verificationSql: readBoundedFile(
       resolve(toolsRoot, "verify-migrations.sql"),
+    ),
+    tenantVerificationSql: readBoundedFile(
+      resolve(toolsRoot, "verify-tenant-access.sql"),
+    ),
+    ownerVerificationSql: readBoundedFile(
+      resolve(toolsRoot, "verify-owner-boundary.sql"),
     ),
   };
 }
@@ -635,12 +855,23 @@ const isMain =
 if (isMain) {
   try {
     const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const inputs = loadInputs(repositoryRoot);
     await runPostgresMigrations({
-      ...loadInputs(repositoryRoot),
+      ...inputs,
       nonce: randomBytes(12).toString("hex"),
       postgresPassword: randomBytes(32).toString("hex"),
+      migratorPassword: randomBytes(32).toString("hex"),
+      writerPassword: randomBytes(32).toString("hex"),
     });
-    console.log("PostgreSQL migrations verified.");
+    await runPostgresMigrations({
+      ...inputs,
+      nonce: randomBytes(12).toString("hex"),
+      postgresPassword: randomBytes(32).toString("hex"),
+      migratorPassword: randomBytes(32).toString("hex"),
+      writerPassword: randomBytes(32).toString("hex"),
+      legacyUpgradeFromVersion: 2,
+    });
+    console.log("PostgreSQL fresh install and legacy upgrade verified.");
   } catch (error) {
     console.error(
       error instanceof Error
