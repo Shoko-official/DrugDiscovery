@@ -9,7 +9,8 @@ use bioworld_event_store_postgres::{
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use tokio::task::JoinHandle;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, types::ToSql};
+use uuid::Uuid;
 
 const POSTGRES_HOST: &str = "127.0.0.1";
 const POSTGRES_PORT: u16 = 5432;
@@ -26,13 +27,26 @@ struct IntegrationPasswords {
 }
 
 fn occurred_at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+    occurred_at_value("2026-07-20T00:00:00Z")
+}
+
+fn occurred_at_value(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
         .expect("fixed timestamp must parse")
         .with_timezone(&Utc)
 }
 
 #[allow(deprecated)]
 fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
+    decision_event_at_version(event_id, decision_id, u64::MAX)
+}
+
+#[allow(deprecated)]
+fn decision_event_at_version(
+    event_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+) -> DecisionEvent {
     DecisionEvent {
         event_id: event_id.to_owned(),
         decision: Some(DecisionRecord {
@@ -41,7 +55,7 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
             evidence_snapshot_id: "ES-M11".to_owned(),
             recommendation: Recommendation::StopProgram as i32,
             rationale: vec!["PostgreSQL reader integration event.".to_owned()],
-            aggregate_version: u64::MAX,
+            aggregate_version,
             evidence: Some(EvidenceSnapshotRef {
                 id: "ES-M11".to_owned(),
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -51,10 +65,191 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
     }
 }
 
+#[tokio::test]
+async fn returns_the_only_version_one_event_for_a_decision_stream() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m14-version-one";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe601")
+        .expect("fixed decision identifier must parse");
+    let expected = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8101",
+        &decision_id.to_string(),
+        1,
+    );
+
+    append(&mut writer, expected.clone(), tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let actual = PostgresDecisionEventReader::new(&mut reader)
+        .get_latest(tenant_id, decision_id)
+        .await
+        .expect("reader must load the only stream event");
+
+    assert_eq!(actual, Some(expected));
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn returns_u64_max_when_version_one_was_inserted_and_occurred_later() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m14-latest";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe602")
+        .expect("fixed decision identifier must parse");
+    let expected = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8102",
+        &decision_id.to_string(),
+        u64::MAX,
+    );
+    let later_insert = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8103",
+        &decision_id.to_string(),
+        1,
+    );
+    let lexically_greater = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8107",
+        &decision_id.to_string(),
+        9,
+    );
+
+    append_at(
+        &mut writer,
+        expected.clone(),
+        tenant_id,
+        occurred_at_value("2026-07-19T00:00:00Z"),
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer).await);
+    append_at(
+        &mut writer,
+        later_insert,
+        tenant_id,
+        occurred_at_value("2026-07-21T00:00:00Z"),
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer).await);
+    append_at(
+        &mut writer,
+        lexically_greater,
+        tenant_id,
+        occurred_at_value("2026-07-22T00:00:00Z"),
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let actual = PostgresDecisionEventReader::new(&mut reader)
+        .get_latest(tenant_id, decision_id)
+        .await
+        .expect("reader must load the numerically latest stream event");
+
+    assert_eq!(actual, Some(expected));
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn makes_cross_tenant_and_missing_decision_streams_indistinguishable() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_a = "tenant-m14-hidden-a";
+    let tenant_b = "tenant-m14-hidden-b";
+    let hidden_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe603")
+        .expect("fixed hidden decision identifier must parse");
+    let missing_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe604")
+        .expect("fixed missing decision identifier must parse");
+    let hidden = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8104",
+        &hidden_decision_id.to_string(),
+        1,
+    );
+
+    append(&mut writer, hidden, tenant_b).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let cross_tenant = PostgresDecisionEventReader::new(&mut reader)
+        .get_latest(tenant_a, hidden_decision_id)
+        .await
+        .expect("cross-tenant stream lookup must not disclose an error");
+    assert!(tenant_context_is_absent(&reader).await);
+    let absent = PostgresDecisionEventReader::new(&mut reader)
+        .get_latest(tenant_a, missing_decision_id)
+        .await
+        .expect("absent stream lookup must succeed");
+
+    assert_eq!(cross_tenant, None);
+    assert_eq!(cross_tenant, absent);
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn rejects_a_corrupt_latest_event_without_falling_back() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m14-corrupt";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe605")
+        .expect("fixed decision identifier must parse");
+    let valid_older = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8105",
+        &decision_id.to_string(),
+        1,
+    );
+    let corrupt_latest = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8106",
+        &decision_id.to_string(),
+        2,
+    );
+
+    append(&mut writer, valid_older.clone(), tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+    insert_corrupt_event(&mut writer, corrupt_latest, tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let older_event_id = projected_row(&valid_older, tenant_id).event_id;
+    let loaded_older = PostgresDecisionEventReader::new(&mut reader)
+        .get(tenant_id, older_event_id)
+        .await
+        .expect("older stream event must remain readable");
+    assert_eq!(loaded_older, Some(valid_older));
+    assert!(tenant_context_is_absent(&reader).await);
+
+    let error = PostgresDecisionEventReader::new(&mut reader)
+        .get_latest(tenant_id, decision_id)
+        .await
+        .expect_err("corrupt latest event must not fall back to an older version");
+
+    assert_eq!(error, ReadDecisionEventError::StoredEventRejected);
+    assert_redacted(&error);
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
 fn metadata(tenant_id: &str) -> DecisionEventMetadata {
+    metadata_at(tenant_id, occurred_at())
+}
+
+fn metadata_at(tenant_id: &str, event_occurred_at: DateTime<Utc>) -> DecisionEventMetadata {
     DecisionEventMetadata::try_new(
         tenant_id.to_owned(),
-        occurred_at(),
+        event_occurred_at,
         json!({"algorithm": "Ed25519", "key_id": "m11-test", "value": "test-signature"}),
     )
     .expect("fixed metadata must be valid")
@@ -96,10 +291,63 @@ async fn connect(role: &str, password: String) -> (Client, JoinHandle<()>) {
 }
 
 async fn append(client: &mut Client, event: DecisionEvent, tenant_id: &str) {
+    append_at(client, event, tenant_id, occurred_at()).await;
+}
+
+async fn append_at(
+    client: &mut Client,
+    event: DecisionEvent,
+    tenant_id: &str,
+    event_occurred_at: DateTime<Utc>,
+) {
     PostgresDecisionEventWriter::new(client)
-        .append(event, metadata(tenant_id))
+        .append(event, metadata_at(tenant_id, event_occurred_at))
         .await
         .expect("writer must seed a valid integration event");
+}
+
+async fn insert_corrupt_event(client: &mut Client, event: DecisionEvent, tenant_id: &str) {
+    let mut row = projected_row(&event, tenant_id);
+    row.payload_sha256 = "0".repeat(64);
+    let aggregate_version = row.aggregate_version.to_string();
+    let signature = serde_json::Value::Object(row.signature);
+    let parameters: [&(dyn ToSql + Sync); 11] = [
+        &row.event_id,
+        &row.event_type,
+        &row.schema_version,
+        &row.aggregate_type,
+        &row.aggregate_id,
+        &aggregate_version,
+        &row.occurred_at,
+        &row.tenant_id,
+        &row.payload,
+        &row.payload_sha256,
+        &signature,
+    ];
+    let transaction = client
+        .transaction()
+        .await
+        .expect("corrupt fixture transaction must begin");
+    let context_is_exact: bool = transaction
+        .query_one(
+            "SELECT pg_catalog.set_config('bioworld.tenant_id', $1, true) = $1",
+            &[&tenant_id],
+        )
+        .await
+        .expect("corrupt fixture tenant context must be set")
+        .get(0);
+    assert!(context_is_exact);
+    transaction
+        .execute(
+            "INSERT INTO public.scientific_event (event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature) VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7, $8, $9, $10, $11)",
+            &parameters,
+        )
+        .await
+        .expect("corrupt fixture must be inserted");
+    transaction
+        .commit()
+        .await
+        .expect("corrupt fixture transaction must commit");
 }
 
 async fn tenant_context_is_absent(client: &Client) -> bool {
@@ -127,6 +375,9 @@ fn assert_redacted(error: &ReadDecisionEventError) {
         "tenant-fixture",
         "fixture-decision",
         "00000000-0000-4000-8000-000000000001",
+        "tenant-m14-corrupt",
+        "018f5a72-9c4b-7d31-8f6a-26f08f3fe605",
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8106",
     ] {
         assert!(!rendered.contains(sensitive));
     }
