@@ -14,7 +14,19 @@ const EXPECTED_IMAGE =
 const NONCE = "0123456789abcdef01234567";
 const CONTAINER_NAME = `bioworld-postgres-migrations-${NONCE}`;
 const POSTGRES_PASSWORD = "0123456789abcdef".repeat(4);
+const MIGRATOR_PASSWORD = "123456789abcdef0".repeat(4);
+const WRITER_PASSWORD = "23456789abcdef01".repeat(4);
 const SECRET = "postgresql://admin:do-not-expose@example.invalid/database";
+const ROLE_BOOTSTRAP_SQL = [
+  "CREATE ROLE bioworld_owner NOLOGIN;",
+  "CREATE ROLE bioworld_migrator LOGIN;",
+  "CREATE ROLE bioworld_writer LOGIN;",
+  "ALTER TABLE public.scientific_event OWNER TO bioworld_owner;",
+].join("\n");
+const WRITER_ACCESS_SQL = [
+  "GRANT USAGE ON SCHEMA public TO bioworld_writer;",
+  "GRANT SELECT, INSERT ON public.scientific_event TO bioworld_writer;",
+].join("\n");
 const FIXTURE_SQL = [
   "INSERT INTO scientific_event (event_id)",
   "VALUES ('00000000-0000-4000-8000-000000000001');",
@@ -26,6 +38,10 @@ const VERIFICATION_SQL = [
   "  ELSE 'bioworld_migrations_missing'",
   "END;",
 ].join("\n");
+const TENANT_VERIFICATION_SQL =
+  "SELECT 'bioworld_tenant_access_ready';";
+const OWNER_VERIFICATION_SQL =
+  "SELECT 'bioworld_owner_boundary_ready';";
 
 const migrations = [
   {
@@ -37,6 +53,11 @@ const migrations = [
     name: "0001_scientific_event.sql",
     isFile: true,
     sql: "CREATE TABLE scientific_event (event_id uuid PRIMARY KEY);",
+  },
+  {
+    name: "0003_postgres_tenant_boundary.sql",
+    isFile: true,
+    sql: "ALTER TABLE public.scientific_event ENABLE ROW LEVEL SECURITY;",
   },
 ];
 
@@ -86,6 +107,9 @@ function commandKind(args, options = {}) {
   if (input.trim() === "SELECT 1;") {
     return "readiness";
   }
+  if (input.includes(ROLE_BOOTSTRAP_SQL)) {
+    return "bootstrap";
+  }
   if (input.includes(migrations[1].sql)) {
     return "migration-0001";
   }
@@ -94,6 +118,18 @@ function commandKind(args, options = {}) {
   }
   if (input.includes(migrations[0].sql)) {
     return "migration-0002";
+  }
+  if (input.includes(migrations[2].sql)) {
+    return "migration-0003";
+  }
+  if (input.includes(WRITER_ACCESS_SQL)) {
+    return "writer-access";
+  }
+  if (input.includes("bioworld_tenant_access_ready")) {
+    return "tenant-verify";
+  }
+  if (input.includes("bioworld_owner_boundary_ready")) {
+    return "owner-verify";
   }
   if (input.includes("bioworld_migrations_ready")) {
     return "verify";
@@ -108,6 +144,12 @@ function operationResult(kind) {
   if (kind === "verify") {
     return result(0, "bioworld_migrations_ready\n");
   }
+  if (kind === "tenant-verify") {
+    return result(0, "bioworld_tenant_access_ready\n");
+  }
+  if (kind === "owner-verify") {
+    return result(0, "bioworld_owner_boundary_ready\n");
+  }
   return result(0);
 }
 
@@ -116,8 +158,14 @@ function runOptions(runCommand, time = clock(), overrides = {}) {
     migrations,
     fixtureSql: FIXTURE_SQL,
     verificationSql: VERIFICATION_SQL,
+    roleBootstrapSql: ROLE_BOOTSTRAP_SQL,
+    writerAccessSql: WRITER_ACCESS_SQL,
+    tenantVerificationSql: TENANT_VERIFICATION_SQL,
+    ownerVerificationSql: OWNER_VERIFICATION_SQL,
     nonce: NONCE,
     postgresPassword: POSTGRES_PASSWORD,
+    migratorPassword: MIGRATOR_PASSWORD,
+    writerPassword: WRITER_PASSWORD,
     runCommand,
     now: time.now,
     sleep: time.sleep,
@@ -133,6 +181,7 @@ test("discovers regular migration files in strict contiguous version order", () 
   assert.deepEqual(discoverMigrations(migrations), [
     migrations[1],
     migrations[0],
+    migrations[2],
   ]);
 });
 
@@ -194,6 +243,72 @@ test("requires an independent high-entropy PostgreSQL password", async () => {
   }
 });
 
+test("requires three distinct high-entropy role passwords", async () => {
+  const invalidCredentials = [
+    { migratorPassword: "" },
+    { writerPassword: "writer" },
+    { migratorPassword: POSTGRES_PASSWORD },
+    { writerPassword: POSTGRES_PASSWORD },
+    { writerPassword: MIGRATOR_PASSWORD },
+  ];
+
+  for (const credentials of invalidCredentials) {
+    let called = false;
+    await assert.rejects(
+      runPostgresMigrations(
+        runOptions(async () => {
+          called = true;
+          return result(0);
+        }, undefined, credentials),
+      ),
+    );
+    assert.equal(called, false);
+  }
+});
+
+test("requires every role-boundary SQL input before Docker", async () => {
+  for (const input of [
+    "roleBootstrapSql",
+    "writerAccessSql",
+    "tenantVerificationSql",
+    "ownerVerificationSql",
+  ]) {
+    let called = false;
+    await assert.rejects(
+      runPostgresMigrations(
+        runOptions(
+          async () => {
+            called = true;
+            return result(0);
+          },
+          undefined,
+          { [input]: " " },
+        ),
+      ),
+    );
+    assert.equal(called, false);
+  }
+});
+
+test("rejects an invalid legacy upgrade boundary before Docker", async () => {
+  for (const legacyUpgradeFromVersion of [-1, 1.5, migrations.length, 99]) {
+    let called = false;
+    await assert.rejects(
+      runPostgresMigrations(
+        runOptions(
+          async () => {
+            called = true;
+            return result(0);
+          },
+          undefined,
+          { legacyUpgradeFromVersion },
+        ),
+      ),
+    );
+    assert.equal(called, false);
+  }
+});
+
 test("uses distinct bounded psql sessions in migration lifecycle order", async () => {
   const calls = [];
   const time = clock();
@@ -223,10 +338,15 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "health",
       "health",
       "readiness",
+      "bootstrap",
       "migration-0001",
       "fixture",
       "migration-0002",
+      "migration-0003",
+      "writer-access",
       "verify",
+      "tenant-verify",
+      "owner-verify",
       "cleanup",
     ],
   );
@@ -247,6 +367,9 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     EXPECTED_IMAGE,
   ]);
   assert.equal(calls[0].options.env.POSTGRES_PASSWORD, POSTGRES_PASSWORD);
+  assert.equal(calls[0].options.env.PGPASSWORD, undefined);
+  assert.equal(calls[0].options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
+  assert.equal(calls[0].options.env.BIOWORLD_WRITER_PASSWORD, undefined);
   assert.ok(!calls[0].args.includes("--publish"));
   assert.ok(!calls[0].args.includes("-p"));
   assert.ok(
@@ -264,6 +387,8 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "exec",
       CONTAINER_NAME,
       "pg_isready",
+      "--host",
+      "127.0.0.1",
       "--username",
       "postgres",
       "--dbname",
@@ -278,8 +403,12 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.deepEqual(readinessCall.args, [
     "exec",
     "--interactive",
+    "--env",
+    "PGPASSWORD",
     CONTAINER_NAME,
     "psql",
+    "--host",
+    "127.0.0.1",
     "--username",
     "postgres",
     "--dbname",
@@ -294,8 +423,55 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     "-",
   ]);
   assert.equal(readinessCall.options.input, "SELECT 1;\n");
+  assert.equal(readinessCall.options.env.PGPASSWORD, POSTGRES_PASSWORD);
 
-  const transactionKinds = ["migration-0001", "fixture", "migration-0002"];
+  const bootstrapCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "bootstrap",
+  );
+  assert.deepEqual(bootstrapCall.args, [
+    "exec",
+    "--interactive",
+    "--env",
+    "PGPASSWORD",
+    "--env",
+    "BIOWORLD_MIGRATOR_PASSWORD",
+    "--env",
+    "BIOWORLD_WRITER_PASSWORD",
+    CONTAINER_NAME,
+    "psql",
+    "--host",
+    "127.0.0.1",
+    "--username",
+    "postgres",
+    "--dbname",
+    "bioworld_migrations",
+    "--no-password",
+    "--no-psqlrc",
+    "--set",
+    "ON_ERROR_STOP=1",
+    "--quiet",
+    "--single-transaction",
+    "--file",
+    "-",
+  ]);
+  assert.equal(bootstrapCall.options.env.PGPASSWORD, POSTGRES_PASSWORD);
+  assert.equal(
+    bootstrapCall.options.env.BIOWORLD_MIGRATOR_PASSWORD,
+    MIGRATOR_PASSWORD,
+  );
+  assert.equal(
+    bootstrapCall.options.env.BIOWORLD_WRITER_PASSWORD,
+    WRITER_PASSWORD,
+  );
+  assert.equal(bootstrapCall.options.env.POSTGRES_PASSWORD, undefined);
+
+  const transactionKinds = [
+    "migration-0001",
+    "fixture",
+    "migration-0002",
+    "migration-0003",
+    "writer-access",
+  ];
   const transactionCalls = transactionKinds.map((expectedKind) =>
     calls.find(
       ({ args, options }) => commandKind(args, options) === expectedKind,
@@ -306,10 +482,14 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     assert.deepEqual(call.args, [
       "exec",
       "--interactive",
+      "--env",
+      "PGPASSWORD",
       CONTAINER_NAME,
       "psql",
+      "--host",
+      "127.0.0.1",
       "--username",
-      "postgres",
+      "bioworld_migrator",
       "--dbname",
       "bioworld_migrations",
       "--no-password",
@@ -321,12 +501,29 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "--file",
       "-",
     ]);
+    assert.equal(call.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+    assert.equal(call.options.env.POSTGRES_PASSWORD, undefined);
+    assert.equal(call.options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
+    assert.equal(call.options.env.BIOWORLD_WRITER_PASSWORD, undefined);
+    assert.match(call.options.input, /SET LOCAL ROLE bioworld_owner;/);
+    assert.match(
+      call.options.input,
+      /SET LOCAL search_path = public, pg_catalog;/,
+    );
   }
   assert.match(transactionCalls[0].options.input, /0001_scientific_event\.sql/);
   assert.match(transactionCalls[1].options.input, /after-0001\.sql/);
   assert.match(
     transactionCalls[2].options.input,
     /0002_decision_event_contract\.sql/,
+  );
+  assert.match(
+    transactionCalls[3].options.input,
+    /0003_postgres_tenant_boundary\.sql/,
+  );
+  assert.match(
+    transactionCalls[4].options.input,
+    /grant-writer-access\.sql/,
   );
 
   const verificationCall = calls.find(
@@ -335,8 +532,12 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.deepEqual(verificationCall.args, [
     "exec",
     "--interactive",
+    "--env",
+    "PGPASSWORD",
     CONTAINER_NAME,
     "psql",
+    "--host",
+    "127.0.0.1",
     "--username",
     "postgres",
     "--dbname",
@@ -354,6 +555,42 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.equal(verificationCall.options.input, VERIFICATION_SQL);
   assert.ok(!verificationCall.args.includes("--command"));
   assert.ok(!verificationCall.args.includes("--single-transaction"));
+  assert.equal(verificationCall.options.env.PGPASSWORD, POSTGRES_PASSWORD);
+
+  const tenantVerificationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "tenant-verify",
+  );
+  assert.equal(
+    tenantVerificationCall.args[
+      tenantVerificationCall.args.indexOf("--username") + 1
+    ],
+    "bioworld_writer",
+  );
+  assert.equal(tenantVerificationCall.options.env.PGPASSWORD, WRITER_PASSWORD);
+  assert.equal(
+    tenantVerificationCall.options.env.BIOWORLD_MIGRATOR_PASSWORD,
+    undefined,
+  );
+  assert.equal(
+    tenantVerificationCall.options.env.BIOWORLD_WRITER_PASSWORD,
+    undefined,
+  );
+  assert.equal(
+    tenantVerificationCall.options.input,
+    TENANT_VERIFICATION_SQL,
+  );
+
+  const ownerVerificationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "owner-verify",
+  );
+  assert.equal(
+    ownerVerificationCall.args[
+      ownerVerificationCall.args.indexOf("--username") + 1
+    ],
+    "bioworld_migrator",
+  );
+  assert.equal(ownerVerificationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+  assert.equal(ownerVerificationCall.options.input, OWNER_VERIFICATION_SQL);
 
   assert.deepEqual(calls.at(-1).args, [
     "rm",
@@ -372,13 +609,180 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     assert.ok(Number.isSafeInteger(options.maxBuffer));
     assert.ok(options.maxBuffer > 0 && options.maxBuffer <= 64 * 1024);
     assert.ok(!args.join(" ").includes(POSTGRES_PASSWORD));
+    assert.ok(!args.join(" ").includes(MIGRATOR_PASSWORD));
+    assert.ok(!args.join(" ").includes(WRITER_PASSWORD));
     assert.ok(!args.join(" ").includes(SECRET));
     assert.ok(!String(options.input ?? "").includes(POSTGRES_PASSWORD));
+    assert.ok(!String(options.input ?? "").includes(MIGRATOR_PASSWORD));
+    assert.ok(!String(options.input ?? "").includes(WRITER_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(SECRET));
     if (index > 0) {
       assert.equal(options.env?.POSTGRES_PASSWORD, undefined);
       assert.equal(options.env?.POSTGRES_HOST_AUTH_METHOD, undefined);
     }
+  }
+});
+
+test("reassigns legacy-owned objects before applying the tenant migration", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { legacyUpgradeFromVersion: 2 }),
+  );
+
+  const kinds = calls.map(({ args, options }) => commandKind(args, options));
+  assert.deepEqual(kinds, [
+    "start",
+    "health",
+    "readiness",
+    "migration-0001",
+    "fixture",
+    "migration-0002",
+    "bootstrap",
+    "migration-0003",
+    "writer-access",
+    "verify",
+    "tenant-verify",
+    "owner-verify",
+    "cleanup",
+  ]);
+
+  for (const kind of ["migration-0001", "fixture", "migration-0002"]) {
+    const call = calls.find(
+      ({ args, options }) => commandKind(args, options) === kind,
+    );
+    assert.equal(call.args[call.args.indexOf("--username") + 1], "postgres");
+    assert.equal(call.options.env.PGPASSWORD, POSTGRES_PASSWORD);
+    assert.doesNotMatch(call.options.input, /SET LOCAL ROLE bioworld_owner;/);
+  }
+
+  const bootstrapCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "bootstrap",
+  );
+  assert.match(
+    bootstrapCall.options.input,
+    /ALTER TABLE public\.scientific_event OWNER TO bioworld_owner;/,
+  );
+
+  const tenantMigrationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "migration-0003",
+  );
+  assert.equal(
+    tenantMigrationCall.args[
+      tenantMigrationCall.args.indexOf("--username") + 1
+    ],
+    "bioworld_migrator",
+  );
+  assert.equal(tenantMigrationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+  assert.match(
+    tenantMigrationCall.options.input,
+    /SET LOCAL ROLE bioworld_owner;/,
+  );
+});
+
+test("interrupts every privileged phase and performs unsignaled cleanup", async (t) => {
+  for (const scenario of [
+    { name: "bootstrap", kind: "bootstrap" },
+    { name: "migration-0003", kind: "migration-0003" },
+    { name: "writer-access", kind: "writer-access" },
+    { name: "verify", kind: "verify" },
+    { name: "tenant-verify", kind: "tenant-verify" },
+    { name: "owner-verify", kind: "owner-verify" },
+    {
+      name: "legacy-migration-0001",
+      kind: "migration-0001",
+      legacyUpgradeFromVersion: 2,
+    },
+    {
+      name: "legacy-fixture",
+      kind: "fixture",
+      legacyUpgradeFromVersion: 2,
+    },
+    {
+      name: "legacy-migration-0002",
+      kind: "migration-0002",
+      legacyUpgradeFromVersion: 2,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const originalExitCode = process.exitCode;
+      const calls = [];
+      const diagnostics = [];
+      let interrupt;
+      let interrupted = false;
+      let unregistered = false;
+      process.exitCode = undefined;
+
+      try {
+        const runCommand = async (command, args, options = {}) => {
+          calls.push({ command, args, options });
+          const kind = commandKind(args, options);
+          if (kind === scenario.kind && !interrupted) {
+            interrupted = true;
+            interrupt();
+            return result(
+              1,
+              `${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}`,
+              `${WRITER_PASSWORD}${SECRET}`,
+            );
+          }
+          return operationResult(kind);
+        };
+
+        const error = await captureError(
+          runPostgresMigrations(
+            runOptions(runCommand, undefined, {
+              reportDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+              ...(scenario.legacyUpgradeFromVersion === undefined
+                ? {}
+                : {
+                    legacyUpgradeFromVersion:
+                      scenario.legacyUpgradeFromVersion,
+                  }),
+              signalRegistrar: (abortController, setExitCode) => {
+                interrupt = () => {
+                  setExitCode(130);
+                  abortController.abort();
+                };
+                return () => {
+                  unregistered = true;
+                };
+              },
+            }),
+          ),
+        );
+
+        assert.equal(
+          error.message,
+          "PostgreSQL migration verification interrupted.",
+        );
+        assert.equal(process.exitCode, 130);
+        assert.equal(unregistered, true);
+
+        const kinds = calls.map(({ args, options }) =>
+          commandKind(args, options),
+        );
+        const interruptedIndex = kinds.indexOf(scenario.kind);
+        assert.deepEqual(kinds.slice(interruptedIndex + 1), ["cleanup"]);
+
+        const interruptedCall = calls[interruptedIndex];
+        assert.equal(interruptedCall.options.signal.aborted, true);
+        const cleanupCall = calls.at(-1);
+        assert.equal(cleanupCall.options.signal, undefined);
+
+        assert.equal(diagnostics.length, 1);
+        assert.ok(!diagnostics[0].includes(POSTGRES_PASSWORD));
+        assert.ok(!diagnostics[0].includes(MIGRATOR_PASSWORD));
+        assert.ok(!diagnostics[0].includes(WRITER_PASSWORD));
+        assert.ok(!diagnostics[0].includes("admin:do-not-expose"));
+      } finally {
+        process.exitCode = originalExitCode;
+      }
+    });
   }
 });
 
@@ -439,7 +843,13 @@ test("failed final readiness probe captures logs and never starts migrations", a
 
 test("startup diagnostics are bounded and redact passwords and URL credentials", async () => {
   const diagnostics = [];
-  const hugeOutput = `${SECRET}\n${POSTGRES_PASSWORD}\n${"x".repeat(128 * 1024)}`;
+  const hugeOutput = [
+    SECRET,
+    POSTGRES_PASSWORD,
+    MIGRATOR_PASSWORD,
+    WRITER_PASSWORD,
+    "x".repeat(128 * 1024),
+  ].join("\n");
   const runCommand = async (_command, args, options = {}) => {
     const kind = commandKind(args, options);
     if (kind === "start" || kind === "logs") {
@@ -461,6 +871,8 @@ test("startup diagnostics are bounded and redact passwords and URL credentials",
   for (const diagnostic of diagnostics) {
     assert.ok(Buffer.byteLength(diagnostic, "utf8") <= 64 * 1024);
     assert.ok(!diagnostic.includes(POSTGRES_PASSWORD));
+    assert.ok(!diagnostic.includes(MIGRATOR_PASSWORD));
+    assert.ok(!diagnostic.includes(WRITER_PASSWORD));
     assert.ok(!diagnostic.includes("admin:do-not-expose"));
   }
 });
@@ -484,16 +896,21 @@ test("redacts a secret crossing the retained output boundary", () => {
 test("command failures remain secret-safe and always clean up", async (t) => {
   const scenarios = [
     ["start", "PostgreSQL migration container could not start."],
+    ["bootstrap", "PostgreSQL role bootstrap failed."],
     ["migration-0001", "PostgreSQL migrations failed."],
     ["fixture", "PostgreSQL migration fixture failed."],
     ["migration-0002", "PostgreSQL migrations failed."],
+    ["migration-0003", "PostgreSQL migrations failed."],
+    ["writer-access", "PostgreSQL writer access provisioning failed."],
     ["verify", "PostgreSQL migration verification failed."],
+    ["tenant-verify", "PostgreSQL tenant access verification failed."],
+    ["owner-verify", "PostgreSQL owner boundary verification failed."],
   ];
 
   for (const [failedKind, expectedMessage] of scenarios) {
     await t.test(failedKind, async () => {
       const calls = [];
-      const hugeSecretOutput = `${SECRET}${POSTGRES_PASSWORD}${"x".repeat(1024 * 1024)}`;
+      const hugeSecretOutput = `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}${"x".repeat(1024 * 1024)}`;
       const runCommand = async (command, args, options = {}) => {
         calls.push({ command, args, options });
         const kind = commandKind(args, options);
@@ -514,6 +931,8 @@ test("command failures remain secret-safe and always clean up", async (t) => {
       assert.ok(error.message.length < 128);
       assert.ok(!error.message.includes(SECRET));
       assert.ok(!error.message.includes(POSTGRES_PASSWORD));
+      assert.ok(!error.message.includes(MIGRATOR_PASSWORD));
+      assert.ok(!error.message.includes(WRITER_PASSWORD));
       assert.equal(
         commandKind(calls.at(-1).args, calls.at(-1).options),
         "cleanup",
@@ -522,31 +941,52 @@ test("command failures remain secret-safe and always clean up", async (t) => {
   }
 });
 
-test("unexpected verification output fails closed without exposing output", async () => {
-  const calls = [];
-  const runCommand = async (command, args, options = {}) => {
-    calls.push({ command, args, options });
-    const kind = commandKind(args, options);
-    if (kind === "verify") {
-      return result(0, `${SECRET}${POSTGRES_PASSWORD}\n`);
-    }
-    return operationResult(kind);
-  };
+test("unexpected verification output fails closed without exposing output", async (t) => {
+  const scenarios = [
+    [
+      "verify",
+      "PostgreSQL migration verification returned an unexpected result.",
+    ],
+    [
+      "tenant-verify",
+      "PostgreSQL tenant access verification returned an unexpected result.",
+    ],
+    [
+      "owner-verify",
+      "PostgreSQL owner boundary verification returned an unexpected result.",
+    ],
+  ];
 
-  const error = await captureError(
-    runPostgresMigrations(runOptions(runCommand)),
-  );
+  for (const [failedKind, expectedMessage] of scenarios) {
+    await t.test(failedKind, async () => {
+      const calls = [];
+      const runCommand = async (command, args, options = {}) => {
+        calls.push({ command, args, options });
+        const kind = commandKind(args, options);
+        if (kind === failedKind) {
+          return result(
+            0,
+            `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}\n`,
+          );
+        }
+        return operationResult(kind);
+      };
 
-  assert.equal(
-    error.message,
-    "PostgreSQL migration verification returned an unexpected result.",
-  );
-  assert.ok(!error.message.includes(SECRET));
-  assert.ok(!error.message.includes(POSTGRES_PASSWORD));
-  assert.equal(
-    commandKind(calls.at(-1).args, calls.at(-1).options),
-    "cleanup",
-  );
+      const error = await captureError(
+        runPostgresMigrations(runOptions(runCommand)),
+      );
+
+      assert.equal(error.message, expectedMessage);
+      assert.ok(!error.message.includes(SECRET));
+      assert.ok(!error.message.includes(POSTGRES_PASSWORD));
+      assert.ok(!error.message.includes(MIGRATOR_PASSWORD));
+      assert.ok(!error.message.includes(WRITER_PASSWORD));
+      assert.equal(
+        commandKind(calls.at(-1).args, calls.at(-1).options),
+        "cleanup",
+      );
+    });
+  }
 });
 
 test("cleanup failure is reported only when no earlier failure exists", async () => {
