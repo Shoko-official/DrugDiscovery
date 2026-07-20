@@ -7,7 +7,7 @@ import { decisionPreviewFixture } from "./decisionReviewFixture";
 describe("DecisionReview", () => {
   it("renders a stable loading state", () => {
     const markup = renderToStaticMarkup(
-      <DecisionReview state={{ kind: "loading" }} />,
+      <DecisionReview state={{ kind: "loading", context: "preview" }} />,
     );
 
     expect(markup).toContain('aria-busy="true"');
@@ -17,7 +17,7 @@ describe("DecisionReview", () => {
 
   it("renders an empty state without fixture data", () => {
     const markup = renderToStaticMarkup(
-      <DecisionReview state={{ kind: "empty" }} />,
+      <DecisionReview state={{ kind: "empty", context: "preview" }} />,
     );
 
     expect(markup).toContain("No decision selected");
@@ -28,13 +28,21 @@ describe("DecisionReview", () => {
   it("renders an announced error with retry only when retry is available", () => {
     const retryableMarkup = renderToStaticMarkup(
       <DecisionReview
-        state={{ kind: "error", message: "Fixture could not be loaded." }}
+        state={{
+          kind: "error",
+          context: "preview",
+          message: "Fixture could not be loaded.",
+        }}
         onRetry={() => undefined}
       />,
     );
     const terminalMarkup = renderToStaticMarkup(
       <DecisionReview
-        state={{ kind: "error", message: "Fixture could not be loaded." }}
+        state={{
+          kind: "error",
+          context: "preview",
+          message: "Fixture could not be loaded.",
+        }}
       />,
     );
 
@@ -68,7 +76,8 @@ describe("DecisionReview", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview
         state={{
-          kind: "preview",
+          kind: "ready",
+          source: "preview_fixture",
           decision: {
             ...decisionPreviewFixture.decision,
             recommendation: "stop_program",
@@ -79,5 +88,51 @@ describe("DecisionReview", () => {
 
     expect(markup).toContain("Stop program");
     expect(markup).toContain('status status--negative">Stop program');
+  });
+
+  it("identifies a bundled sample loaded through the desktop runtime", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          ...decisionPreviewFixture,
+          source: "bundled_sample",
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Desktop runtime");
+    expect(markup).toContain("Bundled sample");
+    expect(markup).toContain("Loaded through local runtime. Not persisted.");
+    expect(markup).toContain(
+      "Evidence contents are not included in this review response.",
+    );
+    expect(markup).not.toContain("Not connected to decision runtime.");
+  });
+
+  it("uses runtime-specific copy for non-ready states", () => {
+    const loadingMarkup = renderToStaticMarkup(
+      <DecisionReview state={{ kind: "loading", context: "runtime" }} />,
+    );
+    const emptyMarkup = renderToStaticMarkup(
+      <DecisionReview state={{ kind: "empty", context: "runtime" }} />,
+    );
+    const errorMarkup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "error",
+          context: "runtime",
+          message: "The local decision runtime could not load the current record.",
+        }}
+        onRetry={() => undefined}
+      />,
+    );
+
+    expect(loadingMarkup).toContain("Waiting for the local decision runtime.");
+    expect(emptyMarkup).toContain(
+      "No current decision is available from the local runtime.",
+    );
+    expect(emptyMarkup).toContain("No current decision");
+    expect(errorMarkup).toContain("Decision runtime unavailable");
+    expect(errorMarkup).toContain("Retry runtime");
   });
 });

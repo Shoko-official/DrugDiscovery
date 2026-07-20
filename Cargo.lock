@@ -144,8 +144,10 @@ dependencies = [
 name = "bioworld-desktop"
 version = "0.1.0"
 dependencies = [
+ "bioworld-contracts",
  "bioworld-desktop-core",
  "bioworld-domain",
+ "prost",
  "serde",
  "serde_json",
  "tauri",
