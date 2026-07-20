@@ -4,6 +4,7 @@ members = [
     "crates/contracts",
     "crates/domain",
     "crates/desktop-core",
+    "crates/plugin-contracts",
     "crates/viz",
     "apps/desktop/src-tauri",
 ]
@@ -22,4 +23,5 @@ thiserror = "2"
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = { version = "0.14.6", default-features = false }
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["serde"] }
+wit-bindgen = { version = "=0.59.0", default-features = false, features = ["macros", "realloc", "std"] }
