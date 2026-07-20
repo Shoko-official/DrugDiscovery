@@ -299,6 +299,7 @@ test("builds writer tests without credentials and runs them only beside PostgreS
   assert.match(sourceCommand, /git .*ls-files/);
   assert.match(sourceCommand, /Cargo\.toml Cargo\.lock rust-toolchain\.toml/);
   assert.match(sourceCommand, /apps\/desktop\/src-tauri crates proto/);
+  assert.match(sourceCommand, /tar --extract --no-same-owner/);
 
   const fetch = calls.find(
     ({ args, options }) => commandKind(args, options) === "writer-fetch",

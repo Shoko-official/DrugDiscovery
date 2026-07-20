@@ -36,7 +36,7 @@ const WRITER_TEST_TIMEOUT_MS = 5 * 60_000;
 const WRITER_SOURCE_STAGE_SCRIPT = [
   "umask 077",
   "cd /workspace",
-  "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri crates proto | tar --null --files-from=- --create | tar --extract --directory=/sanitized",
+  "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri crates proto | tar --null --files-from=- --create | tar --extract --no-same-owner --directory=/sanitized",
   "for source_path in crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/tests/postgres_writer.rs; do",
   '  test -f "$source_path"',
   '  test ! -L "$source_path"',
