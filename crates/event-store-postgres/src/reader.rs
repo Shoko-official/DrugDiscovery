@@ -1,5 +1,7 @@
 use bioworld_contracts::v2::DecisionEvent;
-use bioworld_event_store_contracts::{ScientificEventRow, reconstruct_decision_event};
+use bioworld_event_store_contracts::{
+    DECISION_AGGREGATE_TYPE, ScientificEventRow, reconstruct_decision_event,
+};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
@@ -11,6 +13,13 @@ use crate::{
 
 const READER_ROLE: &str = "bioworld_reader";
 const SELECT_DECISION_EVENT: &str = "SELECT event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version::text AS aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature FROM public.scientific_event WHERE tenant_id = $1 AND event_id = $2";
+const SELECT_LATEST_DECISION_EVENT: &str = "SELECT event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version::text AS aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature FROM public.scientific_event WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3 ORDER BY public.scientific_event.aggregate_version DESC LIMIT 1";
+
+#[derive(Clone, Copy)]
+enum DecisionEventLookup {
+    Event(Uuid),
+    Latest(Uuid),
+}
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReadDecisionEventError {
@@ -50,6 +59,24 @@ impl<'client> PostgresDecisionEventReader<'client> {
         tenant_id: &str,
         event_id: Uuid,
     ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
+        self.read(tenant_id, DecisionEventLookup::Event(event_id))
+            .await
+    }
+
+    pub async fn get_latest(
+        &mut self,
+        tenant_id: &str,
+        decision_id: Uuid,
+    ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
+        self.read(tenant_id, DecisionEventLookup::Latest(decision_id))
+            .await
+    }
+
+    async fn read(
+        &mut self,
+        tenant_id: &str,
+        lookup: DecisionEventLookup,
+    ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
         if !tenant_id_is_valid(tenant_id) {
             return Err(ReadDecisionEventError::InvalidTenantId);
         }
@@ -62,7 +89,7 @@ impl<'client> PostgresDecisionEventReader<'client> {
             .await
             .map_err(|error| classify_reader_database_error(&error))?;
 
-        match read_in_transaction(&transaction, tenant_id, event_id).await {
+        match read_in_transaction(&transaction, tenant_id, lookup).await {
             Ok(event) => transaction
                 .commit()
                 .await
@@ -79,7 +106,7 @@ impl<'client> PostgresDecisionEventReader<'client> {
 async fn read_in_transaction(
     transaction: &Transaction<'_>,
     tenant_id: &str,
-    event_id: Uuid,
+    lookup: DecisionEventLookup,
 ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
     verify_role_identity(transaction, READER_ROLE)
         .await
@@ -89,11 +116,25 @@ async fn read_in_transaction(
         .await
         .map_err(map_append_error)?;
 
-    transaction
-        .query_opt(SELECT_DECISION_EVENT, &[&tenant_id, &event_id])
-        .await
-        .map_err(|error| classify_reader_database_error(&error))?
-        .map(|row| reconstruct_row(row, tenant_id, event_id))
+    let row = match lookup {
+        DecisionEventLookup::Event(event_id) => {
+            transaction
+                .query_opt(SELECT_DECISION_EVENT, &[&tenant_id, &event_id])
+                .await
+        }
+        DecisionEventLookup::Latest(decision_id) => {
+            let aggregate_id = decision_id.to_string();
+            transaction
+                .query_opt(
+                    SELECT_LATEST_DECISION_EVENT,
+                    &[&tenant_id, &DECISION_AGGREGATE_TYPE, &aggregate_id],
+                )
+                .await
+        }
+    }
+    .map_err(|error| classify_reader_database_error(&error))?;
+
+    row.map(|row| reconstruct_row(row, tenant_id, lookup))
         .transpose()
 }
 
@@ -118,7 +159,7 @@ async fn verify_read_only(transaction: &Transaction<'_>) -> Result<(), ReadDecis
 fn reconstruct_row(
     row: Row,
     tenant_id: &str,
-    event_id: Uuid,
+    lookup: DecisionEventLookup,
 ) -> Result<DecisionEvent, ReadDecisionEventError> {
     let aggregate_version = row
         .try_get::<_, String>("aggregate_version")
@@ -164,7 +205,14 @@ fn reconstruct_row(
         signature,
     };
 
-    if stored.tenant_id != tenant_id || stored.event_id != event_id {
+    let identity_matches = match lookup {
+        DecisionEventLookup::Event(event_id) => stored.event_id == event_id,
+        DecisionEventLookup::Latest(decision_id) => {
+            stored.aggregate_type == DECISION_AGGREGATE_TYPE
+                && stored.aggregate_id == decision_id.to_string()
+        }
+    };
+    if stored.tenant_id != tenant_id || !identity_matches {
         return Err(ReadDecisionEventError::StoredEventRejected);
     }
 
