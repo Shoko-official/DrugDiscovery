@@ -9,6 +9,8 @@ serde.workspace = true
 serde_json.workspace = true
 bioworld-domain = { path = "../../../crates/domain" }
 bioworld-desktop-core = { path = "../../../crates/desktop-core" }
+bioworld-contracts = { path = "../../../crates/contracts" }
+prost.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }

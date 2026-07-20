@@ -24,6 +24,7 @@ const decision = create(DecisionRecordSchema, {
 });
 
 export const decisionPreviewFixture = {
-  kind: "preview",
+  kind: "ready",
+  source: "preview_fixture",
   decision: toDecisionSummary(decision, "unknown"),
 } as const satisfies DecisionReviewState;

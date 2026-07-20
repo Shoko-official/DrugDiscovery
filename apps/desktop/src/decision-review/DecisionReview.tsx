@@ -20,11 +20,18 @@ export type DecisionSummary = {
   evidenceSnapshotId: string;
 };
 
+export type DecisionReviewContext = "runtime" | "preview";
+export type DecisionReviewSource = "bundled_sample" | "preview_fixture";
+
 export type DecisionReviewState =
-  | { kind: "loading" }
-  | { kind: "empty" }
-  | { kind: "error"; message: string }
-  | { kind: "preview"; decision: DecisionSummary };
+  | { kind: "loading"; context: DecisionReviewContext }
+  | { kind: "empty"; context: DecisionReviewContext }
+  | { kind: "error"; context: DecisionReviewContext; message: string }
+  | {
+      kind: "ready";
+      source: DecisionReviewSource;
+      decision: DecisionSummary;
+    };
 
 type DecisionReviewProps = {
   state: DecisionReviewState;
@@ -54,7 +61,11 @@ const assessmentLabels: Record<DomainAssessment, string> = {
   unknown: "Unknown",
 };
 
-function LoadingState(): React.JSX.Element {
+function LoadingState({
+  context,
+}: {
+  context: DecisionReviewContext;
+}): React.JSX.Element {
   return (
     <section
       className="review-state"
@@ -64,27 +75,41 @@ function LoadingState(): React.JSX.Element {
     >
       <p className="section-label">Decision state</p>
       <h2 id="loading-state-title">Loading decision review</h2>
-      <p className="state-detail">Waiting for the local preview state.</p>
+      <p className="state-detail">
+        {context === "runtime"
+          ? "Waiting for the local decision runtime."
+          : "Waiting for the local preview state."}
+      </p>
     </section>
   );
 }
 
-function EmptyState(): React.JSX.Element {
+function EmptyState({
+  context,
+}: {
+  context: DecisionReviewContext;
+}): React.JSX.Element {
   return (
     <section className="review-state" aria-labelledby="empty-state-title">
       <p className="section-label">Decision state</p>
-      <h2 id="empty-state-title">No decision selected</h2>
+      <h2 id="empty-state-title">
+        {context === "runtime" ? "No current decision" : "No decision selected"}
+      </h2>
       <p className="state-detail">
-        Decision selection is not connected in this preview.
+        {context === "runtime"
+          ? "No current decision is available from the local runtime."
+          : "Decision selection is not connected in this preview."}
       </p>
     </section>
   );
 }
 
 function ErrorState({
+  context,
   message,
   onRetry,
 }: {
+  context: DecisionReviewContext;
   message: string;
   onRetry?: () => void;
 }): React.JSX.Element {
@@ -95,26 +120,41 @@ function ErrorState({
       role="alert"
     >
       <p className="section-label">Decision state</p>
-      <h2 id="error-state-title">Decision preview unavailable</h2>
+      <h2 id="error-state-title">
+        {context === "runtime"
+          ? "Decision runtime unavailable"
+          : "Decision preview unavailable"}
+      </h2>
       <p className="state-detail">{message}</p>
       {onRetry ? (
         <button className="secondary-action" type="button" onClick={onRetry}>
-          Retry preview
+          {context === "runtime" ? "Retry runtime" : "Retry preview"}
         </button>
       ) : null}
     </section>
   );
 }
 
-function PreviewState({ decision }: { decision: DecisionSummary }): React.JSX.Element {
+function ReadyState({
+  decision,
+  source,
+}: {
+  decision: DecisionSummary;
+  source: DecisionReviewSource;
+}): React.JSX.Element {
   const recommendation = recommendationLabels[decision.recommendation];
   const assessment = assessmentLabels[decision.domainAssessment];
+  const isRuntime = source === "bundled_sample";
 
   return (
     <>
       <aside className="fixture-boundary" aria-label="Data source">
-        <strong>Preview fixture</strong>
-        <span>Not connected to decision runtime.</span>
+        <strong>{isRuntime ? "Bundled sample" : "Preview fixture"}</strong>
+        <span>
+          {isRuntime
+            ? "Loaded through local runtime. Not persisted."
+            : "Not connected to decision runtime."}
+        </span>
       </aside>
 
       <article className="decision-record" aria-labelledby="decision-record-title">
@@ -156,7 +196,11 @@ function PreviewState({ decision }: { decision: DecisionSummary }): React.JSX.El
         <section className="evidence-status" aria-labelledby="evidence-status-title">
           <div>
             <h3 id="evidence-status-title">Evidence availability</h3>
-            <p>Evidence contents unavailable in preview.</p>
+            <p>
+              {isRuntime
+                ? "Evidence contents are not included in this review response."
+                : "Evidence contents unavailable in preview."}
+            </p>
           </div>
           <span className="status status--neutral">Unavailable</span>
         </section>
@@ -169,19 +213,31 @@ export function DecisionReview({
   state,
   onRetry,
 }: DecisionReviewProps): React.JSX.Element {
+  const isRuntime =
+    state.kind === "ready"
+      ? state.source === "bundled_sample"
+      : state.context === "runtime";
   let content: React.JSX.Element;
   switch (state.kind) {
     case "loading":
-      content = <LoadingState />;
+      content = <LoadingState context={state.context} />;
       break;
     case "empty":
-      content = <EmptyState />;
+      content = <EmptyState context={state.context} />;
       break;
     case "error":
-      content = <ErrorState message={state.message} onRetry={onRetry} />;
+      content = (
+        <ErrorState
+          context={state.context}
+          message={state.message}
+          onRetry={onRetry}
+        />
+      );
       break;
-    case "preview":
-      content = <PreviewState decision={state.decision} />;
+    case "ready":
+      content = (
+        <ReadyState decision={state.decision} source={state.source} />
+      );
       break;
   }
 
@@ -192,7 +248,9 @@ export function DecisionReview({
           <p className="product-name">BioWorld Decision OS</p>
           <h1 id="decision-review-title">Decision review</h1>
         </div>
-        <span className="connection-state">Local preview</span>
+        <span className="connection-state">
+          {isRuntime ? "Desktop runtime" : "Local preview"}
+        </span>
       </header>
       {content}
     </main>
