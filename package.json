@@ -12,6 +12,8 @@
     "desktop:tools:test": "node --test tools/native-desktop.test.mjs tools/tauri-icons.test.mjs",
     "desktop:native:preflight": "node tools/native-desktop.mjs preflight",
     "desktop:native:check": "node tools/native-desktop.mjs check",
+    "desktop:native:test": "node tools/native-desktop.mjs test",
+    "desktop:native:clippy": "node tools/native-desktop.mjs clippy",
     "desktop:native:build": "node tools/native-desktop.mjs build"
   },
   "devDependencies": {

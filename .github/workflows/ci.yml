@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  node:
+    name: Node, contracts, desktop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          test "$(pnpm --version)" = "10.34.5"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check generated contracts
+        run: pnpm contracts:check
+
+      - name: Test desktop tools
+        run: pnpm desktop:tools:test
+
+      - name: Validate desktop icons
+        run: pnpm desktop:icons:check
+
+      - name: Test desktop
+        run: pnpm --filter @bioworld/desktop test
+
+      - name: Build desktop
+        run: pnpm desktop:build
+
+  rust:
+    name: Rust core and WebAssembly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --component rustfmt,clippy \
+            --target wasm32-unknown-unknown,wasm32-wasip2
+          rustup default 1.95.0
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --exclude bioworld-desktop --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --exclude bioworld-desktop --all-targets --locked -- -D warnings
+
+      - name: Check plugin contracts for wasm32-unknown-unknown
+        run: cargo check -p bioworld-plugin-contracts --target wasm32-unknown-unknown --locked
+
+      - name: Check plugin contracts for wasm32-wasip2
+        run: cargo check -p bioworld-plugin-contracts --target wasm32-wasip2 --locked
+
+  tauri-windows:
+    name: Tauri Windows
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        shell: pwsh
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          if ((pnpm --version) -ne "10.34.5") {
+            throw "Expected pnpm 10.34.5"
+          }
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup default 1.95.0
+
+      - name: Run native desktop preflight
+        run: pnpm desktop:native:preflight
+
+      - name: Check native desktop
+        run: pnpm desktop:native:check
+
+      - name: Test native desktop
+        run: pnpm desktop:native:test
+
+      - name: Lint native desktop
+        run: pnpm desktop:native:clippy
+
+      - name: Build native desktop
+        run: pnpm desktop:native:build

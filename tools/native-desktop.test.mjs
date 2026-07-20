@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { win32 } from "node:path";
 
@@ -160,7 +161,8 @@ test("parses supported modes and returns deterministic child commands", () => {
   assert.equal(parseMode(["check"]), "check");
   assert.equal(parseMode(["build"]), "build");
   assert.throws(() => parseMode(["release"]), {
-    message: "Usage: node tools/native-desktop.mjs <preflight|check|build>",
+    message:
+      "Usage: node tools/native-desktop.mjs <preflight|check|test|clippy|build>",
   });
 
   assert.deepEqual(commandForMode("check", "C:\\repo"), {
@@ -186,6 +188,55 @@ test("parses supported modes and returns deterministic child commands", () => {
     cwd: win32.join("C:\\repo", "apps", "desktop"),
   });
   assert.equal(commandForMode("preflight", "C:\\repo"), null);
+});
+
+test("maps native test mode to the locked desktop crate tests", () => {
+  assert.equal(parseMode(["test"]), "test");
+  assert.deepEqual(commandForMode("test", "C:\\repo"), {
+    command: "cargo",
+    args: ["test", "-p", "bioworld-desktop", "--locked"],
+    cwd: "C:\\repo",
+  });
+});
+
+test("exposes the native desktop test mode through the root package", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
+
+  assert.equal(
+    packageJson.scripts["desktop:native:test"],
+    "node tools/native-desktop.mjs test",
+  );
+});
+
+test("maps native clippy mode to warning-denied checks for all desktop targets", () => {
+  assert.equal(parseMode(["clippy"]), "clippy");
+  assert.deepEqual(commandForMode("clippy", "C:\\repo"), {
+    command: "cargo",
+    args: [
+      "clippy",
+      "-p",
+      "bioworld-desktop",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings",
+    ],
+    cwd: "C:\\repo",
+  });
+});
+
+test("exposes the native desktop clippy mode through the root package", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
+
+  assert.equal(
+    packageJson.scripts["desktop:native:clippy"],
+    "node tools/native-desktop.mjs clippy",
+  );
 });
 
 test("builds a restricted child environment without application secrets", () => {
