@@ -3,7 +3,8 @@ use bioworld_event_store_contracts::{
     DecisionEventMetadata, ScientificEventRow, project_decision_event,
 };
 use bioworld_event_store_postgres::{
-    PostgresDecisionEventReader, PostgresDecisionEventWriter, ReadDecisionEventError,
+    AppendDecisionEventError, PostgresDecisionEventReader, PostgresDecisionEventWriter,
+    ReadDecisionEventError,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -13,9 +14,16 @@ use tokio_postgres::Client;
 const POSTGRES_HOST: &str = "127.0.0.1";
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_DATABASE: &str = "bioworld_migrations";
-const POSTGRES_USER: &str = "bioworld_writer";
+const POSTGRES_WRITER_USER: &str = "bioworld_writer";
+const POSTGRES_READER_USER: &str = "bioworld_reader";
 const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PASSWORD";
+const READER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_READER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
+
+struct IntegrationPasswords {
+    writer: String,
+    reader: String,
+}
 
 fn occurred_at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
@@ -52,28 +60,35 @@ fn metadata(tenant_id: &str) -> DecisionEventMetadata {
     .expect("fixed metadata must be valid")
 }
 
-fn integration_password() -> Option<String> {
-    match std::env::var(WRITER_PASSWORD_ENVIRONMENT_VARIABLE) {
-        Ok(password) if !password.is_empty() => Some(password),
+fn integration_passwords() -> Option<IntegrationPasswords> {
+    let writer = std::env::var(WRITER_PASSWORD_ENVIRONMENT_VARIABLE)
+        .ok()
+        .filter(|password| !password.is_empty());
+    let reader = std::env::var(READER_PASSWORD_ENVIRONMENT_VARIABLE)
+        .ok()
+        .filter(|password| !password.is_empty());
+
+    match (writer, reader) {
+        (Some(writer), Some(reader)) => Some(IntegrationPasswords { writer, reader }),
         _ if std::env::var(INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE).as_deref() == Ok("1") => {
-            panic!("required PostgreSQL writer credential is unavailable")
+            panic!("required PostgreSQL integration credentials are unavailable")
         }
         _ => None,
     }
 }
 
-async fn connect_writer(password: String) -> (Client, JoinHandle<()>) {
+async fn connect(role: &str, password: String) -> (Client, JoinHandle<()>) {
     let mut configuration = tokio_postgres::Config::new();
     configuration
         .host(POSTGRES_HOST)
         .port(POSTGRES_PORT)
         .dbname(POSTGRES_DATABASE)
-        .user(POSTGRES_USER)
+        .user(role)
         .password(password);
     let (client, connection) = configuration
         .connect(tokio_postgres::NoTls)
         .await
-        .expect("writer must connect through internal PostgreSQL TCP");
+        .expect("runtime role must connect through internal PostgreSQL TCP");
     let connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -106,6 +121,7 @@ fn assert_redacted(error: &ReadDecisionEventError) {
     let rendered = format!("{error:?} {error}");
     for sensitive in [
         WRITER_PASSWORD_ENVIRONMENT_VARIABLE,
+        READER_PASSWORD_ENVIRONMENT_VARIABLE,
         "test-signature",
         "fixture-signature",
         "tenant-fixture",
@@ -141,10 +157,11 @@ fn exposes_a_narrow_reader_api_and_redacted_errors() {
 
 #[tokio::test]
 async fn reads_the_exact_decision_event_with_the_maximum_u64_version() {
-    let Some(password) = integration_password() else {
+    let Some(passwords) = integration_passwords() else {
         return;
     };
-    let (mut client, connection_task) = connect_writer(password).await;
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
     let tenant_id = "tenant-m11-exact";
     let expected = decision_event(
         "01910d47-6f80-7a31-8c29-1d5c4f6b7101",
@@ -152,10 +169,10 @@ async fn reads_the_exact_decision_event_with_the_maximum_u64_version() {
     );
     let id = projected_row(&expected, tenant_id).event_id;
 
-    append(&mut client, expected.clone(), tenant_id).await;
-    assert!(tenant_context_is_absent(&client).await);
+    append(&mut writer, expected.clone(), tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
 
-    let actual = PostgresDecisionEventReader::new(&mut client)
+    let actual = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_id, id)
         .await
         .expect("reader must load a valid event");
@@ -165,16 +182,18 @@ async fn reads_the_exact_decision_event_with_the_maximum_u64_version() {
         actual.unwrap().decision.unwrap().aggregate_version,
         u64::MAX
     );
-    assert!(tenant_context_is_absent(&client).await);
-    connection_task.abort();
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
 }
 
 #[tokio::test]
 async fn makes_cross_tenant_events_indistinguishable_from_absent_events() {
-    let Some(password) = integration_password() else {
+    let Some(passwords) = integration_passwords() else {
         return;
     };
-    let (mut client, connection_task) = connect_writer(password).await;
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
     let tenant_a = "tenant-m11-hidden-a";
     let tenant_b = "tenant-m11-hidden-b";
     let hidden = decision_event(
@@ -188,31 +207,33 @@ async fn makes_cross_tenant_events_indistinguishable_from_absent_events() {
     let hidden_id = projected_row(&hidden, tenant_b).event_id;
     let missing_id = projected_row(&missing, tenant_a).event_id;
 
-    append(&mut client, hidden, tenant_b).await;
+    append(&mut writer, hidden, tenant_b).await;
 
-    let cross_tenant = PostgresDecisionEventReader::new(&mut client)
+    let cross_tenant = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_a, hidden_id)
         .await
         .expect("cross-tenant lookup must not disclose an error");
-    assert!(tenant_context_is_absent(&client).await);
-    let absent = PostgresDecisionEventReader::new(&mut client)
+    assert!(tenant_context_is_absent(&reader).await);
+    let absent = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_a, missing_id)
         .await
         .expect("absent lookup must succeed");
 
     assert_eq!(cross_tenant, None);
     assert_eq!(cross_tenant, absent);
-    assert!(tenant_context_is_absent(&client).await);
-    connection_task.abort();
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
 }
 
 #[tokio::test]
 #[allow(deprecated)]
 async fn resolves_the_same_event_identifier_independently_for_each_tenant() {
-    let Some(password) = integration_password() else {
+    let Some(passwords) = integration_passwords() else {
         return;
     };
-    let (mut client, connection_task) = connect_writer(password).await;
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
     let tenant_a = "tenant-m11-shared-a";
     let tenant_b = "tenant-m11-shared-b";
     let event_a = decision_event(
@@ -230,43 +251,80 @@ async fn resolves_the_same_event_identifier_independently_for_each_tenant() {
         .id = "ES-M11-B".to_owned();
     let shared_id = projected_row(&event_a, tenant_a).event_id;
 
-    append(&mut client, event_a.clone(), tenant_a).await;
-    append(&mut client, event_b.clone(), tenant_b).await;
+    append(&mut writer, event_a.clone(), tenant_a).await;
+    append(&mut writer, event_b.clone(), tenant_b).await;
 
-    let loaded_a = PostgresDecisionEventReader::new(&mut client)
+    let loaded_a = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_a, shared_id)
         .await
         .expect("tenant A event must be readable");
-    let loaded_b = PostgresDecisionEventReader::new(&mut client)
+    let loaded_b = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_b, shared_id)
         .await
         .expect("tenant B event must be readable");
 
     assert_eq!(loaded_a, Some(event_a));
     assert_eq!(loaded_b, Some(event_b));
-    assert!(tenant_context_is_absent(&client).await);
-    connection_task.abort();
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
 }
 
 #[tokio::test]
 async fn rejects_a_corrupt_stored_event_without_leaking_details_or_tenant_context() {
-    let Some(password) = integration_password() else {
+    let Some(passwords) = integration_passwords() else {
         return;
     };
-    let (mut client, connection_task) = connect_writer(password).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
     let fixture_identity = decision_event(
         "00000000-0000-4000-8000-000000000001",
         "018f5a72-9c4b-7d31-8f6a-26f08f3fd401",
     );
     let fixture_id = projected_row(&fixture_identity, "tenant-fixture").event_id;
 
-    let error = PostgresDecisionEventReader::new(&mut client)
+    let error = PostgresDecisionEventReader::new(&mut reader)
         .get("tenant-fixture", fixture_id)
         .await
         .expect_err("legacy fixture is not a valid decision event");
 
     assert_eq!(error, ReadDecisionEventError::StoredEventRejected);
     assert_redacted(&error);
-    assert!(tenant_context_is_absent(&client).await);
-    connection_task.abort();
+    assert!(tenant_context_is_absent(&reader).await);
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn rejects_writer_for_reads_and_reader_for_appends() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m13-opposite-identities";
+    let event = decision_event(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b7401",
+        "018f5a72-9c4b-7d31-8f6a-26f08f3fd501",
+    );
+    let event_id = projected_row(&event, tenant_id).event_id;
+
+    let read_error = PostgresDecisionEventReader::new(&mut writer)
+        .get(tenant_id, event_id)
+        .await
+        .expect_err("writer identity must not be accepted for reads");
+    assert_eq!(read_error, ReadDecisionEventError::ReaderIdentityRejected);
+    assert_redacted(&read_error);
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let append_error = PostgresDecisionEventWriter::new(&mut reader)
+        .append(event, metadata(tenant_id))
+        .await
+        .expect_err("reader identity must not be accepted for appends");
+    assert_eq!(
+        append_error,
+        AppendDecisionEventError::WriterIdentityRejected
+    );
+    assert!(tenant_context_is_absent(&reader).await);
+
+    writer_task.abort();
+    reader_task.abort();
 }
