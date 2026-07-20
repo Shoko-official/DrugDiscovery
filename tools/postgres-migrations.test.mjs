@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   POSTGRES_IMAGE,
+  RUST_INTEGRATION_IMAGE,
   createContainerName,
   discoverMigrations,
   redactBoundedOutput,
@@ -11,8 +12,17 @@ import {
 
 const EXPECTED_IMAGE =
   "postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";
+const EXPECTED_RUST_IMAGE =
+  "rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1";
 const NONCE = "0123456789abcdef01234567";
 const CONTAINER_NAME = `bioworld-postgres-migrations-${NONCE}`;
+const WRITER_SOURCE_CONTAINER = `bioworld-postgres-writer-source-${NONCE}`;
+const WRITER_FETCH_CONTAINER = `bioworld-postgres-writer-fetch-${NONCE}`;
+const WRITER_BUILD_CONTAINER = `bioworld-postgres-writer-build-${NONCE}`;
+const WRITER_TEST_CONTAINER = `bioworld-postgres-writer-test-${NONCE}`;
+const WRITER_CARGO_VOLUME = `bioworld-postgres-writer-cargo-${NONCE}`;
+const WRITER_TARGET_VOLUME = `bioworld-postgres-writer-target-${NONCE}`;
+const WRITER_SOURCE_VOLUME = `bioworld-postgres-writer-source-${NONCE}`;
 const POSTGRES_PASSWORD = "0123456789abcdef".repeat(4);
 const MIGRATOR_PASSWORD = "123456789abcdef0".repeat(4);
 const WRITER_PASSWORD = "23456789abcdef01".repeat(4);
@@ -87,13 +97,55 @@ async function captureError(promise) {
 }
 
 function commandKind(args, options = {}) {
+  if (args[0] === "pull") {
+    return "writer-image-pull";
+  }
+  if (args[0] === "volume" && args[1] === "create") {
+    if (args.includes(WRITER_CARGO_VOLUME)) {
+      return "writer-cargo-volume-create";
+    }
+    return args.includes(WRITER_TARGET_VOLUME)
+      ? "writer-target-volume-create"
+      : "writer-source-volume-create";
+  }
+  if (args[0] === "volume" && args[1] === "rm") {
+    if (args.includes(WRITER_CARGO_VOLUME)) {
+      return "writer-cargo-volume-cleanup";
+    }
+    return args.includes(WRITER_TARGET_VOLUME)
+      ? "writer-target-volume-cleanup"
+      : "writer-source-volume-cleanup";
+  }
   if (args[0] === "run") {
+    if (args.includes(EXPECTED_RUST_IMAGE)) {
+      if (args.includes(`container:${CONTAINER_NAME}`)) {
+        return "writer-test";
+      }
+      if (args.includes(WRITER_SOURCE_CONTAINER)) {
+        return "writer-source-stage";
+      }
+      return args.includes(WRITER_FETCH_CONTAINER)
+        ? "writer-fetch"
+        : "writer-build";
+    }
     return "start";
   }
   if (args[0] === "logs") {
     return "logs";
   }
   if (args[0] === "rm") {
+    if (args.includes(WRITER_SOURCE_CONTAINER)) {
+      return "writer-source-stage-cleanup";
+    }
+    if (args.includes(WRITER_FETCH_CONTAINER)) {
+      return "writer-fetch-cleanup";
+    }
+    if (args.includes(WRITER_BUILD_CONTAINER)) {
+      return "writer-build-cleanup";
+    }
+    if (args.includes(WRITER_TEST_CONTAINER)) {
+      return "writer-test-cleanup";
+    }
     return "cleanup";
   }
   if (args.includes("pg_isready")) {
@@ -175,6 +227,384 @@ function runOptions(runCommand, time = clock(), overrides = {}) {
 
 test("pins the exact PostgreSQL 18.4 Bookworm image digest", () => {
   assert.equal(POSTGRES_IMAGE, EXPECTED_IMAGE);
+});
+
+test("pins the exact Rust 1.95 Bookworm integration image digest", () => {
+  assert.equal(RUST_INTEGRATION_IMAGE, EXPECTED_RUST_IMAGE);
+});
+
+test("builds writer tests without credentials and runs them only beside PostgreSQL", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { writerIntegration: true }),
+  );
+
+  assert.deepEqual(
+    calls.map(({ args, options }) => commandKind(args, options)),
+    [
+      "writer-image-pull",
+      "writer-cargo-volume-create",
+      "writer-target-volume-create",
+      "writer-source-volume-create",
+      "writer-source-stage",
+      "writer-fetch",
+      "writer-build",
+      "start",
+      "health",
+      "readiness",
+      "bootstrap",
+      "migration-0001",
+      "fixture",
+      "migration-0002",
+      "migration-0003",
+      "writer-access",
+      "verify",
+      "tenant-verify",
+      "owner-verify",
+      "writer-test",
+      "writer-test-cleanup",
+      "writer-build-cleanup",
+      "writer-fetch-cleanup",
+      "writer-source-stage-cleanup",
+      "cleanup",
+      "writer-source-volume-cleanup",
+      "writer-target-volume-cleanup",
+      "writer-cargo-volume-cleanup",
+    ],
+  );
+
+  const imagePull = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-image-pull",
+  );
+  assert.deepEqual(imagePull.args, ["pull", EXPECTED_RUST_IMAGE]);
+
+  const sourceStage = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-source-stage",
+  );
+  assert.ok(sourceStage.args.includes("none"));
+  assert.ok(
+    sourceStage.args.some((value) => value.endsWith("target=/workspace,readonly")),
+  );
+  assert.ok(
+    sourceStage.args.some((value) =>
+      value.includes(`source=${WRITER_SOURCE_VOLUME},target=/sanitized`),
+    ),
+  );
+  const sourceCommand = sourceStage.args.at(-1);
+  assert.match(sourceCommand, /git .*ls-files/);
+  assert.match(sourceCommand, /Cargo\.toml Cargo\.lock rust-toolchain\.toml/);
+  assert.match(sourceCommand, /apps\/desktop\/src-tauri crates proto/);
+
+  const fetch = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-fetch",
+  );
+  assert.ok(fetch.args.includes("bridge"));
+  assert.ok(
+    fetch.args.some((value) =>
+      value.includes(`source=${WRITER_SOURCE_VOLUME},target=/workspace,readonly`),
+    ),
+  );
+  assert.ok(!fetch.args.some((value) => value.includes("type=bind")));
+  assert.deepEqual(fetch.args.slice(-3), ["cargo", "fetch", "--locked"]);
+
+  const build = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-build",
+  );
+  assert.ok(build);
+  assert.ok(build.args.includes("none"));
+  assert.ok(!build.args.some((value) => value.includes("type=bind")));
+  assert.ok(
+    build.args.some((value) =>
+      value.includes(`source=${WRITER_SOURCE_VOLUME},target=/workspace,readonly`),
+    ),
+  );
+  assert.ok(build.args.includes("CARGO_HOME=/cargo"));
+  assert.ok(build.args.includes("CARGO_TARGET_DIR=/target"));
+  assert.ok(build.args.includes("CARGO_NET_OFFLINE=true"));
+  assert.ok(build.args.includes("RUSTUP_TOOLCHAIN=1.95.0"));
+  assert.ok(build.args.includes("--offline"));
+  assert.ok(build.args.includes("--no-run"));
+  assert.equal(build.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD, undefined);
+  assert.equal(build.options.env.POSTGRES_PASSWORD, undefined);
+  assert.equal(build.options.env.PGPASSWORD, undefined);
+
+  const runtime = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-test",
+  );
+  assert.ok(runtime);
+  assert.ok(runtime.args.includes(`container:${CONTAINER_NAME}`));
+  assert.ok(!runtime.args.some((value) => value.includes("type=bind")));
+  assert.ok(
+    runtime.args.some((value) =>
+      value.includes(`source=${WRITER_SOURCE_VOLUME},target=/workspace,readonly`),
+    ),
+  );
+  assert.ok(runtime.args.includes("BIOWORLD_POSTGRES_WRITER_PASSWORD"));
+  assert.ok(runtime.args.includes("BIOWORLD_POSTGRES_INTEGRATION_REQUIRED=1"));
+  assert.ok(runtime.args.includes("CARGO_NET_OFFLINE=true"));
+  assert.ok(runtime.args.includes("RUSTUP_TOOLCHAIN=1.95.0"));
+  assert.ok(runtime.args.includes("--offline"));
+  assert.ok(!runtime.args.includes("--publish"));
+  assert.ok(!runtime.args.includes("-p"));
+  assert.equal(
+    runtime.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD,
+    WRITER_PASSWORD,
+  );
+
+  const serializedArguments = calls
+    .flatMap(({ args }) => args)
+    .join(" ");
+  for (const secret of [POSTGRES_PASSWORD, MIGRATOR_PASSWORD, WRITER_PASSWORD]) {
+    assert.ok(!serializedArguments.includes(secret));
+  }
+});
+
+test("writer integration build failure cleans isolated containers and volumes", async () => {
+  const kinds = [];
+  const runCommand = async (_command, args, options = {}) => {
+    const kind = commandKind(args, options);
+    kinds.push(kind);
+    return kind === "writer-build" ? result(1, "", "build failed") : operationResult(kind);
+  };
+
+  await assert.rejects(
+    runPostgresMigrations(
+      runOptions(runCommand, undefined, { writerIntegration: true }),
+    ),
+    { message: "PostgreSQL writer integration build failed." },
+  );
+  assert.deepEqual(kinds, [
+    "writer-image-pull",
+    "writer-cargo-volume-create",
+    "writer-target-volume-create",
+    "writer-source-volume-create",
+    "writer-source-stage",
+    "writer-fetch",
+    "writer-build",
+    "writer-build-cleanup",
+    "writer-fetch-cleanup",
+    "writer-source-stage-cleanup",
+    "cleanup",
+    "writer-source-volume-cleanup",
+    "writer-target-volume-cleanup",
+    "writer-cargo-volume-cleanup",
+  ]);
+});
+
+test("writer integration runtime failure is redacted and fully cleaned", async () => {
+  const calls = [];
+  const diagnostics = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    const kind = commandKind(args, options);
+    return kind === "writer-test"
+      ? result(1, POSTGRES_PASSWORD, `${WRITER_PASSWORD}${SECRET}`)
+      : operationResult(kind);
+  };
+
+  await assert.rejects(
+    runPostgresMigrations(
+      runOptions(runCommand, undefined, {
+        writerIntegration: true,
+        reportDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      }),
+    ),
+    { message: "PostgreSQL writer integration verification failed." },
+  );
+  assert.deepEqual(
+    calls
+      .slice(-8)
+      .map(({ args, options }) => commandKind(args, options)),
+    [
+      "writer-test-cleanup",
+      "writer-build-cleanup",
+      "writer-fetch-cleanup",
+      "writer-source-stage-cleanup",
+      "cleanup",
+      "writer-source-volume-cleanup",
+      "writer-target-volume-cleanup",
+      "writer-cargo-volume-cleanup",
+    ],
+  );
+  assert.equal(diagnostics.length, 1);
+  for (const secret of [POSTGRES_PASSWORD, WRITER_PASSWORD, "admin:do-not-expose"]) {
+    assert.ok(!diagnostics[0].includes(secret));
+  }
+});
+
+test("interrupts writer build and runtime with unsignaled full cleanup", async (t) => {
+  for (const scenario of [
+    {
+      kind: "writer-source-stage",
+      cleanup: [
+        "writer-source-stage-cleanup",
+        "cleanup",
+        "writer-source-volume-cleanup",
+        "writer-target-volume-cleanup",
+        "writer-cargo-volume-cleanup",
+      ],
+    },
+    {
+      kind: "writer-fetch",
+      cleanup: [
+        "writer-fetch-cleanup",
+        "writer-source-stage-cleanup",
+        "cleanup",
+        "writer-source-volume-cleanup",
+        "writer-target-volume-cleanup",
+        "writer-cargo-volume-cleanup",
+      ],
+    },
+    {
+      kind: "writer-build",
+      cleanup: [
+        "writer-build-cleanup",
+        "writer-fetch-cleanup",
+        "writer-source-stage-cleanup",
+        "cleanup",
+        "writer-source-volume-cleanup",
+        "writer-target-volume-cleanup",
+        "writer-cargo-volume-cleanup",
+      ],
+    },
+    {
+      kind: "writer-test",
+      cleanup: [
+        "writer-test-cleanup",
+        "writer-build-cleanup",
+        "writer-fetch-cleanup",
+        "writer-source-stage-cleanup",
+        "cleanup",
+        "writer-source-volume-cleanup",
+        "writer-target-volume-cleanup",
+        "writer-cargo-volume-cleanup",
+      ],
+    },
+  ]) {
+    await t.test(scenario.kind, async () => {
+      const originalExitCode = process.exitCode;
+      const calls = [];
+      let interrupt;
+      let interrupted = false;
+      let unregistered = false;
+      process.exitCode = undefined;
+
+      try {
+        const runCommand = async (command, args, options = {}) => {
+          calls.push({ command, args, options });
+          const kind = commandKind(args, options);
+          if (kind === scenario.kind && !interrupted) {
+            interrupted = true;
+            interrupt();
+            return result(1, POSTGRES_PASSWORD, WRITER_PASSWORD);
+          }
+          return operationResult(kind);
+        };
+
+        const error = await captureError(
+          runPostgresMigrations(
+            runOptions(runCommand, undefined, {
+              writerIntegration: true,
+              signalRegistrar: (abortController, setExitCode) => {
+                interrupt = () => {
+                  setExitCode(130);
+                  abortController.abort();
+                };
+                return () => {
+                  unregistered = true;
+                };
+              },
+            }),
+          ),
+        );
+        assert.equal(
+          error.message,
+          "PostgreSQL migration verification interrupted.",
+        );
+        assert.equal(process.exitCode, 130);
+        assert.equal(unregistered, true);
+
+        const kinds = calls.map(({ args, options }) =>
+          commandKind(args, options),
+        );
+        const interruptedIndex = kinds.indexOf(scenario.kind);
+        assert.deepEqual(kinds.slice(interruptedIndex + 1), scenario.cleanup);
+        assert.equal(calls[interruptedIndex].options.signal.aborted, true);
+        for (const call of calls.slice(interruptedIndex + 1)) {
+          assert.equal(call.options.signal, undefined);
+        }
+      } finally {
+        process.exitCode = originalExitCode;
+      }
+    });
+  }
+});
+
+test("interrupts writer volume creation and removes every deterministic volume", async (t) => {
+  for (const interruptedKind of [
+    "writer-cargo-volume-create",
+    "writer-target-volume-create",
+    "writer-source-volume-create",
+  ]) {
+    await t.test(interruptedKind, async () => {
+      const originalExitCode = process.exitCode;
+      const calls = [];
+      let interrupt;
+      process.exitCode = undefined;
+
+      try {
+        const runCommand = async (command, args, options = {}) => {
+          calls.push({ command, args, options });
+          const kind = commandKind(args, options);
+          if (kind === interruptedKind) {
+            interrupt();
+            return result(1);
+          }
+          return operationResult(kind);
+        };
+
+        const error = await captureError(
+          runPostgresMigrations(
+            runOptions(runCommand, undefined, {
+              writerIntegration: true,
+              signalRegistrar: (abortController, setExitCode) => {
+                interrupt = () => {
+                  setExitCode(130);
+                  abortController.abort();
+                };
+                return () => {};
+              },
+            }),
+          ),
+        );
+
+        assert.equal(
+          error.message,
+          "PostgreSQL migration verification interrupted.",
+        );
+        const kinds = calls.map(({ args, options }) =>
+          commandKind(args, options),
+        );
+        const interruptedIndex = kinds.indexOf(interruptedKind);
+        assert.deepEqual(kinds.slice(interruptedIndex + 1), [
+          "cleanup",
+          "writer-source-volume-cleanup",
+          "writer-target-volume-cleanup",
+          "writer-cargo-volume-cleanup",
+        ]);
+        for (const call of calls.slice(interruptedIndex + 1)) {
+          assert.equal(call.options.signal, undefined);
+        }
+      } finally {
+        process.exitCode = originalExitCode;
+      }
+    });
+  }
 });
 
 test("discovers regular migration files in strict contiguous version order", () => {
@@ -307,6 +737,21 @@ test("rejects an invalid legacy upgrade boundary before Docker", async () => {
     );
     assert.equal(called, false);
   }
+
+  let called = false;
+  await assert.rejects(
+    runPostgresMigrations(
+      runOptions(
+        async () => {
+          called = true;
+          return result(0);
+        },
+        undefined,
+        { legacyUpgradeFromVersion: 2, writerIntegration: true },
+      ),
+    ),
+  );
+  assert.equal(called, false);
 });
 
 test("uses distinct bounded psql sessions in migration lifecycle order", async () => {

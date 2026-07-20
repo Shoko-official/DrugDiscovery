@@ -11,7 +11,12 @@ import { fileURLToPath } from "node:url";
 
 export const POSTGRES_IMAGE =
   "postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";
+export const RUST_INTEGRATION_IMAGE =
+  "rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1";
 
+const REPOSITORY_ROOT = realpathSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+);
 const DATABASE_NAME = "bioworld_migrations";
 const SUCCESS_MARKER = "bioworld_migrations_ready";
 const TENANT_SUCCESS_MARKER = "bioworld_tenant_access_ready";
@@ -26,6 +31,19 @@ const MAX_TOTAL_MIGRATION_BYTES = 8 * 1024 * 1024;
 const MAX_ENVIRONMENT_VALUE_BYTES = 16 * 1024;
 const COMMAND_TIMEOUT_MS = 120_000;
 const CLEANUP_TIMEOUT_MS = 30_000;
+const WRITER_BUILD_TIMEOUT_MS = 10 * 60_000;
+const WRITER_TEST_TIMEOUT_MS = 5 * 60_000;
+const WRITER_SOURCE_STAGE_SCRIPT = [
+  "umask 077",
+  "cd /workspace",
+  "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri crates proto | tar --null --files-from=- --create | tar --extract --directory=/sanitized",
+  "for source_path in crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/tests/postgres_writer.rs; do",
+  '  test -f "$source_path"',
+  '  test ! -L "$source_path"',
+  '  mkdir -p "/sanitized/$(dirname "$source_path")"',
+  '  cp "$source_path" "/sanitized/$source_path"',
+  "done",
+].join("\n");
 const DOCKER_ENVIRONMENT_KEYS = new Set([
   "APPDATA",
   "ALL_PROXY",
@@ -240,6 +258,19 @@ export function createContainerName(nonce) {
   return `bioworld-postgres-migrations-${nonce}`;
 }
 
+function createWriterIntegrationResources(nonce) {
+  createContainerName(nonce);
+  return {
+    sourceContainer: `bioworld-postgres-writer-source-${nonce}`,
+    fetchContainer: `bioworld-postgres-writer-fetch-${nonce}`,
+    buildContainer: `bioworld-postgres-writer-build-${nonce}`,
+    testContainer: `bioworld-postgres-writer-test-${nonce}`,
+    cargoVolume: `bioworld-postgres-writer-cargo-${nonce}`,
+    targetVolume: `bioworld-postgres-writer-target-${nonce}`,
+    sourceVolume: `bioworld-postgres-writer-source-${nonce}`,
+  };
+}
+
 export function discoverMigrations(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     throw new Error("PostgreSQL migrations are missing.");
@@ -376,6 +407,7 @@ export async function runPostgresMigrations({
   migratorPassword,
   writerPassword,
   legacyUpgradeFromVersion,
+  writerIntegration = false,
   runCommand = defaultRunCommand,
   now = Date.now,
   sleep = (milliseconds) =>
@@ -433,9 +465,11 @@ export async function runPostgresMigrations({
     typeof sleep !== "function" ||
     typeof runCommand !== "function" ||
     (signalRegistrar !== undefined && typeof signalRegistrar !== "function") ||
+    typeof writerIntegration !== "boolean" ||
     !Number.isSafeInteger(legacyMigrationCount) ||
     legacyMigrationCount < 0 ||
-    legacyMigrationCount >= migrations.length
+    legacyMigrationCount >= migrations.length ||
+    (writerIntegration && legacyMigrationCount !== 0)
   ) {
     throw new Error("PostgreSQL migration runner configuration is invalid.");
   }
@@ -459,6 +493,14 @@ export async function runPostgresMigrations({
   const writerEnvironment = buildDockerEnvironment(environment, {
     PGPASSWORD: writerPassword,
   });
+  const writerIntegrationEnvironment = writerIntegration
+    ? buildDockerEnvironment(environment, {
+        BIOWORLD_POSTGRES_WRITER_PASSWORD: writerPassword,
+      })
+    : undefined;
+  const writerResources = writerIntegration
+    ? createWriterIntegrationResources(nonce)
+    : undefined;
   const diagnosticSecrets = [
     postgresPassword,
     migratorPassword,
@@ -504,10 +546,28 @@ export async function runPostgresMigrations({
     );
     reportResult(logs);
   };
-  const cleanup = () =>
+  const cleanupDatabase = () =>
     invoke(
       runCommand,
       ["rm", "--force", "--volumes", containerName],
+      commandOptions(dockerEnvironment, {
+        redactions: diagnosticSecrets,
+        timeout: CLEANUP_TIMEOUT_MS,
+      }),
+    );
+  const cleanupContainer = (name) =>
+    invoke(
+      runCommand,
+      ["rm", "--force", "--volumes", name],
+      commandOptions(dockerEnvironment, {
+        redactions: diagnosticSecrets,
+        timeout: CLEANUP_TIMEOUT_MS,
+      }),
+    );
+  const cleanupVolume = (name) =>
+    invoke(
+      runCommand,
+      ["volume", "rm", "--force", name],
       commandOptions(dockerEnvironment, {
         redactions: diagnosticSecrets,
         timeout: CLEANUP_TIMEOUT_MS,
@@ -541,9 +601,169 @@ export async function runPostgresMigrations({
       throw new Error("PostgreSQL role bootstrap failed.");
     }
   };
+  let sourceContainerAttempted = false;
+  let fetchContainerAttempted = false;
+  let buildContainerAttempted = false;
+  let testContainerAttempted = false;
   let primaryError;
 
   try {
+    if (writerResources !== undefined) {
+      const rustImagePulled = await invoke(
+        runCommand,
+        ["pull", RUST_INTEGRATION_IMAGE],
+        activeOptions(dockerEnvironment, { timeout: WRITER_BUILD_TIMEOUT_MS }),
+      );
+      if (rustImagePulled.status !== 0) {
+        reportResult(rustImagePulled);
+        throw new Error("PostgreSQL writer integration image pull failed.");
+      }
+
+      const cargoVolume = await invoke(
+        runCommand,
+        ["volume", "create", "--name", writerResources.cargoVolume],
+        activeOptions(dockerEnvironment, { timeout: CLEANUP_TIMEOUT_MS }),
+      );
+      if (cargoVolume.status !== 0) {
+        reportResult(cargoVolume);
+        throw new Error("PostgreSQL writer integration storage failed.");
+      }
+      const targetVolume = await invoke(
+        runCommand,
+        ["volume", "create", "--name", writerResources.targetVolume],
+        activeOptions(dockerEnvironment, { timeout: CLEANUP_TIMEOUT_MS }),
+      );
+      if (targetVolume.status !== 0) {
+        reportResult(targetVolume);
+        throw new Error("PostgreSQL writer integration storage failed.");
+      }
+      const sourceVolume = await invoke(
+        runCommand,
+        ["volume", "create", "--name", writerResources.sourceVolume],
+        activeOptions(dockerEnvironment, { timeout: CLEANUP_TIMEOUT_MS }),
+      );
+      if (sourceVolume.status !== 0) {
+        reportResult(sourceVolume);
+        throw new Error("PostgreSQL writer integration storage failed.");
+      }
+
+      sourceContainerAttempted = true;
+      const sourceStaged = await invoke(
+        runCommand,
+        [
+          "run",
+          "--name",
+          writerResources.sourceContainer,
+          "--pull=never",
+          "--network",
+          "none",
+          "--cap-drop",
+          "ALL",
+          "--security-opt",
+          "no-new-privileges:true",
+          "--mount",
+          `type=bind,source=${REPOSITORY_ROOT},target=/workspace,readonly`,
+          "--mount",
+          `type=volume,source=${writerResources.sourceVolume},target=/sanitized`,
+          "--workdir",
+          "/workspace",
+          RUST_INTEGRATION_IMAGE,
+          "sh",
+          "-ceu",
+          WRITER_SOURCE_STAGE_SCRIPT,
+        ],
+        activeOptions(dockerEnvironment, { timeout: COMMAND_TIMEOUT_MS }),
+      );
+      if (sourceStaged.status !== 0) {
+        reportResult(sourceStaged);
+        throw new Error("PostgreSQL writer integration source staging failed.");
+      }
+
+      fetchContainerAttempted = true;
+      const dependenciesFetched = await invoke(
+        runCommand,
+        [
+          "run",
+          "--name",
+          writerResources.fetchContainer,
+          "--pull=never",
+          "--network",
+          "bridge",
+          "--cap-drop",
+          "ALL",
+          "--security-opt",
+          "no-new-privileges:true",
+          "--mount",
+          `type=volume,source=${writerResources.sourceVolume},target=/workspace,readonly`,
+          "--mount",
+          `type=volume,source=${writerResources.cargoVolume},target=/cargo`,
+          "--env",
+          "CARGO_HOME=/cargo",
+          "--env",
+          "RUSTUP_TOOLCHAIN=1.95.0",
+          "--workdir",
+          "/workspace",
+          RUST_INTEGRATION_IMAGE,
+          "cargo",
+          "fetch",
+          "--locked",
+        ],
+        activeOptions(dockerEnvironment, { timeout: WRITER_BUILD_TIMEOUT_MS }),
+      );
+      if (dependenciesFetched.status !== 0) {
+        reportResult(dependenciesFetched);
+        throw new Error("PostgreSQL writer integration dependency fetch failed.");
+      }
+
+      buildContainerAttempted = true;
+      const writerBuilt = await invoke(
+        runCommand,
+        [
+          "run",
+          "--name",
+          writerResources.buildContainer,
+          "--pull=never",
+          "--network",
+          "none",
+          "--cap-drop",
+          "ALL",
+          "--security-opt",
+          "no-new-privileges:true",
+          "--mount",
+          `type=volume,source=${writerResources.sourceVolume},target=/workspace,readonly`,
+          "--mount",
+          `type=volume,source=${writerResources.cargoVolume},target=/cargo`,
+          "--mount",
+          `type=volume,source=${writerResources.targetVolume},target=/target`,
+          "--env",
+          "CARGO_HOME=/cargo",
+          "--env",
+          "CARGO_TARGET_DIR=/target",
+          "--env",
+          "CARGO_NET_OFFLINE=true",
+          "--env",
+          "RUSTUP_TOOLCHAIN=1.95.0",
+          "--workdir",
+          "/workspace",
+          RUST_INTEGRATION_IMAGE,
+          "cargo",
+          "test",
+          "-p",
+          "bioworld-event-store-postgres",
+          "--test",
+          "postgres_writer",
+          "--locked",
+          "--offline",
+          "--no-run",
+        ],
+        activeOptions(dockerEnvironment, { timeout: WRITER_BUILD_TIMEOUT_MS }),
+      );
+      if (writerBuilt.status !== 0) {
+        reportResult(writerBuilt);
+        throw new Error("PostgreSQL writer integration build failed.");
+      }
+    }
+
     const started = await invoke(
       runCommand,
       [
@@ -745,18 +965,103 @@ export async function runPostgresMigrations({
         "PostgreSQL owner boundary verification returned an unexpected result.",
       );
     }
+
+    if (writerResources !== undefined) {
+      testContainerAttempted = true;
+      const writerTested = await invoke(
+        runCommand,
+        [
+          "run",
+          "--name",
+          writerResources.testContainer,
+          "--pull=never",
+          "--network",
+          `container:${containerName}`,
+          "--cap-drop",
+          "ALL",
+          "--security-opt",
+          "no-new-privileges:true",
+          "--mount",
+          `type=volume,source=${writerResources.sourceVolume},target=/workspace,readonly`,
+          "--mount",
+          `type=volume,source=${writerResources.cargoVolume},target=/cargo`,
+          "--mount",
+          `type=volume,source=${writerResources.targetVolume},target=/target`,
+          "--env",
+          "BIOWORLD_POSTGRES_WRITER_PASSWORD",
+          "--env",
+          "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED=1",
+          "--env",
+          "CARGO_HOME=/cargo",
+          "--env",
+          "CARGO_TARGET_DIR=/target",
+          "--env",
+          "CARGO_NET_OFFLINE=true",
+          "--env",
+          "RUSTUP_TOOLCHAIN=1.95.0",
+          "--workdir",
+          "/workspace",
+          RUST_INTEGRATION_IMAGE,
+          "cargo",
+          "test",
+          "--package",
+          "bioworld-event-store-postgres",
+          "--test",
+          "postgres_writer",
+          "--locked",
+          "--offline",
+        ],
+        activeOptions(writerIntegrationEnvironment, {
+          timeout: WRITER_TEST_TIMEOUT_MS,
+        }),
+      );
+      if (writerTested.status !== 0) {
+        reportResult(writerTested);
+        throw new Error("PostgreSQL writer integration verification failed.");
+      }
+    }
   } catch (error) {
     primaryError =
       error instanceof Error
         ? error
         : new Error("PostgreSQL migration verification failed.");
   } finally {
-    const removed = await cleanup();
+    let cleanupFailed = false;
+    if (testContainerAttempted && writerResources !== undefined) {
+      const removed = await cleanupContainer(writerResources.testContainer);
+      cleanupFailed ||= removed.status !== 0;
+    }
+    if (buildContainerAttempted && writerResources !== undefined) {
+      const removed = await cleanupContainer(writerResources.buildContainer);
+      cleanupFailed ||= removed.status !== 0;
+    }
+    if (fetchContainerAttempted && writerResources !== undefined) {
+      const removed = await cleanupContainer(writerResources.fetchContainer);
+      cleanupFailed ||= removed.status !== 0;
+    }
+    if (sourceContainerAttempted && writerResources !== undefined) {
+      const removed = await cleanupContainer(writerResources.sourceContainer);
+      cleanupFailed ||= removed.status !== 0;
+    }
+    const removed = await cleanupDatabase();
+    cleanupFailed ||= removed.status !== 0;
+    if (writerResources !== undefined) {
+      const removedVolume = await cleanupVolume(writerResources.sourceVolume);
+      cleanupFailed ||= removedVolume.status !== 0;
+    }
+    if (writerResources !== undefined) {
+      const removedVolume = await cleanupVolume(writerResources.targetVolume);
+      cleanupFailed ||= removedVolume.status !== 0;
+    }
+    if (writerResources !== undefined) {
+      const removedVolume = await cleanupVolume(writerResources.cargoVolume);
+      cleanupFailed ||= removedVolume.status !== 0;
+    }
     unregisterSignals();
     if (signalExitCode !== undefined) {
       process.exitCode = signalExitCode;
       primaryError = new Error("PostgreSQL migration verification interrupted.");
-    } else if (removed.status !== 0 && primaryError === undefined) {
+    } else if (cleanupFailed && primaryError === undefined) {
       primaryError = new Error(
         "PostgreSQL migration container cleanup failed.",
       );
@@ -854,14 +1159,14 @@ const isMain =
 
 if (isMain) {
   try {
-    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    const inputs = loadInputs(repositoryRoot);
+    const inputs = loadInputs(REPOSITORY_ROOT);
     await runPostgresMigrations({
       ...inputs,
       nonce: randomBytes(12).toString("hex"),
       postgresPassword: randomBytes(32).toString("hex"),
       migratorPassword: randomBytes(32).toString("hex"),
       writerPassword: randomBytes(32).toString("hex"),
+      writerIntegration: true,
     });
     await runPostgresMigrations({
       ...inputs,
