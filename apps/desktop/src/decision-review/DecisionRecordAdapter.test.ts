@@ -56,9 +56,15 @@ describe("toDecisionSummary", () => {
 
     expect(summary).toEqual({
       decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+      couId: "COU-001",
+      aggregateVersion: "7",
       recommendation: "stop_program",
       domainAssessment: "unknown",
-      evidenceSnapshotId: "ES-001",
+      rationale: ["Evidence coverage is incomplete."],
+      evidence: {
+        id: "ES-001",
+        sha256: validSha256,
+      },
     });
   });
 
@@ -81,13 +87,13 @@ describe("toDecisionSummary", () => {
     expectAdapterError(completeRecord(recommendation), code);
   });
 
-  it("projects the legacy evidence ID when nested evidence is absent", () => {
+  it("projects legacy evidence without a digest when nested evidence is absent", () => {
     const record = completeRecord();
     record.evidence = undefined;
 
     const summary = toDecisionSummary(record, "unknown");
 
-    expect(summary.evidenceSnapshotId).toBe("ES-001");
+    expect(summary.evidence).toEqual({ id: "ES-001", sha256: null });
   });
 
   it("projects nested evidence when the legacy ID is absent", () => {
@@ -96,7 +102,7 @@ describe("toDecisionSummary", () => {
 
     const summary = toDecisionSummary(record, "unknown");
 
-    expect(summary.evidenceSnapshotId).toBe("ES-001");
+    expect(summary.evidence).toEqual({ id: "ES-001", sha256: validSha256 });
   });
 
   it("rejects a record with no nested or legacy evidence ID", () => {
@@ -156,11 +162,32 @@ describe("toDecisionSummary", () => {
     },
   );
 
+  it("preserves the maximum uint64 aggregate version exactly", () => {
+    const record = completeRecord();
+    record.aggregateVersion = 18_446_744_073_709_551_615n;
+
+    const summary = toDecisionSummary(record, "unknown");
+
+    expect(summary.aggregateVersion).toBe("18446744073709551615");
+  });
+
   it("rejects a decision with no meaningful rationale", () => {
     const record = completeRecord();
     record.rationale = ["  ", "\t"];
 
     expectAdapterError(record, "missing_rationale");
+  });
+
+  it("preserves meaningful rationale order and text", () => {
+    const record = completeRecord();
+    record.rationale = ["  First reason.  ", "   ", "Second reason.", "\t"];
+
+    const summary = toDecisionSummary(record, "unknown");
+
+    expect(summary.rationale).toEqual([
+      "  First reason.  ",
+      "Second reason.",
+    ]);
   });
 
   it("reports structural evidence errors before aggregate errors", () => {

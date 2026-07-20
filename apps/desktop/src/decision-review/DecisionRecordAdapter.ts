@@ -37,7 +37,7 @@ const uuid =
 
 type ResolvedEvidence =
   | { kind: "nested"; id: string; sha256: string }
-  | { kind: "legacy"; id: string };
+  | { kind: "legacy"; id: string; sha256: null };
 
 function resolveEvidence(record: DecisionRecord): ResolvedEvidence {
   if (record.evidence) {
@@ -70,7 +70,7 @@ function resolveEvidence(record: DecisionRecord): ResolvedEvidence {
     );
   }
 
-  return { kind: "legacy", id: record.evidenceSnapshotId };
+  return { kind: "legacy", id: record.evidenceSnapshotId, sha256: null };
 }
 
 function validateEvidenceDigest(evidence: ResolvedEvidence): void {
@@ -135,7 +135,10 @@ export function toDecisionSummary(
   }
   const recommendation = toRecommendation(record.recommendation);
   validateEvidenceDigest(evidence);
-  if (record.rationale.every((rationale) => rationale.trim().length === 0)) {
+  const rationale = record.rationale.filter(
+    (entry) => entry.trim().length > 0,
+  );
+  if (rationale.length === 0) {
     throw new DecisionRecordAdapterError(
       "missing_rationale",
       "Decision rationale is required",
@@ -144,8 +147,14 @@ export function toDecisionSummary(
 
   return {
     decisionId: record.decisionId,
+    couId: record.couId,
+    aggregateVersion: record.aggregateVersion.toString(),
     recommendation,
     domainAssessment,
-    evidenceSnapshotId: evidence.id,
+    rationale,
+    evidence: {
+      id: evidence.id,
+      sha256: evidence.sha256,
+    },
   };
 }

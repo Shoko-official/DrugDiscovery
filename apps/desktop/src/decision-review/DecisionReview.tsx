@@ -15,9 +15,15 @@ export type DomainAssessment =
 
 export type DecisionSummary = {
   decisionId: string;
+  couId: string;
+  aggregateVersion: string;
   recommendation: Recommendation;
   domainAssessment: DomainAssessment;
-  evidenceSnapshotId: string;
+  rationale: readonly string[];
+  evidence: {
+    id: string;
+    sha256: string | null;
+  };
 };
 
 export type DecisionReviewContext = "runtime" | "preview";
@@ -70,8 +76,8 @@ function LoadingState({
     <section
       className="review-state"
       aria-labelledby="loading-state-title"
-      aria-busy="true"
-      aria-live="polite"
+      aria-atomic="true"
+      role="status"
     >
       <p className="section-label">Decision state</p>
       <h2 id="loading-state-title">Loading decision review</h2>
@@ -180,12 +186,19 @@ function ReadyState({
             <dd>{assessment}</dd>
           </div>
           <div>
-            <dt>Evidence snapshot</dt>
-            <dd className="technical-value">{decision.evidenceSnapshotId}</dd>
+            <dt>COU</dt>
+            <dd className="technical-value">{decision.couId}</dd>
+          </div>
+          <div>
+            <dt>Aggregate version</dt>
+            <dd className="technical-value">{decision.aggregateVersion}</dd>
           </div>
         </dl>
 
-        <section className="review-interpretation" aria-labelledby="review-status-title">
+        <section
+          className="review-interpretation"
+          aria-labelledby="review-status-title"
+        >
           <h3 id="review-status-title">Review status</h3>
           <p>
             Assessment incomplete. Review remains blocked until evidence coverage
@@ -193,16 +206,46 @@ function ReadyState({
           </p>
         </section>
 
-        <section className="evidence-status" aria-labelledby="evidence-status-title">
-          <div>
-            <h3 id="evidence-status-title">Evidence availability</h3>
-            <p>
-              {isRuntime
-                ? "Evidence contents are not included in this review response."
-                : "Evidence contents unavailable in preview."}
-            </p>
-          </div>
-          <span className="status status--neutral">Unavailable</span>
+        <section
+          className="rationale-section"
+          aria-labelledby="decision-rationale-title"
+        >
+          <p className="section-label">Recorded basis</p>
+          <h3 id="decision-rationale-title">Decision rationale</h3>
+          <ol className="rationale-list">
+            {decision.rationale.map((rationale, index) => (
+              <li key={`${index}-${rationale}`}>{rationale}</li>
+            ))}
+          </ol>
+        </section>
+
+        <section
+          className="evidence-reference"
+          aria-labelledby="evidence-reference-title"
+        >
+          <header className="evidence-reference__header">
+            <div>
+              <p className="section-label">Traceability</p>
+              <h3 id="evidence-reference-title">Evidence reference</h3>
+            </div>
+            <span className="status status--neutral">Reference only</span>
+          </header>
+          <dl className="evidence-reference__facts">
+            <div>
+              <dt>Reference ID</dt>
+              <dd className="technical-value">{decision.evidence.id}</dd>
+            </div>
+            <div>
+              <dt>SHA-256</dt>
+              <dd className="technical-value">
+                {decision.evidence.sha256 ??
+                  "Legacy reference: SHA-256 unavailable"}
+              </dd>
+            </div>
+          </dl>
+          <p className="evidence-reference__note">
+            Evidence content is not included in this decision review.
+          </p>
         </section>
       </article>
     </>

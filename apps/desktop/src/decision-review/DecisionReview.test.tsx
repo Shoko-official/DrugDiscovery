@@ -4,13 +4,32 @@ import { describe, expect, it } from "vitest";
 import { DecisionReview } from "./DecisionReview";
 import { decisionPreviewFixture } from "./decisionReviewFixture";
 
+const tracedDecision = {
+  decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+  couId: "COU-001",
+  aggregateVersion: "1",
+  recommendation: "abstain",
+  domainAssessment: "unknown",
+  rationale: [
+    "Evidence coverage is incomplete.",
+    "Domain applicability has not been established.",
+  ],
+  evidence: {
+    id: "ES-001",
+    sha256:
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  },
+} as const;
+
 describe("DecisionReview", () => {
   it("renders a stable loading state", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview state={{ kind: "loading", context: "preview" }} />,
     );
 
-    expect(markup).toContain('aria-busy="true"');
+    expect(markup).toContain('role="status"');
+    expect(markup).toContain('aria-atomic="true"');
+    expect(markup).not.toContain('aria-busy="true"');
     expect(markup).toContain("Loading decision review");
     expect(markup).not.toContain(decisionPreviewFixture.decision.decisionId);
   });
@@ -54,12 +73,16 @@ describe("DecisionReview", () => {
 
   it("identifies fixture content before rendering decision values", () => {
     const markup = renderToStaticMarkup(
-      <DecisionReview state={decisionPreviewFixture} />,
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "preview_fixture",
+          decision: tracedDecision,
+        }}
+      />,
     );
     const boundaryIndex = markup.indexOf("Preview fixture");
-    const decisionIndex = markup.indexOf(
-      decisionPreviewFixture.decision.decisionId,
-    );
+    const decisionIndex = markup.indexOf(tracedDecision.decisionId);
 
     expect(boundaryIndex).toBeGreaterThanOrEqual(0);
     expect(decisionIndex).toBeGreaterThan(boundaryIndex);
@@ -68,8 +91,74 @@ describe("DecisionReview", () => {
     expect(markup).toContain("Abstain");
     expect(markup).toContain("Domain assessment");
     expect(markup).toContain("Unknown");
-    expect(markup).toContain("Evidence contents unavailable in preview.");
-    expect(markup).not.toContain("Open evidence");
+    expect(markup).toContain("COU");
+    expect(markup).toContain("COU-001");
+    expect(markup).toContain("Aggregate version");
+    expect(markup).toContain(">1</dd>");
+    expect(markup).toContain("Review remains blocked");
+  });
+
+  it("renders rationale in source order and an honest evidence reference", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "preview_fixture",
+          decision: tracedDecision,
+        }}
+      />,
+    );
+    const firstRationale = markup.indexOf(tracedDecision.rationale[0]);
+    const secondRationale = markup.indexOf(tracedDecision.rationale[1]);
+
+    expect(markup).toContain("Decision rationale");
+    expect(markup).toContain("<ol");
+    expect(firstRationale).toBeGreaterThanOrEqual(0);
+    expect(secondRationale).toBeGreaterThan(firstRationale);
+    expect(markup).toContain("Evidence reference");
+    expect(markup).toContain("Reference ID");
+    expect(markup).toContain("SHA-256");
+    expect(markup).toContain(tracedDecision.evidence.sha256);
+    expect(markup).toContain("Reference only");
+    expect(markup).toContain(
+      "Evidence content is not included in this decision review.",
+    );
+    expect(markup).not.toContain("verified");
+    expect(markup).not.toContain("<button");
+  });
+
+  it("renders the maximum uint64 aggregate version exactly", () => {
+    const aggregateVersion = "18446744073709551615";
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "preview_fixture",
+          decision: { ...tracedDecision, aggregateVersion },
+        }}
+      />,
+    );
+
+    expect(markup).toContain(`>${aggregateVersion}</dd>`);
+  });
+
+  it("labels a legacy evidence reference without implying digest verification", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "bundled_sample",
+          decision: {
+            ...tracedDecision,
+            evidence: { id: "ES-LEGACY-001", sha256: null },
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Legacy reference: SHA-256 unavailable");
+    expect(markup).toContain("Reference only");
+    expect(markup).not.toContain("<button");
   });
 
   it("renders the stop_program recommendation", () => {
@@ -79,7 +168,7 @@ describe("DecisionReview", () => {
           kind: "ready",
           source: "preview_fixture",
           decision: {
-            ...decisionPreviewFixture.decision,
+            ...tracedDecision,
             recommendation: "stop_program",
           },
         }}
@@ -95,6 +184,7 @@ describe("DecisionReview", () => {
       <DecisionReview
         state={{
           ...decisionPreviewFixture,
+          decision: tracedDecision,
           source: "bundled_sample",
         }}
       />,
@@ -104,7 +194,7 @@ describe("DecisionReview", () => {
     expect(markup).toContain("Bundled sample");
     expect(markup).toContain("Loaded through local runtime. Not persisted.");
     expect(markup).toContain(
-      "Evidence contents are not included in this review response.",
+      "Evidence content is not included in this decision review.",
     );
     expect(markup).not.toContain("Not connected to decision runtime.");
   });
