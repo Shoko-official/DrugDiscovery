@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const USAGE = "Usage: node tools/native-desktop.mjs <preflight|check|build>";
+const USAGE =
+  "Usage: node tools/native-desktop.mjs <preflight|check|test|clippy|build>";
 const TEMPORARY_KEYS = new Set(["BIOWORLD_VSDEVCMD", "BIOWORLD_ENV_MARKER"]);
 const EXACT_CHILD_KEYS = new Set(
   [
@@ -302,7 +303,10 @@ export function parseEnvironmentDump(output, marker) {
 
 export function parseMode(arguments_) {
   const mode = arguments_[0] ?? "preflight";
-  if (arguments_.length > 1 || !["preflight", "check", "build"].includes(mode)) {
+  if (
+    arguments_.length > 1 ||
+    !["preflight", "check", "test", "clippy", "build"].includes(mode)
+  ) {
     throw new Error(USAGE);
   }
   return mode;
@@ -330,6 +334,29 @@ export function commandForMode(mode, repositoryRoot) {
     return {
       command: "cargo",
       args: ["check", "-p", "bioworld-desktop", "--locked"],
+      cwd: repositoryRoot,
+    };
+  }
+  if (mode === "test") {
+    return {
+      command: "cargo",
+      args: ["test", "-p", "bioworld-desktop", "--locked"],
+      cwd: repositoryRoot,
+    };
+  }
+  if (mode === "clippy") {
+    return {
+      command: "cargo",
+      args: [
+        "clippy",
+        "-p",
+        "bioworld-desktop",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+      ],
       cwd: repositoryRoot,
     };
   }
