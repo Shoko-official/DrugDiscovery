@@ -20,11 +20,13 @@ const REPOSITORY_ROOT = realpathSync(
 const DATABASE_NAME = "bioworld_migrations";
 const SUCCESS_MARKER = "bioworld_migrations_ready";
 const TENANT_SUCCESS_MARKER = "bioworld_tenant_access_ready";
+const READER_SUCCESS_MARKER = "bioworld_reader_access_ready";
 const OWNER_SUCCESS_MARKER = "bioworld_owner_boundary_ready";
 const POSTGRES_USER = "postgres";
 const OWNER_ROLE = "bioworld_owner";
 const MIGRATOR_ROLE = "bioworld_migrator";
 const WRITER_ROLE = "bioworld_writer";
+const READER_ROLE = "bioworld_reader";
 const MAX_BUFFER = 64 * 1024;
 const MAX_MIGRATION_BYTES = 1024 * 1024;
 const MAX_TOTAL_MIGRATION_BYTES = 8 * 1024 * 1024;
@@ -400,12 +402,15 @@ export async function runPostgresMigrations({
   verificationSql,
   roleBootstrapSql,
   writerAccessSql,
+  readerAccessSql,
   tenantVerificationSql,
+  readerVerificationSql,
   ownerVerificationSql,
   nonce,
   postgresPassword,
   migratorPassword,
   writerPassword,
+  readerPassword,
   legacyUpgradeFromVersion,
   writerIntegration = false,
   runCommand = defaultRunCommand,
@@ -432,9 +437,17 @@ export async function runPostgresMigrations({
     writerAccessSql,
     "PostgreSQL writer access provisioning",
   );
+  const readerAccess = validateSql(
+    readerAccessSql,
+    "PostgreSQL reader access provisioning",
+  );
   const tenantVerification = validateSql(
     tenantVerificationSql,
     "PostgreSQL tenant verification",
+  );
+  const readerVerification = validateSql(
+    readerVerificationSql,
+    "PostgreSQL reader verification",
   );
   const ownerVerification = validateSql(
     ownerVerificationSql,
@@ -443,7 +456,12 @@ export async function runPostgresMigrations({
   const containerName = createContainerName(nonce);
   const legacyMigrationCount =
     legacyUpgradeFromVersion === undefined ? 0 : legacyUpgradeFromVersion;
-  const passwords = [postgresPassword, migratorPassword, writerPassword];
+  const passwords = [
+    postgresPassword,
+    migratorPassword,
+    writerPassword,
+    readerPassword,
+  ];
   if (
     passwords.some(
       (password) =>
@@ -486,6 +504,7 @@ export async function runPostgresMigrations({
     PGPASSWORD: postgresPassword,
     BIOWORLD_MIGRATOR_PASSWORD: migratorPassword,
     BIOWORLD_WRITER_PASSWORD: writerPassword,
+    BIOWORLD_READER_PASSWORD: readerPassword,
   });
   const migratorEnvironment = buildDockerEnvironment(environment, {
     PGPASSWORD: migratorPassword,
@@ -493,9 +512,13 @@ export async function runPostgresMigrations({
   const writerEnvironment = buildDockerEnvironment(environment, {
     PGPASSWORD: writerPassword,
   });
+  const readerEnvironment = buildDockerEnvironment(environment, {
+    PGPASSWORD: readerPassword,
+  });
   const writerIntegrationEnvironment = writerIntegration
     ? buildDockerEnvironment(environment, {
         BIOWORLD_POSTGRES_WRITER_PASSWORD: writerPassword,
+        BIOWORLD_POSTGRES_READER_PASSWORD: readerPassword,
       })
     : undefined;
   const writerResources = writerIntegration
@@ -505,6 +528,7 @@ export async function runPostgresMigrations({
     postgresPassword,
     migratorPassword,
     writerPassword,
+    readerPassword,
     ...Object.entries(startEnvironment)
       .filter(
         ([key, value]) =>
@@ -589,6 +613,7 @@ export async function runPostgresMigrations({
           "PGPASSWORD",
           "BIOWORLD_MIGRATOR_PASSWORD",
           "BIOWORLD_WRITER_PASSWORD",
+          "BIOWORLD_READER_PASSWORD",
         ],
         singleTransaction: true,
       }),
@@ -906,6 +931,22 @@ export async function runPostgresMigrations({
       throw new Error("PostgreSQL writer access provisioning failed.");
     }
 
+    const readerProvisioned = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        username: MIGRATOR_ROLE,
+        environmentKeys: ["PGPASSWORD"],
+        singleTransaction: true,
+      }),
+      activeOptions(migratorEnvironment, {
+        input: ownerTransactionInput("grant-reader-access.sql", readerAccess),
+      }),
+    );
+    if (readerProvisioned.status !== 0) {
+      reportResult(readerProvisioned);
+      throw new Error("PostgreSQL reader access provisioning failed.");
+    }
+
     const verified = await invoke(
       runCommand,
       psqlArgs(containerName, {
@@ -942,6 +983,26 @@ export async function runPostgresMigrations({
     if (tenantVerified.stdout.trim() !== TENANT_SUCCESS_MARKER) {
       throw new Error(
         "PostgreSQL tenant access verification returned an unexpected result.",
+      );
+    }
+
+    const readerVerified = await invoke(
+      runCommand,
+      psqlArgs(containerName, {
+        username: READER_ROLE,
+        environmentKeys: ["PGPASSWORD"],
+        tuplesOnly: true,
+        unaligned: true,
+      }),
+      activeOptions(readerEnvironment, { input: readerVerification }),
+    );
+    if (readerVerified.status !== 0) {
+      reportResult(readerVerified);
+      throw new Error("PostgreSQL reader access verification failed.");
+    }
+    if (readerVerified.stdout.trim() !== READER_SUCCESS_MARKER) {
+      throw new Error(
+        "PostgreSQL reader access verification returned an unexpected result.",
       );
     }
 
@@ -988,6 +1049,8 @@ export async function runPostgresMigrations({
           `type=volume,source=${writerResources.targetVolume},target=/target`,
           "--env",
           "BIOWORLD_POSTGRES_WRITER_PASSWORD",
+          "--env",
+          "BIOWORLD_POSTGRES_READER_PASSWORD",
           "--env",
           "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED=1",
           "--env",
@@ -1138,11 +1201,17 @@ function loadInputs(repositoryRoot) {
     writerAccessSql: readBoundedFile(
       resolve(toolsRoot, "grant-writer-access.sql"),
     ),
+    readerAccessSql: readBoundedFile(
+      resolve(toolsRoot, "grant-reader-access.sql"),
+    ),
     verificationSql: readBoundedFile(
       resolve(toolsRoot, "verify-migrations.sql"),
     ),
     tenantVerificationSql: readBoundedFile(
       resolve(toolsRoot, "verify-tenant-access.sql"),
+    ),
+    readerVerificationSql: readBoundedFile(
+      resolve(toolsRoot, "verify-reader-access.sql"),
     ),
     ownerVerificationSql: readBoundedFile(
       resolve(toolsRoot, "verify-owner-boundary.sql"),
@@ -1164,6 +1233,7 @@ if (isMain) {
       postgresPassword: randomBytes(32).toString("hex"),
       migratorPassword: randomBytes(32).toString("hex"),
       writerPassword: randomBytes(32).toString("hex"),
+      readerPassword: randomBytes(32).toString("hex"),
       writerIntegration: true,
     });
     await runPostgresMigrations({
@@ -1172,6 +1242,7 @@ if (isMain) {
       postgresPassword: randomBytes(32).toString("hex"),
       migratorPassword: randomBytes(32).toString("hex"),
       writerPassword: randomBytes(32).toString("hex"),
+      readerPassword: randomBytes(32).toString("hex"),
       legacyUpgradeFromVersion: 2,
     });
     console.log("PostgreSQL fresh install and legacy upgrade verified.");

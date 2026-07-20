@@ -1,6 +1,7 @@
 \set ON_ERROR_STOP on
 \getenv migrator_password BIOWORLD_MIGRATOR_PASSWORD
 \getenv writer_password BIOWORLD_WRITER_PASSWORD
+\getenv reader_password BIOWORLD_READER_PASSWORD
 
 CREATE ROLE bioworld_owner
   NOLOGIN
@@ -31,6 +32,16 @@ CREATE ROLE bioworld_writer
   NOBYPASSRLS
   PASSWORD :'writer_password';
 
+CREATE ROLE bioworld_reader
+  LOGIN
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOINHERIT
+  NOREPLICATION
+  NOBYPASSRLS
+  PASSWORD :'reader_password';
+
 GRANT bioworld_owner TO bioworld_migrator
   WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
 
@@ -54,9 +65,12 @@ ALTER SCHEMA public OWNER TO bioworld_owner;
 
 REVOKE ALL ON DATABASE bioworld_migrations FROM PUBLIC;
 GRANT CONNECT ON DATABASE bioworld_migrations
-  TO bioworld_migrator, bioworld_writer;
+  TO bioworld_migrator, bioworld_writer, bioworld_reader;
 
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 
 ALTER ROLE bioworld_writer IN DATABASE bioworld_migrations
+  SET search_path = pg_catalog;
+
+ALTER ROLE bioworld_reader IN DATABASE bioworld_migrations
   SET search_path = pg_catalog;

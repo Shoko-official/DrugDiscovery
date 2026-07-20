@@ -17,7 +17,7 @@ const EVENT_ID_CONSTRAINT: &str = "scientific_event_pkey";
 const STREAM_VERSION_CONSTRAINT: &str = "scientific_event_stream_version_key";
 
 #[derive(Clone, Copy)]
-struct WriterRoleAttributes {
+struct RoleAttributes {
     is_superuser: bool,
     bypasses_row_security: bool,
     can_create_database: bool,
@@ -157,8 +157,15 @@ async fn append_in_transaction(
     Ok(())
 }
 
-pub(crate) async fn verify_writer_identity(
+async fn verify_writer_identity(
     transaction: &Transaction<'_>,
+) -> Result<(), AppendDecisionEventError> {
+    verify_role_identity(transaction, WRITER_ROLE).await
+}
+
+async fn verify_role_identity(
+    transaction: &Transaction<'_>,
+    expected_role: &str,
 ) -> Result<(), AppendDecisionEventError> {
     let identity = transaction
         .query_opt(
@@ -174,7 +181,7 @@ pub(crate) async fn verify_writer_identity(
     let current_name: String = identity
         .try_get("current_name")
         .map_err(|_| AppendDecisionEventError::WriterIdentityRejected)?;
-    let attributes = WriterRoleAttributes {
+    let attributes = RoleAttributes {
         is_superuser: identity
             .try_get("rolsuper")
             .map_err(|_| AppendDecisionEventError::WriterIdentityRejected)?,
@@ -201,20 +208,21 @@ pub(crate) async fn verify_writer_identity(
             .map_err(|_| AppendDecisionEventError::WriterIdentityRejected)?,
     };
 
-    if !writer_identity_is_valid(&session_name, &current_name, attributes) {
+    if !role_identity_is_valid(&session_name, &current_name, expected_role, attributes) {
         return Err(AppendDecisionEventError::WriterIdentityRejected);
     }
 
     Ok(())
 }
 
-fn writer_identity_is_valid(
+fn role_identity_is_valid(
     session_name: &str,
     current_name: &str,
-    attributes: WriterRoleAttributes,
+    expected_role: &str,
+    attributes: RoleAttributes,
 ) -> bool {
-    session_name == WRITER_ROLE
-        && current_name == WRITER_ROLE
+    session_name == expected_role
+        && current_name == expected_role
         && !attributes.is_superuser
         && !attributes.bypasses_row_security
         && !attributes.can_create_database
@@ -321,8 +329,8 @@ fn classify_server_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendDecisionEventError, RollbackPrimary, WriterRoleAttributes, classify_commit_failure,
-        classify_server_failure, rollback_primary, writer_identity_is_valid,
+        AppendDecisionEventError, RoleAttributes, RollbackPrimary, WRITER_ROLE,
+        classify_commit_failure, classify_server_failure, role_identity_is_valid, rollback_primary,
     };
 
     #[test]
@@ -406,7 +414,7 @@ mod tests {
 
     #[test]
     fn validates_the_exact_least_privilege_writer_identity() {
-        let valid = WriterRoleAttributes {
+        let valid = RoleAttributes {
             is_superuser: false,
             bypasses_row_security: false,
             can_create_database: false,
@@ -416,51 +424,63 @@ mod tests {
             can_replicate: false,
             has_memberships: false,
         };
-        assert!(writer_identity_is_valid(
+        assert!(role_identity_is_valid(
             "bioworld_writer",
             "bioworld_writer",
+            WRITER_ROLE,
             valid,
         ));
-        assert!(!writer_identity_is_valid("other", "bioworld_writer", valid,));
-        assert!(!writer_identity_is_valid("bioworld_writer", "other", valid,));
+        assert!(!role_identity_is_valid(
+            "other",
+            "bioworld_writer",
+            WRITER_ROLE,
+            valid,
+        ));
+        assert!(!role_identity_is_valid(
+            "bioworld_writer",
+            "other",
+            WRITER_ROLE,
+            valid,
+        ));
 
         for attributes in [
-            WriterRoleAttributes {
+            RoleAttributes {
                 is_superuser: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 bypasses_row_security: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 can_create_database: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 can_create_role: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 inherits_roles: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 can_login: false,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 can_replicate: true,
                 ..valid
             },
-            WriterRoleAttributes {
+            RoleAttributes {
                 has_memberships: true,
                 ..valid
             },
         ] {
-            assert!(!writer_identity_is_valid(
+            assert!(!role_identity_is_valid(
                 "bioworld_writer",
                 "bioworld_writer",
+                WRITER_ROLE,
                 attributes,
             ));
         }

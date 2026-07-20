@@ -6,9 +6,10 @@ use tokio_postgres::{Client, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    AppendDecisionEventError, classify_database_error, set_tenant_context, verify_writer_identity,
+    AppendDecisionEventError, classify_database_error, set_tenant_context, verify_role_identity,
 };
 
+const READER_ROLE: &str = "bioworld_reader";
 const SELECT_DECISION_EVENT: &str = "SELECT event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version::text AS aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature FROM public.scientific_event WHERE tenant_id = $1 AND event_id = $2";
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -80,7 +81,7 @@ async fn read_in_transaction(
     tenant_id: &str,
     event_id: Uuid,
 ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
-    verify_writer_identity(transaction)
+    verify_role_identity(transaction, READER_ROLE)
         .await
         .map_err(map_append_error)?;
     verify_read_only(transaction).await?;
@@ -216,9 +217,49 @@ fn map_append_error(error: AppendDecisionEventError) -> ReadDecisionEventError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadDecisionEventError, map_append_error, parse_aggregate_version, tenant_id_is_valid,
+        READER_ROLE, ReadDecisionEventError, map_append_error, parse_aggregate_version,
+        tenant_id_is_valid,
     };
-    use crate::AppendDecisionEventError;
+    use crate::{AppendDecisionEventError, RoleAttributes, role_identity_is_valid};
+
+    #[test]
+    fn accepts_only_the_exact_least_privilege_reader_identity() {
+        let valid = RoleAttributes {
+            is_superuser: false,
+            bypasses_row_security: false,
+            can_create_database: false,
+            can_create_role: false,
+            inherits_roles: false,
+            can_login: true,
+            can_replicate: false,
+            has_memberships: false,
+        };
+
+        assert!(role_identity_is_valid(
+            "bioworld_reader",
+            "bioworld_reader",
+            READER_ROLE,
+            valid,
+        ));
+        assert!(!role_identity_is_valid(
+            "bioworld_writer",
+            "bioworld_writer",
+            READER_ROLE,
+            valid,
+        ));
+        assert!(!role_identity_is_valid(
+            "bioworld_reader",
+            "bioworld_writer",
+            READER_ROLE,
+            valid,
+        ));
+        assert!(!role_identity_is_valid(
+            "bioworld_writer",
+            "bioworld_reader",
+            READER_ROLE,
+            valid,
+        ));
+    }
 
     #[test]
     fn validates_tenant_identifiers_before_database_access() {

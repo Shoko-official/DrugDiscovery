@@ -26,6 +26,7 @@ const WRITER_SOURCE_VOLUME = `bioworld-postgres-writer-source-${NONCE}`;
 const POSTGRES_PASSWORD = "0123456789abcdef".repeat(4);
 const MIGRATOR_PASSWORD = "123456789abcdef0".repeat(4);
 const WRITER_PASSWORD = "23456789abcdef01".repeat(4);
+const READER_PASSWORD = "3456789abcdef012".repeat(4);
 const SECRET = "postgresql://admin:do-not-expose@example.invalid/database";
 const ROLE_BOOTSTRAP_SQL = [
   "CREATE ROLE bioworld_owner NOLOGIN;",
@@ -36,6 +37,10 @@ const ROLE_BOOTSTRAP_SQL = [
 const WRITER_ACCESS_SQL = [
   "GRANT USAGE ON SCHEMA public TO bioworld_writer;",
   "GRANT SELECT, INSERT ON public.scientific_event TO bioworld_writer;",
+].join("\n");
+const READER_ACCESS_SQL = [
+  "GRANT USAGE ON SCHEMA public TO bioworld_reader;",
+  "GRANT SELECT ON public.scientific_event TO bioworld_reader;",
 ].join("\n");
 const FIXTURE_SQL = [
   "INSERT INTO scientific_event (event_id)",
@@ -50,6 +55,8 @@ const VERIFICATION_SQL = [
 ].join("\n");
 const TENANT_VERIFICATION_SQL =
   "SELECT 'bioworld_tenant_access_ready';";
+const READER_VERIFICATION_SQL =
+  "SELECT 'bioworld_reader_access_ready';";
 const OWNER_VERIFICATION_SQL =
   "SELECT 'bioworld_owner_boundary_ready';";
 
@@ -177,11 +184,17 @@ function commandKind(args, options = {}) {
   if (input.includes(WRITER_ACCESS_SQL)) {
     return "writer-access";
   }
+  if (input.includes(READER_ACCESS_SQL)) {
+    return "reader-access";
+  }
   if (input.includes("bioworld_tenant_access_ready")) {
     return "tenant-verify";
   }
   if (input.includes("bioworld_owner_boundary_ready")) {
     return "owner-verify";
+  }
+  if (input.includes("bioworld_reader_access_ready")) {
+    return "reader-verify";
   }
   if (input.includes("bioworld_migrations_ready")) {
     return "verify";
@@ -198,6 +211,9 @@ function operationResult(kind) {
   }
   if (kind === "tenant-verify") {
     return result(0, "bioworld_tenant_access_ready\n");
+  }
+  if (kind === "reader-verify") {
+    return result(0, "bioworld_reader_access_ready\n");
   }
   if (kind === "owner-verify") {
     return result(0, "bioworld_owner_boundary_ready\n");
@@ -249,12 +265,15 @@ function runOptions(runCommand, time = clock(), overrides = {}) {
     verificationSql: VERIFICATION_SQL,
     roleBootstrapSql: ROLE_BOOTSTRAP_SQL,
     writerAccessSql: WRITER_ACCESS_SQL,
+    readerAccessSql: READER_ACCESS_SQL,
     tenantVerificationSql: TENANT_VERIFICATION_SQL,
+    readerVerificationSql: READER_VERIFICATION_SQL,
     ownerVerificationSql: OWNER_VERIFICATION_SQL,
     nonce: NONCE,
     postgresPassword: POSTGRES_PASSWORD,
     migratorPassword: MIGRATOR_PASSWORD,
     writerPassword: WRITER_PASSWORD,
+    readerPassword: READER_PASSWORD,
     runCommand,
     now: time.now,
     sleep: time.sleep,
@@ -321,8 +340,10 @@ test("builds PostgreSQL integration tests without credentials and runs them only
       "migration-0002",
       "migration-0003",
       "writer-access",
+      "reader-access",
       "verify",
       "tenant-verify",
+      "reader-verify",
       "owner-verify",
       "writer-test",
       "writer-test-cleanup",
@@ -398,6 +419,7 @@ test("builds PostgreSQL integration tests without credentials and runs them only
   assert.ok(build.args.includes("--no-run"));
   assertRunsAllPostgresIntegrationTests(build.args);
   assert.equal(build.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD, undefined);
+  assert.equal(build.options.env.BIOWORLD_POSTGRES_READER_PASSWORD, undefined);
   assert.equal(build.options.env.POSTGRES_PASSWORD, undefined);
   assert.equal(build.options.env.PGPASSWORD, undefined);
 
@@ -413,6 +435,7 @@ test("builds PostgreSQL integration tests without credentials and runs them only
     ),
   );
   assert.ok(runtime.args.includes("BIOWORLD_POSTGRES_WRITER_PASSWORD"));
+  assert.ok(runtime.args.includes("BIOWORLD_POSTGRES_READER_PASSWORD"));
   assert.ok(runtime.args.includes("BIOWORLD_POSTGRES_INTEGRATION_REQUIRED=1"));
   assert.ok(runtime.args.includes("CARGO_NET_OFFLINE=true"));
   assert.ok(runtime.args.includes("RUSTUP_TOOLCHAIN=1.95.0"));
@@ -424,10 +447,18 @@ test("builds PostgreSQL integration tests without credentials and runs them only
     runtime.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD,
     WRITER_PASSWORD,
   );
+  assert.equal(
+    runtime.options.env.BIOWORLD_POSTGRES_READER_PASSWORD,
+    READER_PASSWORD,
+  );
 
   for (const integrationCall of [sourceStage, fetch, build]) {
     assert.equal(
       integrationCall.options.env.BIOWORLD_POSTGRES_WRITER_PASSWORD,
+      undefined,
+    );
+    assert.equal(
+      integrationCall.options.env.BIOWORLD_POSTGRES_READER_PASSWORD,
       undefined,
     );
   }
@@ -435,7 +466,12 @@ test("builds PostgreSQL integration tests without credentials and runs them only
   const serializedArguments = calls
     .flatMap(({ args }) => args)
     .join(" ");
-  for (const secret of [POSTGRES_PASSWORD, MIGRATOR_PASSWORD, WRITER_PASSWORD]) {
+  for (const secret of [
+    POSTGRES_PASSWORD,
+    MIGRATOR_PASSWORD,
+    WRITER_PASSWORD,
+    READER_PASSWORD,
+  ]) {
     assert.ok(!serializedArguments.includes(secret));
   }
 });
@@ -479,7 +515,11 @@ test("writer integration runtime failure is redacted and fully cleaned", async (
     calls.push({ command, args, options });
     const kind = commandKind(args, options);
     return kind === "writer-test"
-      ? result(1, POSTGRES_PASSWORD, `${WRITER_PASSWORD}${SECRET}`)
+      ? result(
+          1,
+          `${POSTGRES_PASSWORD}${READER_PASSWORD}`,
+          `${WRITER_PASSWORD}${SECRET}`,
+        )
       : operationResult(kind);
   };
 
@@ -508,7 +548,12 @@ test("writer integration runtime failure is redacted and fully cleaned", async (
     ],
   );
   assert.equal(diagnostics.length, 1);
-  for (const secret of [POSTGRES_PASSWORD, WRITER_PASSWORD, "admin:do-not-expose"]) {
+  for (const secret of [
+    POSTGRES_PASSWORD,
+    WRITER_PASSWORD,
+    READER_PASSWORD,
+    "admin:do-not-expose",
+  ]) {
     assert.ok(!diagnostics[0].includes(secret));
   }
 });
@@ -749,13 +794,17 @@ test("requires an independent high-entropy PostgreSQL password", async () => {
   }
 });
 
-test("requires three distinct high-entropy role passwords", async () => {
+test("requires four distinct high-entropy role passwords", async () => {
   const invalidCredentials = [
     { migratorPassword: "" },
     { writerPassword: "writer" },
+    { readerPassword: "reader" },
     { migratorPassword: POSTGRES_PASSWORD },
     { writerPassword: POSTGRES_PASSWORD },
+    { readerPassword: POSTGRES_PASSWORD },
     { writerPassword: MIGRATOR_PASSWORD },
+    { readerPassword: MIGRATOR_PASSWORD },
+    { readerPassword: WRITER_PASSWORD },
   ];
 
   for (const credentials of invalidCredentials) {
@@ -772,11 +821,50 @@ test("requires three distinct high-entropy role passwords", async () => {
   }
 });
 
+test("provisions and verifies a distinct reader credential", async () => {
+  const calls = [];
+  await runPostgresMigrations(
+    runOptions(async (command, args, options = {}) => {
+      calls.push({ command, args, options });
+      return operationResult(commandKind(args, options));
+    }),
+  );
+
+  const bootstrapCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "bootstrap",
+  );
+  assert.ok(bootstrapCall.args.includes("BIOWORLD_READER_PASSWORD"));
+  assert.equal(
+    bootstrapCall.options.env.BIOWORLD_READER_PASSWORD,
+    READER_PASSWORD,
+  );
+
+  const readerAccessCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "reader-access",
+  );
+  assert.ok(readerAccessCall);
+  assert.equal(readerAccessCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+
+  const readerVerificationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "reader-verify",
+  );
+  assert.ok(readerVerificationCall);
+  assert.equal(
+    readerVerificationCall.args[
+      readerVerificationCall.args.indexOf("--username") + 1
+    ],
+    "bioworld_reader",
+  );
+  assert.equal(readerVerificationCall.options.env.PGPASSWORD, READER_PASSWORD);
+});
+
 test("requires every role-boundary SQL input before Docker", async () => {
   for (const input of [
     "roleBootstrapSql",
     "writerAccessSql",
+    "readerAccessSql",
     "tenantVerificationSql",
+    "readerVerificationSql",
     "ownerVerificationSql",
   ]) {
     let called = false;
@@ -865,8 +953,10 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "migration-0002",
       "migration-0003",
       "writer-access",
+      "reader-access",
       "verify",
       "tenant-verify",
+      "reader-verify",
       "owner-verify",
       "cleanup",
     ],
@@ -891,6 +981,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.equal(calls[0].options.env.PGPASSWORD, undefined);
   assert.equal(calls[0].options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
   assert.equal(calls[0].options.env.BIOWORLD_WRITER_PASSWORD, undefined);
+  assert.equal(calls[0].options.env.BIOWORLD_READER_PASSWORD, undefined);
   assert.ok(!calls[0].args.includes("--publish"));
   assert.ok(!calls[0].args.includes("-p"));
   assert.ok(
@@ -958,6 +1049,8 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     "BIOWORLD_MIGRATOR_PASSWORD",
     "--env",
     "BIOWORLD_WRITER_PASSWORD",
+    "--env",
+    "BIOWORLD_READER_PASSWORD",
     CONTAINER_NAME,
     "psql",
     "--host",
@@ -984,6 +1077,10 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     bootstrapCall.options.env.BIOWORLD_WRITER_PASSWORD,
     WRITER_PASSWORD,
   );
+  assert.equal(
+    bootstrapCall.options.env.BIOWORLD_READER_PASSWORD,
+    READER_PASSWORD,
+  );
   assert.equal(bootstrapCall.options.env.POSTGRES_PASSWORD, undefined);
 
   const transactionKinds = [
@@ -992,6 +1089,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     "migration-0002",
     "migration-0003",
     "writer-access",
+    "reader-access",
   ];
   const transactionCalls = transactionKinds.map((expectedKind) =>
     calls.find(
@@ -1026,6 +1124,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     assert.equal(call.options.env.POSTGRES_PASSWORD, undefined);
     assert.equal(call.options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
     assert.equal(call.options.env.BIOWORLD_WRITER_PASSWORD, undefined);
+    assert.equal(call.options.env.BIOWORLD_READER_PASSWORD, undefined);
     assert.match(call.options.input, /SET LOCAL ROLE bioworld_owner;/);
     assert.match(
       call.options.input,
@@ -1045,6 +1144,10 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.match(
     transactionCalls[4].options.input,
     /grant-writer-access\.sql/,
+  );
+  assert.match(
+    transactionCalls[5].options.input,
+    /grant-reader-access\.sql/,
   );
 
   const verificationCall = calls.find(
@@ -1101,6 +1204,33 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     TENANT_VERIFICATION_SQL,
   );
 
+  const readerVerificationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "reader-verify",
+  );
+  assert.equal(
+    readerVerificationCall.args[
+      readerVerificationCall.args.indexOf("--username") + 1
+    ],
+    "bioworld_reader",
+  );
+  assert.equal(readerVerificationCall.options.env.PGPASSWORD, READER_PASSWORD);
+  assert.equal(
+    readerVerificationCall.options.env.BIOWORLD_MIGRATOR_PASSWORD,
+    undefined,
+  );
+  assert.equal(
+    readerVerificationCall.options.env.BIOWORLD_WRITER_PASSWORD,
+    undefined,
+  );
+  assert.equal(
+    readerVerificationCall.options.env.BIOWORLD_READER_PASSWORD,
+    undefined,
+  );
+  assert.equal(
+    readerVerificationCall.options.input,
+    READER_VERIFICATION_SQL,
+  );
+
   const ownerVerificationCall = calls.find(
     ({ args, options }) => commandKind(args, options) === "owner-verify",
   );
@@ -1132,10 +1262,12 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     assert.ok(!args.join(" ").includes(POSTGRES_PASSWORD));
     assert.ok(!args.join(" ").includes(MIGRATOR_PASSWORD));
     assert.ok(!args.join(" ").includes(WRITER_PASSWORD));
+    assert.ok(!args.join(" ").includes(READER_PASSWORD));
     assert.ok(!args.join(" ").includes(SECRET));
     assert.ok(!String(options.input ?? "").includes(POSTGRES_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(MIGRATOR_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(WRITER_PASSWORD));
+    assert.ok(!String(options.input ?? "").includes(READER_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(SECRET));
     if (index > 0) {
       assert.equal(options.env?.POSTGRES_PASSWORD, undefined);
@@ -1166,8 +1298,10 @@ test("reassigns legacy-owned objects before applying the tenant migration", asyn
     "bootstrap",
     "migration-0003",
     "writer-access",
+    "reader-access",
     "verify",
     "tenant-verify",
+    "reader-verify",
     "owner-verify",
     "cleanup",
   ]);
@@ -1210,8 +1344,10 @@ test("interrupts every privileged phase and performs unsignaled cleanup", async 
     { name: "bootstrap", kind: "bootstrap" },
     { name: "migration-0003", kind: "migration-0003" },
     { name: "writer-access", kind: "writer-access" },
+    { name: "reader-access", kind: "reader-access" },
     { name: "verify", kind: "verify" },
     { name: "tenant-verify", kind: "tenant-verify" },
+    { name: "reader-verify", kind: "reader-verify" },
     { name: "owner-verify", kind: "owner-verify" },
     {
       name: "legacy-migration-0001",
@@ -1248,7 +1384,7 @@ test("interrupts every privileged phase and performs unsignaled cleanup", async 
             return result(
               1,
               `${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}`,
-              `${WRITER_PASSWORD}${SECRET}`,
+              `${WRITER_PASSWORD}${READER_PASSWORD}${SECRET}`,
             );
           }
           return operationResult(kind);
@@ -1299,6 +1435,7 @@ test("interrupts every privileged phase and performs unsignaled cleanup", async 
         assert.ok(!diagnostics[0].includes(POSTGRES_PASSWORD));
         assert.ok(!diagnostics[0].includes(MIGRATOR_PASSWORD));
         assert.ok(!diagnostics[0].includes(WRITER_PASSWORD));
+        assert.ok(!diagnostics[0].includes(READER_PASSWORD));
         assert.ok(!diagnostics[0].includes("admin:do-not-expose"));
       } finally {
         process.exitCode = originalExitCode;
@@ -1369,6 +1506,7 @@ test("startup diagnostics are bounded and redact passwords and URL credentials",
     POSTGRES_PASSWORD,
     MIGRATOR_PASSWORD,
     WRITER_PASSWORD,
+    READER_PASSWORD,
     "x".repeat(128 * 1024),
   ].join("\n");
   const runCommand = async (_command, args, options = {}) => {
@@ -1394,6 +1532,7 @@ test("startup diagnostics are bounded and redact passwords and URL credentials",
     assert.ok(!diagnostic.includes(POSTGRES_PASSWORD));
     assert.ok(!diagnostic.includes(MIGRATOR_PASSWORD));
     assert.ok(!diagnostic.includes(WRITER_PASSWORD));
+    assert.ok(!diagnostic.includes(READER_PASSWORD));
     assert.ok(!diagnostic.includes("admin:do-not-expose"));
   }
 });
@@ -1423,15 +1562,17 @@ test("command failures remain secret-safe and always clean up", async (t) => {
     ["migration-0002", "PostgreSQL migrations failed."],
     ["migration-0003", "PostgreSQL migrations failed."],
     ["writer-access", "PostgreSQL writer access provisioning failed."],
+    ["reader-access", "PostgreSQL reader access provisioning failed."],
     ["verify", "PostgreSQL migration verification failed."],
     ["tenant-verify", "PostgreSQL tenant access verification failed."],
+    ["reader-verify", "PostgreSQL reader access verification failed."],
     ["owner-verify", "PostgreSQL owner boundary verification failed."],
   ];
 
   for (const [failedKind, expectedMessage] of scenarios) {
     await t.test(failedKind, async () => {
       const calls = [];
-      const hugeSecretOutput = `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}${"x".repeat(1024 * 1024)}`;
+      const hugeSecretOutput = `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}${READER_PASSWORD}${"x".repeat(1024 * 1024)}`;
       const runCommand = async (command, args, options = {}) => {
         calls.push({ command, args, options });
         const kind = commandKind(args, options);
@@ -1454,6 +1595,7 @@ test("command failures remain secret-safe and always clean up", async (t) => {
       assert.ok(!error.message.includes(POSTGRES_PASSWORD));
       assert.ok(!error.message.includes(MIGRATOR_PASSWORD));
       assert.ok(!error.message.includes(WRITER_PASSWORD));
+      assert.ok(!error.message.includes(READER_PASSWORD));
       assert.equal(
         commandKind(calls.at(-1).args, calls.at(-1).options),
         "cleanup",
@@ -1476,6 +1618,10 @@ test("unexpected verification output fails closed without exposing output", asyn
       "owner-verify",
       "PostgreSQL owner boundary verification returned an unexpected result.",
     ],
+    [
+      "reader-verify",
+      "PostgreSQL reader access verification returned an unexpected result.",
+    ],
   ];
 
   for (const [failedKind, expectedMessage] of scenarios) {
@@ -1487,7 +1633,7 @@ test("unexpected verification output fails closed without exposing output", asyn
         if (kind === failedKind) {
           return result(
             0,
-            `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}\n`,
+            `${SECRET}${POSTGRES_PASSWORD}${MIGRATOR_PASSWORD}${WRITER_PASSWORD}${READER_PASSWORD}\n`,
           );
         }
         return operationResult(kind);
@@ -1502,6 +1648,7 @@ test("unexpected verification output fails closed without exposing output", asyn
       assert.ok(!error.message.includes(POSTGRES_PASSWORD));
       assert.ok(!error.message.includes(MIGRATOR_PASSWORD));
       assert.ok(!error.message.includes(WRITER_PASSWORD));
+      assert.ok(!error.message.includes(READER_PASSWORD));
       assert.equal(
         commandKind(calls.at(-1).args, calls.at(-1).options),
         "cleanup",
