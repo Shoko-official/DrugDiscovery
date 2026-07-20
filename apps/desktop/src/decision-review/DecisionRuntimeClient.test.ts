@@ -56,9 +56,15 @@ describe("createDecisionReviewLoader", () => {
       source: "bundled_sample",
       decision: {
         decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+        couId: "COU-001",
+        aggregateVersion: "7",
         recommendation: "abstain",
         domainAssessment: "unknown",
-        evidenceSnapshotId: "ES-001",
+        rationale: ["Evidence coverage is incomplete."],
+        evidence: {
+          id: "ES-001",
+          sha256: validSha256,
+        },
       },
     });
     expect(commands).toEqual(["read_current_decision"]);
@@ -145,6 +151,9 @@ describe("createDecisionReviewLoader", () => {
     await expect(loader()).resolves.toMatchObject({
       kind: "ready",
       source: "bundled_sample",
+      decision: {
+        aggregateVersion: "18446744073709551615",
+      },
     });
   });
 });
