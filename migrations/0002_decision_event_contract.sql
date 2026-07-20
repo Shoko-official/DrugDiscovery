@@ -1,5 +1,3 @@
-BEGIN;
-
 ALTER TABLE scientific_event
   DROP CONSTRAINT scientific_event_aggregate_version_check,
   ALTER COLUMN aggregate_version TYPE numeric
@@ -44,5 +42,3 @@ FOR EACH STATEMENT
 EXECUTE FUNCTION reject_scientific_event_mutation();
 
 REVOKE UPDATE, DELETE, TRUNCATE ON scientific_event FROM PUBLIC;
-
-COMMIT;

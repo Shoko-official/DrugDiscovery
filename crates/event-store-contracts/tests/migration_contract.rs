@@ -34,20 +34,24 @@ fn every_migration_parses_as_postgresql() {
     assert!(!migrations.is_empty());
     for path in migrations {
         let sql = fs::read_to_string(&path).unwrap();
-        Parser::parse_sql(&PostgreSqlDialect {}, &sql)
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, &sql)
             .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+        assert!(
+            !statements.iter().any(|statement| matches!(
+                statement,
+                Statement::StartTransaction { .. }
+                    | Statement::Commit { .. }
+                    | Statement::Rollback { .. }
+            )),
+            "migration transaction ownership belongs to the runner: {}",
+            path.display()
+        );
     }
 }
 
 #[test]
 fn decision_event_migration_enforces_the_storage_contract() {
     let statements = parse_migration("0002_decision_event_contract.sql");
-
-    assert!(matches!(
-        statements.first(),
-        Some(Statement::StartTransaction { .. })
-    ));
-    assert!(matches!(statements.last(), Some(Statement::Commit { .. })));
 
     let alter_table = statements
         .iter()
