@@ -11,6 +11,7 @@ bioworld-event-store-contracts = { path = "../event-store-contracts" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio-postgres.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
