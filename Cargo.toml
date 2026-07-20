@@ -4,6 +4,7 @@ members = [
     "crates/contracts",
     "crates/domain",
     "crates/desktop-core",
+    "crates/event-store-contracts",
     "crates/plugin-contracts",
     "crates/viz",
     "apps/desktop/src-tauri",
@@ -15,10 +16,14 @@ license = "Proprietary"
 rust-version = "1.95"
 
 [workspace.dependencies]
+chrono = { version = "=0.4.45", default-features = false, features = ["serde", "std"] }
 prost = "0.14.4"
 protoc-bin-vendored = "3.2.0"
 serde = { version = "1", features = ["derive"] }
+serde_jcs = "=0.2.0"
 serde_json = "1"
+sha2 = "=0.10.9"
+sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
 thiserror = "2"
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14.6"
