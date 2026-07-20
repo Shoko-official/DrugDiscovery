@@ -6,6 +6,8 @@
     "contracts:check": "corepack pnpm contracts:check-generated && corepack pnpm --filter @bioworld/contracts check && corepack pnpm --filter @bioworld/contracts test",
     "contracts:check-generated": "node tools/check-generated-contracts.mjs",
     "contracts:generate": "buf generate",
+    "migrations:tools:test": "node --test tools/postgres-migrations.test.mjs",
+    "migrations:postgres:test": "node tools/postgres-migrations.mjs",
     "desktop:dev": "corepack pnpm --filter @bioworld/desktop dev",
     "desktop:build": "corepack pnpm --filter @bioworld/desktop build",
     "desktop:icons:check": "node tools/validate-tauri-icons.mjs",

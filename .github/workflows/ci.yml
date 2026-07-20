@@ -50,6 +50,9 @@ jobs:
       - name: Check generated contracts
         run: pnpm contracts:check
 
+      - name: Test migration tooling
+        run: pnpm migrations:tools:test
+
       - name: Test desktop tools
         run: pnpm desktop:tools:test
 
@@ -61,6 +64,26 @@ jobs:
 
       - name: Build desktop
         run: pnpm desktop:build
+
+  postgres:
+    name: PostgreSQL migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Execute and verify migrations
+        run: node tools/postgres-migrations.mjs
 
   rust:
     name: Rust core and WebAssembly
