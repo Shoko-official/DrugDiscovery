@@ -5,6 +5,7 @@ members = [
     "crates/decision-grpc",
     "crates/decision-grpc-jwt",
     "crates/decision-grpc-postgres",
+    "crates/decision-grpc-server",
     "crates/decision-query",
     "crates/domain",
     "crates/desktop-core",
@@ -34,12 +35,16 @@ serde = { version = "1", features = ["derive"] }
 serde_jcs = "=0.2.0"
 serde_json = "1"
 sha2 = "=0.10.9"
+socket2 = "=0.6.5"
 sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
 thiserror = "2"
 tokio = { version = "=1.53.0", default-features = false }
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tokio-stream = { version = "=0.1.18", default-features = false }
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = { version = "0.14.6", default-features = false }
+tower = { version = "=0.5.3", default-features = false }
 uuid = { version = "1", features = ["serde"] }
 wit-bindgen = { version = "=0.59.0", default-features = false, features = ["macros", "realloc", "std"] }
+zeroize = "=1.9.0"

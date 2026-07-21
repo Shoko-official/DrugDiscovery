@@ -1,0 +1,24 @@
+[package]
+name = "bioworld-decision-grpc-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bioworld-decision-grpc = { path = "../decision-grpc" }
+http.workspace = true
+socket2.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["router", "server", "tls-aws-lc"] }
+tower.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+bioworld-contracts = { path = "../contracts" }
+bioworld-decision-query = { path = "../decision-query" }
+prost.workspace = true
+rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "zeroize"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = { workspace = true, features = ["channel"] }

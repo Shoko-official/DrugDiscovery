@@ -157,6 +157,9 @@ jobs:
       - name: Test JWT authentication adapter
         run: cargo test -p bioworld-decision-grpc-jwt --locked
 
+      - name: Test TLS gRPC server transport
+        run: cargo test -p bioworld-decision-grpc-server --locked
+
       - name: Run native desktop preflight
         run: pnpm desktop:native:preflight
 

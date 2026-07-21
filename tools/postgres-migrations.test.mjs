@@ -430,6 +430,22 @@ test("builds PostgreSQL integration tests without credentials and runs them only
     sourceCommand,
     /crates\/decision-grpc\/tests\/decision_service\.rs/,
   );
+  assert.match(sourceCommand, /crates\/decision-grpc-server\/Cargo\.toml/);
+  assert.match(sourceCommand, /crates\/decision-grpc-server\/src\/lib\.rs/);
+  assert.match(sourceCommand, /crates\/decision-grpc-server\/src\/config\.rs/);
+  assert.match(sourceCommand, /crates\/decision-grpc-server\/src\/server\.rs/);
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-server\/tests\/server_config\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-server\/tests\/server_startup\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-server\/tests\/server_transport\.rs/,
+  );
 
   const fetch = calls.find(
     ({ args, options }) => commandKind(args, options) === "writer-fetch",
