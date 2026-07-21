@@ -57,6 +57,18 @@ pub enum GetDecisionError {
     StoredStateRejected,
 }
 
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum GetDecisionRequestExecutionError {
+    #[error("decision request is invalid")]
+    InvalidRequest,
+    #[error("decision was not found")]
+    NotFound,
+    #[error("decision source is unavailable")]
+    SourceUnavailable,
+    #[error("stored decision state was rejected")]
+    StoredStateRejected,
+}
+
 pub type LatestDecisionFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<Option<v2::DecisionRecord>, LatestDecisionSourceError>>
@@ -79,6 +91,30 @@ where
 {
     pub fn new(source: S) -> Self {
         Self { source }
+    }
+
+    pub async fn execute_request(
+        &mut self,
+        request: v2::GetDecisionRequest,
+    ) -> Result<v2::DecisionRecord, GetDecisionRequestExecutionError> {
+        let query = match GetDecisionQuery::try_from(request) {
+            Ok(query) => query,
+            Err(GetDecisionRequestError::InvalidDecisionId) => {
+                return Err(GetDecisionRequestExecutionError::InvalidRequest);
+            }
+        };
+        let decision = match self.execute(query).await {
+            Ok(Some(decision)) => decision,
+            Ok(None) => return Err(GetDecisionRequestExecutionError::NotFound),
+            Err(GetDecisionError::SourceUnavailable) => {
+                return Err(GetDecisionRequestExecutionError::SourceUnavailable);
+            }
+            Err(GetDecisionError::StoredStateRejected) => {
+                return Err(GetDecisionRequestExecutionError::StoredStateRejected);
+            }
+        };
+
+        Ok(v2::DecisionRecord::from(&decision))
     }
 
     pub async fn execute(

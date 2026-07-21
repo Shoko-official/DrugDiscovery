@@ -13,8 +13,9 @@ use bioworld_contracts::{
     v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation},
 };
 use bioworld_decision_query::{
-    GetDecision, GetDecisionError, GetDecisionQuery, GetDecisionRequestError, LatestDecisionFuture,
-    LatestDecisionSource, LatestDecisionSourceError,
+    GetDecision, GetDecisionError, GetDecisionQuery, GetDecisionRequestError,
+    GetDecisionRequestExecutionError, LatestDecisionFuture, LatestDecisionSource,
+    LatestDecisionSourceError,
 };
 use uuid::Uuid;
 
@@ -145,6 +146,175 @@ fn record(decision_id: String, aggregate_version: u64) -> DecisionRecord {
             id: "ES-QUERY-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+    }
+}
+
+#[test]
+#[allow(deprecated)]
+fn executes_a_canonical_request_once_and_returns_a_canonical_record() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+    let mut stored = record(decision_id.to_string(), u64::MAX);
+    stored.evidence_snapshot_id.clear();
+    let boundary = VersionedDecisionRecord::try_from(stored.clone()).unwrap();
+    let expected = DecisionRecord::from(&boundary);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_query = Arc::new(Mutex::new(None));
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::clone(&calls),
+        query: Arc::clone(&observed_query),
+        result: Ok(Some(stored)),
+    });
+
+    let actual = block_on_ready(get_decision.execute_request(GetDecisionRequest {
+        decision_id: decision_id.to_string(),
+    }))
+    .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.aggregate_version, u64::MAX);
+    assert_eq!(actual.evidence_snapshot_id, "ES-QUERY-001");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let observed_decision_id = observed_query
+        .lock()
+        .expect("query recorder must be usable")
+        .as_ref()
+        .map(|query| query.decision_id());
+    assert_eq!(observed_decision_id, Some(decision_id));
+}
+
+#[test]
+fn rejects_an_invalid_request_before_source_access() {
+    let submitted = "sensitive-invalid-decision-id";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_query = Arc::new(Mutex::new(None));
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::clone(&calls),
+        query: Arc::clone(&observed_query),
+        result: Ok(Some(record(
+            "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99".to_owned(),
+            1,
+        ))),
+    });
+
+    let result = block_on_ready(get_decision.execute_request(GetDecisionRequest {
+        decision_id: submitted.to_owned(),
+    }));
+    let error = result.expect_err("invalid request must fail");
+    let rendered = format!("{error:?} {error}");
+
+    assert_eq!(error, GetDecisionRequestExecutionError::InvalidRequest);
+    assert!(!rendered.contains(submitted));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        observed_query
+            .lock()
+            .expect("query recorder must be usable")
+            .is_none()
+    );
+}
+
+#[test]
+fn maps_an_absent_decision_to_not_found_after_one_read() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::clone(&calls),
+        query: Arc::new(Mutex::new(None)),
+        result: Ok(None),
+    });
+
+    let result = block_on_ready(get_decision.execute_request(GetDecisionRequest {
+        decision_id: decision_id.to_string(),
+    }));
+
+    assert_eq!(result, Err(GetDecisionRequestExecutionError::NotFound));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn preserves_each_fixed_query_failure_after_one_read() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+    let cases = [
+        (
+            LatestDecisionSourceError::Unavailable,
+            GetDecisionRequestExecutionError::SourceUnavailable,
+        ),
+        (
+            LatestDecisionSourceError::StoredStateRejected,
+            GetDecisionRequestExecutionError::StoredStateRejected,
+        ),
+    ];
+
+    for (source_error, expected) in cases {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut get_decision = GetDecision::new(RecordingSource {
+            calls: Arc::clone(&calls),
+            query: Arc::new(Mutex::new(None)),
+            result: Err(source_error),
+        });
+
+        let result = block_on_ready(get_decision.execute_request(GetDecisionRequest {
+            decision_id: decision_id.to_string(),
+        }));
+
+        assert_eq!(result, Err(expected));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn maps_invalid_stored_state_to_a_fixed_rejected_state_error() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::clone(&calls),
+        query: Arc::new(Mutex::new(None)),
+        result: Ok(Some(record(decision_id.to_string(), 0))),
+    });
+
+    let result = block_on_ready(get_decision.execute_request(GetDecisionRequest {
+        decision_id: decision_id.to_string(),
+    }));
+
+    assert_eq!(
+        result,
+        Err(GetDecisionRequestExecutionError::StoredStateRejected)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn request_execution_errors_are_fixed_redacted_and_thread_safe() {
+    fn assert_error<T: std::error::Error + Send + Sync + Copy>() {}
+
+    assert_error::<GetDecisionRequestExecutionError>();
+
+    let cases = [
+        (
+            GetDecisionRequestExecutionError::InvalidRequest,
+            "InvalidRequest",
+            "decision request is invalid",
+        ),
+        (
+            GetDecisionRequestExecutionError::NotFound,
+            "NotFound",
+            "decision was not found",
+        ),
+        (
+            GetDecisionRequestExecutionError::SourceUnavailable,
+            "SourceUnavailable",
+            "decision source is unavailable",
+        ),
+        (
+            GetDecisionRequestExecutionError::StoredStateRejected,
+            "StoredStateRejected",
+            "stored decision state was rejected",
+        ),
+    ];
+
+    for (error, debug, display) in cases {
+        assert_eq!(format!("{error:?}"), debug);
+        assert_eq!(error.to_string(), display);
     }
 }
 
@@ -312,6 +482,7 @@ fn query_execution_contracts_are_send() {
     assert_send::<GetDecisionQuery>();
     assert_send::<GetDecision<RecordingSource>>();
     assert_error::<GetDecisionError>();
+    assert_error::<GetDecisionRequestExecutionError>();
     assert_error::<LatestDecisionSourceError>();
 
     let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
@@ -321,6 +492,15 @@ fn query_execution_contracts_are_send() {
         result: Ok(None),
     };
     assert_value_is_send(source.read_latest(GetDecisionQuery::new(decision_id)));
+
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::new(AtomicUsize::new(0)),
+        query: Arc::new(Mutex::new(None)),
+        result: Ok(None),
+    });
+    assert_value_is_send(get_decision.execute_request(GetDecisionRequest {
+        decision_id: decision_id.to_string(),
+    }));
 }
 
 #[test]
