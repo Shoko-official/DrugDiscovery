@@ -5,9 +5,15 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use aws_lc_rs::{
+    rand::SystemRandom,
+    rsa::{KeyPair, KeySize, PublicKeyComponents},
+    signature::{KeyPair as _, RSA_PKCS1_SHA256},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
     DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation,
     decision_service_server::DecisionService as GeneratedDecisionService,
@@ -16,6 +22,9 @@ use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
     DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantScope,
     get_decision,
+};
+use bioworld_decision_grpc_jwt::{
+    BIOWORLD_TENANT_CLAIM, JwtTenantAuthenticator, JwtTenantAuthenticatorConfig,
 };
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
@@ -26,6 +35,7 @@ use bioworld_decision_grpc_postgres::{
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
 };
+use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use tonic::{Code, Request, Status};
@@ -53,7 +63,13 @@ const POOL_TENANT_A: &str = "tenant-grpc-pool-a";
 const POOL_TENANT_B: &str = "tenant-grpc-pool-b";
 const SERVICE_TENANT_A: &str = "tenant-grpc-service-a";
 const SERVICE_TENANT_B: &str = "tenant-grpc-service-b";
+const JWT_SERVICE_TENANT_A: &str = "tenant-jwt-service-a";
+const JWT_SERVICE_TENANT_B: &str = "tenant-jwt-service-b";
 const SERVICE_TIMEOUT_TENANT: &str = "tenant-grpc-service-timeout";
+const JWT_ISSUER: &str = "https://identity.bioworld.test";
+const JWT_AUDIENCE: &str = "https://decision.bioworld.test";
+const JWT_REQUIRED_SCOPE: &str = "decision:read";
+const JWT_KEY_ID: &str = "postgres-integration-key";
 const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
     "22735232adcac85cc4bd3d3b0fee84866ec86d41e112733a1ceeac3ef699ca0c";
@@ -79,6 +95,68 @@ struct VerifiedTestTenant(&'static str);
 
 struct TestTenantAuthenticator;
 
+struct IntegrationJwtKey {
+    key_pair: KeyPair,
+    jwks: Vec<u8>,
+}
+
+impl IntegrationJwtKey {
+    fn generate() -> Self {
+        let key_pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let components = PublicKeyComponents::<Vec<u8>>::from(key_pair.public_key());
+        let jwks = serde_json::to_vec(&json!({
+            "keys": [{
+                "alg": "RS256",
+                "e": URL_SAFE_NO_PAD.encode(components.e),
+                "kid": JWT_KEY_ID,
+                "kty": "RSA",
+                "n": URL_SAFE_NO_PAD.encode(components.n),
+                "use": "sig"
+            }]
+        }))
+        .unwrap();
+
+        Self { key_pair, jwks }
+    }
+
+    fn token(&self, now: u64, tenant_id: &str) -> String {
+        let encoded_header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "RS256",
+                "kid": JWT_KEY_ID,
+                "typ": "at+jwt"
+            }))
+            .unwrap(),
+        );
+        let encoded_claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "aud": JWT_AUDIENCE,
+                "client_id": "postgres-integration-client",
+                "exp": now + 300,
+                "iat": now,
+                "iss": JWT_ISSUER,
+                "jti": format!("postgres-integration-{tenant_id}"),
+                "scope": JWT_REQUIRED_SCOPE,
+                "sub": "postgres-integration-subject",
+                BIOWORLD_TENANT_CLAIM: tenant_id
+            }))
+            .unwrap(),
+        );
+        let message = format!("{encoded_header}.{encoded_claims}");
+        let mut signature = vec![0; self.key_pair.public_modulus_len()];
+        self.key_pair
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                message.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+
+        format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
 impl TenantAuthenticator for TestTenantAuthenticator {
     fn authenticate_tenant<'a>(
         &'a self,
@@ -88,7 +166,7 @@ impl TenantAuthenticator for TestTenantAuthenticator {
             .extensions()
             .get::<VerifiedTestTenant>()
             .map(|tenant| tenant.0.to_owned())
-            .ok_or(AuthenticateTenantError);
+            .ok_or_else(AuthenticateTenantError::rejected);
         Box::pin(async move { result })
     }
 }
@@ -550,6 +628,26 @@ fn service_tenant_b_fixture() -> EventFixture {
     }
 }
 
+fn jwt_service_tenant_a_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc631",
+        tenant_id: JWT_SERVICE_TENANT_A,
+        payload: TENANT_A_PAYLOAD,
+        payload_sha256: TENANT_A_PAYLOAD_SHA256,
+        record: tenant_a_fixture().record,
+    }
+}
+
+fn jwt_service_tenant_b_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc632",
+        tenant_id: JWT_SERVICE_TENANT_B,
+        payload: TENANT_B_PAYLOAD,
+        payload_sha256: TENANT_B_PAYLOAD_SHA256,
+        record: tenant_b_fixture().record,
+    }
+}
+
 fn service_timeout_fixture() -> EventFixture {
     EventFixture {
         event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc623",
@@ -583,6 +681,28 @@ fn authenticated_request(
         .metadata_mut()
         .insert("x-tenant-id", "hostile-client-tenant".parse().unwrap());
     request
+}
+
+fn jwt_authenticated_request(
+    token: &str,
+    hostile_tenant_id: &str,
+    decision_id: &str,
+) -> Request<GetDecisionRequest> {
+    let mut request = request(decision_id);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-tenant-id", hostile_tenant_id.parse().unwrap());
+    request
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("integration clock must follow the Unix epoch")
+        .as_secs()
 }
 
 fn assert_public_status(status: &Status, code: Code, message: &str) {
@@ -958,6 +1078,81 @@ async fn generated_service_executes_concurrent_tenant_isolated_postgres_reads() 
     assert_eq!(
         tenant_b_response
             .expect("tenant B service response must succeed")
+            .into_inner(),
+        tenant_b.record
+    );
+
+    let mut first = pool.acquire().await.expect("first clean lease must return");
+    let mut second = pool
+        .acquire()
+        .await
+        .expect("second clean lease must return");
+    assert!(tenant_context_is_absent(first.client()).await);
+    assert!(tenant_context_is_absent(second.client()).await);
+    first
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("first lease must be discarded");
+    second
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("second lease must be discarded");
+
+    pool.close();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn jwt_authenticated_service_executes_tenant_isolated_postgres_reads() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let tenant_a = jwt_service_tenant_a_fixture();
+    let tenant_b = jwt_service_tenant_b_fixture();
+    seed_event(&mut writer.client, &tenant_a).await;
+    seed_event(&mut writer.client, &tenant_b).await;
+    let now = unix_timestamp();
+    let signing_key = IntegrationJwtKey::generate();
+    let authenticator = JwtTenantAuthenticator::try_from_jwks(
+        JwtTenantAuthenticatorConfig::try_new(
+            JWT_ISSUER.to_owned(),
+            JWT_AUDIENCE.to_owned(),
+            JWT_REQUIRED_SCOPE.to_owned(),
+            now + 600,
+            2,
+        )
+        .unwrap(),
+        &signing_key.jwks,
+    )
+    .unwrap();
+    let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
+    let service = DecisionGrpcService::new(
+        authenticator,
+        PostgresGetDecisionExecutor::new(pool.clone()),
+        DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(2)).unwrap(),
+    );
+    let tenant_a_token = signing_key.token(now, JWT_SERVICE_TENANT_A);
+    let tenant_b_token = signing_key.token(now, JWT_SERVICE_TENANT_B);
+
+    let (tenant_a_response, tenant_b_response) = tokio::join!(
+        GeneratedDecisionService::get_decision(
+            &service,
+            jwt_authenticated_request(&tenant_a_token, JWT_SERVICE_TENANT_B, SHARED_DECISION_ID),
+        ),
+        GeneratedDecisionService::get_decision(
+            &service,
+            jwt_authenticated_request(&tenant_b_token, JWT_SERVICE_TENANT_A, SHARED_DECISION_ID),
+        ),
+    );
+
+    assert_eq!(
+        tenant_a_response
+            .expect("tenant A JWT service response must succeed")
+            .into_inner(),
+        tenant_a.record
+    );
+    assert_eq!(
+        tenant_b_response
+            .expect("tenant B JWT service response must succeed")
             .into_inner(),
         tenant_b.record
     );

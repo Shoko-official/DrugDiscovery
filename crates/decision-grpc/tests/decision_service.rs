@@ -63,12 +63,17 @@ fn rejects_unsafe_service_configuration_with_a_fixed_error() {
 
 #[test]
 fn authentication_error_is_fixed_and_thread_safe() {
-    let error = AuthenticateTenantError;
-    assert_eq!(format!("{error:?}"), "AuthenticateTenantError");
-    assert_eq!(error.to_string(), "tenant authentication failed");
+    for error in [
+        AuthenticateTenantError::rejected(),
+        AuthenticateTenantError::capacity_exhausted(),
+        AuthenticateTenantError::unavailable(),
+    ] {
+        assert_eq!(format!("{error:?}"), "AuthenticateTenantError");
+        assert_eq!(error.to_string(), "tenant authentication failed");
 
-    fn assert_error<T: std::error::Error + Send + Sync + Copy>(_: T) {}
-    assert_error(error);
+        fn assert_error<T: std::error::Error + Send + Sync + Copy>(_: T) {}
+        assert_error(error);
+    }
 }
 
 #[test]
@@ -103,6 +108,18 @@ impl TenantAuthenticator for StaticAuthenticator {
 
 struct RejectingAuthenticator {
     calls: Arc<AtomicUsize>,
+}
+
+struct ErrorAuthenticator(AuthenticateTenantError);
+
+impl TenantAuthenticator for ErrorAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        _context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        let error = self.0;
+        Box::pin(async move { Err(error) })
+    }
 }
 
 struct CountingAuthenticator {
@@ -165,7 +182,7 @@ impl TenantAuthenticator for RejectingAuthenticator {
         _context: TenantAuthenticationContext<'a>,
     ) -> AuthenticateTenantFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Err(AuthenticateTenantError) })
+        Box::pin(async { Err(AuthenticateTenantError::rejected()) })
     }
 }
 
@@ -353,6 +370,39 @@ async fn rejects_authentication_before_request_validation_or_execution() {
     assert!(!rendered.contains(sensitive_tenant));
     assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
     assert!(observed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn maps_authentication_capacity_and_availability_without_execution() {
+    for (error, code, message) in [
+        (
+            AuthenticateTenantError::capacity_exhausted(),
+            Code::ResourceExhausted,
+            "authentication service is at capacity",
+        ),
+        (
+            AuthenticateTenantError::unavailable(),
+            Code::Unavailable,
+            "authentication service is unavailable",
+        ),
+    ] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let service = DecisionGrpcService::new(
+            ErrorAuthenticator(error),
+            RecordingExecutor {
+                observed: Arc::clone(&observed),
+                response: record(),
+            },
+            DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(1)).unwrap(),
+        );
+
+        let status = GeneratedDecisionService::get_decision(&service, request(DECISION_ID))
+            .await
+            .expect_err("authentication infrastructure error must fail");
+
+        assert_public_status(&status, code, message);
+        assert!(observed.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

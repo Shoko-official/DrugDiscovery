@@ -13,7 +13,11 @@ deadpool-postgres.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
+aws-lc-rs.workspace = true
+base64.workspace = true
 bioworld-contracts = { path = "../contracts" }
+bioworld-decision-grpc-jwt = { path = "../decision-grpc-jwt" }
 bioworld-event-store-contracts = { path = "../event-store-contracts" }
+serde_json.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
