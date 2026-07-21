@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/contracts",
     "crates/decision-grpc",
+    "crates/decision-grpc-postgres",
     "crates/decision-query",
     "crates/domain",
     "crates/desktop-core",
