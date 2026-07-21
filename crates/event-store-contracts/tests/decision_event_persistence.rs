@@ -1,10 +1,15 @@
 use bioworld_contracts::{
-    DecisionContractError,
+    DecisionContractError, MAX_TENANT_ID_BYTES,
     v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation},
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
-    EventProjectionError, project_decision_event, reconstruct_decision_event,
+    EventProjectionError, MAX_CANONICAL_DECISION_PAYLOAD_BYTES,
+    MAX_CANONICAL_DECISION_PAYLOAD_DEPTH, MAX_CANONICAL_DECISION_PAYLOAD_NODES,
+    MAX_EVENT_SIGNATURE_DEPTH, MAX_EVENT_SIGNATURE_JSON_BYTES, MAX_EVENT_SIGNATURE_NODES,
+    MAX_STORED_EVENT_PAYLOAD_BYTES, MAX_STORED_EVENT_SIGNATURE_BYTES,
+    parse_stored_decision_payload, parse_stored_event_signature, project_decision_event,
+    reconstruct_decision_event,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -55,8 +60,179 @@ fn metadata() -> DecisionEventMetadata {
     .unwrap()
 }
 
+fn nested_signature(depth: usize) -> serde_json::Value {
+    let mut value = json!("signature");
+    for _ in 1..depth {
+        value = json!({"nested": value});
+    }
+    value
+}
+
+fn nested_payload(depth: usize) -> serde_json::Value {
+    let mut value = json!(null);
+    for _ in 1..depth {
+        value = json!({"nested": value});
+    }
+    value
+}
+
 fn projected_row() -> bioworld_event_store_contracts::ScientificEventRow {
     project_decision_event(complete_event(), metadata()).unwrap()
+}
+
+#[test]
+fn parses_valid_stored_json_without_loss() {
+    let payload_text =
+        r#"{"decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","rationale":["reason"]}"#;
+    let signature_text = r#"{"algorithm":"Ed25519","key_id":"test-key"}"#;
+
+    assert_eq!(
+        parse_stored_decision_payload(payload_text).unwrap(),
+        serde_json::from_str::<serde_json::Value>(payload_text).unwrap()
+    );
+    assert_eq!(
+        parse_stored_event_signature(signature_text).unwrap(),
+        serde_json::from_str::<serde_json::Value>(signature_text)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
+fn bounds_stored_json_node_count() {
+    let payload_exact = serde_json::to_string(&json!({
+        "values": vec![serde_json::Value::Null; MAX_CANONICAL_DECISION_PAYLOAD_NODES - 2]
+    }))
+    .unwrap();
+    assert!(parse_stored_decision_payload(&payload_exact).is_ok());
+
+    let payload_over = serde_json::to_string(&json!({
+        "values": vec![serde_json::Value::Null; MAX_CANONICAL_DECISION_PAYLOAD_NODES - 1]
+    }))
+    .unwrap();
+    assert!(matches!(
+        parse_stored_decision_payload(&payload_over),
+        Err(EventProjectionError::CanonicalPayloadStructureExceeded)
+    ));
+
+    let signature_exact = serde_json::to_string(&json!({
+        "values": vec![serde_json::Value::Null; MAX_EVENT_SIGNATURE_NODES - 2]
+    }))
+    .unwrap();
+    assert!(parse_stored_event_signature(&signature_exact).is_ok());
+
+    let signature_over = serde_json::to_string(&json!({
+        "values": vec![serde_json::Value::Null; MAX_EVENT_SIGNATURE_NODES - 1]
+    }))
+    .unwrap();
+    assert!(matches!(
+        parse_stored_event_signature(&signature_over),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+}
+
+#[test]
+fn bounds_stored_json_depth() {
+    let payload_exact =
+        serde_json::to_string(&nested_payload(MAX_CANONICAL_DECISION_PAYLOAD_DEPTH)).unwrap();
+    assert!(parse_stored_decision_payload(&payload_exact).is_ok());
+
+    let payload_over =
+        serde_json::to_string(&nested_payload(MAX_CANONICAL_DECISION_PAYLOAD_DEPTH + 1)).unwrap();
+    assert!(matches!(
+        parse_stored_decision_payload(&payload_over),
+        Err(EventProjectionError::CanonicalPayloadStructureExceeded)
+    ));
+
+    let signature_exact =
+        serde_json::to_string(&nested_signature(MAX_EVENT_SIGNATURE_DEPTH)).unwrap();
+    assert!(parse_stored_event_signature(&signature_exact).is_ok());
+
+    let signature_over =
+        serde_json::to_string(&nested_signature(MAX_EVENT_SIGNATURE_DEPTH + 1)).unwrap();
+    assert!(matches!(
+        parse_stored_event_signature(&signature_over),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+}
+
+#[test]
+fn bounds_stored_json_text_bytes() {
+    let payload_exact = format!("\"{}\"", "p".repeat(MAX_STORED_EVENT_PAYLOAD_BYTES - 2));
+    assert_eq!(payload_exact.len(), MAX_STORED_EVENT_PAYLOAD_BYTES);
+    assert!(parse_stored_decision_payload(&payload_exact).is_ok());
+
+    let payload_over = format!("\"{}\"", "p".repeat(MAX_STORED_EVENT_PAYLOAD_BYTES - 1));
+    assert!(matches!(
+        parse_stored_decision_payload(&payload_over),
+        Err(EventProjectionError::CanonicalPayloadEnvelopeExceeded)
+    ));
+
+    let signature_overhead = r#"{"value":""}"#.len();
+    let signature_exact = format!(
+        r#"{{"value":"{}"}}"#,
+        "s".repeat(MAX_STORED_EVENT_SIGNATURE_BYTES - signature_overhead)
+    );
+    assert_eq!(signature_exact.len(), MAX_STORED_EVENT_SIGNATURE_BYTES);
+    assert!(parse_stored_event_signature(&signature_exact).is_ok());
+
+    let signature_over = format!(
+        r#"{{"value":"{}"}}"#,
+        "s".repeat(MAX_STORED_EVENT_SIGNATURE_BYTES - signature_overhead + 1)
+    );
+    assert!(matches!(
+        parse_stored_event_signature(&signature_over),
+        Err(EventProjectionError::SignatureEnvelopeExceeded)
+    ));
+}
+
+#[test]
+fn rejects_nul_in_stored_json_text_keys_and_values() {
+    for payload in [r#"{"value":"\u0000"}"#, "{\"value\":\"\0\"}"] {
+        assert!(matches!(
+            parse_stored_decision_payload(payload),
+            Err(EventProjectionError::NulByteNotAllowed)
+        ));
+    }
+
+    for signature in [r#"{"\u0000":"value"}"#, r#"{"value":"\u0000"}"#] {
+        assert!(matches!(
+            parse_stored_event_signature(signature),
+            Err(EventProjectionError::NulByteNotAllowed)
+        ));
+    }
+}
+
+#[test]
+fn rejects_trailing_stored_json_without_reflecting_input() {
+    let marker = "private-marker";
+    let payload_error =
+        parse_stored_decision_payload(&format!(r#"{{"value":1}}{marker}"#)).unwrap_err();
+    assert!(matches!(
+        payload_error,
+        EventProjectionError::InvalidPayload(_)
+    ));
+    assert!(!payload_error.to_string().contains(marker));
+
+    let signature_error =
+        parse_stored_event_signature(&format!(r#"{{"value":1}}{marker}"#)).unwrap_err();
+    assert!(matches!(
+        signature_error,
+        EventProjectionError::InvalidSignature
+    ));
+    assert!(!signature_error.to_string().contains(marker));
+}
+
+#[test]
+fn requires_nonempty_object_for_stored_signature() {
+    for signature in ["null", r#""signature""#, "[]", "{}"] {
+        assert!(matches!(
+            parse_stored_event_signature(signature),
+            Err(EventProjectionError::InvalidSignature)
+        ));
+    }
 }
 
 fn rehash_payload(row: &mut bioworld_event_store_contracts::ScientificEventRow) {
@@ -225,24 +401,221 @@ fn validates_metadata_at_both_sides_of_the_boundary() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn rejects_nul_bytes_that_postgresql_cannot_store() {
+fn bounds_tenant_id_in_bytes() {
     assert!(
         DecisionEventMetadata::try_new(
-            "tenant\0id".to_owned(),
+            "t".repeat(MAX_TENANT_ID_BYTES),
             occurred_at(),
             json!({"value": "signature"}),
         )
-        .is_err()
+        .is_ok()
     );
+    assert!(matches!(
+        DecisionEventMetadata::try_new(
+            "t".repeat(MAX_TENANT_ID_BYTES + 1),
+            occurred_at(),
+            json!({"value": "signature"}),
+        ),
+        Err(EventProjectionError::InvalidTenantId)
+    ));
+}
+
+#[test]
+fn bounds_signature_canonical_json_bytes() {
+    let object_overhead = serde_jcs::to_vec(&json!({"value": ""})).unwrap().len();
+    let accepted = "s".repeat(MAX_EVENT_SIGNATURE_JSON_BYTES - object_overhead);
     assert!(
         DecisionEventMetadata::try_new(
             "tenant-001".to_owned(),
             occurred_at(),
-            json!({"value": "signature\0value"}),
+            json!({"value": accepted}),
         )
-        .is_err()
+        .is_ok()
     );
+
+    let rejected = "s".repeat(MAX_EVENT_SIGNATURE_JSON_BYTES - object_overhead + 1);
+    assert!(matches!(
+        DecisionEventMetadata::try_new(
+            "tenant-001".to_owned(),
+            occurred_at(),
+            json!({"value": rejected}),
+        ),
+        Err(EventProjectionError::SignatureEnvelopeExceeded)
+    ));
+}
+
+#[test]
+fn bounds_signature_json_depth() {
+    assert!(
+        DecisionEventMetadata::try_new(
+            "tenant-001".to_owned(),
+            occurred_at(),
+            nested_signature(MAX_EVENT_SIGNATURE_DEPTH),
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        DecisionEventMetadata::try_new(
+            "tenant-001".to_owned(),
+            occurred_at(),
+            nested_signature(MAX_EVENT_SIGNATURE_DEPTH + 1),
+        ),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+}
+
+#[test]
+fn bounds_signature_json_nodes() {
+    let accepted = json!({
+        "values": vec![serde_json::Value::Null; MAX_EVENT_SIGNATURE_NODES - 2]
+    });
+    assert!(
+        DecisionEventMetadata::try_new("tenant-001".to_owned(), occurred_at(), accepted,).is_ok()
+    );
+
+    let rejected = json!({
+        "values": vec![serde_json::Value::Null; MAX_EVENT_SIGNATURE_NODES - 1]
+    });
+    assert!(matches!(
+        DecisionEventMetadata::try_new("tenant-001".to_owned(), occurred_at(), rejected,),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+}
+
+#[test]
+fn rejects_oversized_stored_signature_before_reconstruction() {
+    let object_overhead = serde_jcs::to_vec(&json!({"value": ""})).unwrap().len();
+    let mut accepted = projected_row();
+    accepted.signature = json!({
+        "value": "s".repeat(MAX_EVENT_SIGNATURE_JSON_BYTES - object_overhead)
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    assert_eq!(
+        reconstruct_decision_event(&accepted).unwrap(),
+        complete_event()
+    );
+
+    let mut rejected = projected_row();
+    rejected.signature = json!({
+        "value": "s".repeat(MAX_EVENT_SIGNATURE_JSON_BYTES - object_overhead + 1)
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    assert!(matches!(
+        reconstruct_decision_event(&rejected),
+        Err(EventProjectionError::SignatureEnvelopeExceeded)
+    ));
+}
+
+#[test]
+fn rejects_structurally_unbounded_stored_signatures() {
+    let mut too_deep = projected_row();
+    too_deep.signature = nested_signature(MAX_EVENT_SIGNATURE_DEPTH + 1)
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(matches!(
+        reconstruct_decision_event(&too_deep),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+
+    let mut too_many_nodes = projected_row();
+    too_many_nodes.signature = json!({
+        "values": vec![serde_json::Value::Null; MAX_EVENT_SIGNATURE_NODES - 1]
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    assert!(matches!(
+        reconstruct_decision_event(&too_many_nodes),
+        Err(EventProjectionError::SignatureStructureExceeded)
+    ));
+}
+
+#[test]
+fn bounds_stored_canonical_payload_before_reconstruction() {
+    let mut accepted = projected_row();
+    accepted.payload["cou_id"] = json!("");
+    let payload_overhead = serde_jcs::to_vec(&accepted.payload).unwrap().len();
+    accepted.payload["cou_id"] =
+        json!("c".repeat(MAX_CANONICAL_DECISION_PAYLOAD_BYTES - payload_overhead));
+    rehash_payload(&mut accepted);
+    assert!(matches!(
+        reconstruct_decision_event(&accepted),
+        Err(EventProjectionError::InvalidDecision(
+            DecisionContractError::DecisionTooLarge
+        ))
+    ));
+
+    let mut rejected = accepted;
+    rejected.payload["cou_id"] =
+        json!("c".repeat(MAX_CANONICAL_DECISION_PAYLOAD_BYTES - payload_overhead + 1));
+    assert!(matches!(
+        reconstruct_decision_event(&rejected),
+        Err(EventProjectionError::CanonicalPayloadEnvelopeExceeded)
+    ));
+}
+
+#[test]
+fn bounds_stored_payload_json_depth_before_canonicalization() {
+    let mut exact = projected_row();
+    exact.payload = nested_payload(MAX_CANONICAL_DECISION_PAYLOAD_DEPTH);
+    assert!(matches!(
+        reconstruct_decision_event(&exact),
+        Err(EventProjectionError::InvalidPayload(_))
+    ));
+
+    let mut oversized = projected_row();
+    oversized.payload = nested_payload(MAX_CANONICAL_DECISION_PAYLOAD_DEPTH + 1);
+    assert!(matches!(
+        reconstruct_decision_event(&oversized),
+        Err(EventProjectionError::CanonicalPayloadStructureExceeded)
+    ));
+}
+
+#[test]
+fn bounds_stored_payload_json_nodes_before_canonicalization() {
+    let mut exact = projected_row();
+    exact.payload = json!({
+        "values": vec![serde_json::Value::Null; MAX_CANONICAL_DECISION_PAYLOAD_NODES - 2]
+    });
+    assert!(matches!(
+        reconstruct_decision_event(&exact),
+        Err(EventProjectionError::InvalidPayload(_))
+    ));
+
+    let mut oversized = projected_row();
+    oversized.payload = json!({
+        "values": vec![serde_json::Value::Null; MAX_CANONICAL_DECISION_PAYLOAD_NODES - 1]
+    });
+    assert!(matches!(
+        reconstruct_decision_event(&oversized),
+        Err(EventProjectionError::CanonicalPayloadStructureExceeded)
+    ));
+}
+
+#[test]
+#[allow(deprecated)]
+fn rejects_nul_bytes_that_postgresql_cannot_store() {
+    assert!(matches!(
+        DecisionEventMetadata::try_new(
+            "tenant\0id".to_owned(),
+            occurred_at(),
+            json!({"value": "signature"}),
+        ),
+        Err(EventProjectionError::NulByteNotAllowed)
+    ));
+    assert!(matches!(
+        DecisionEventMetadata::try_new(
+            "tenant-001".to_owned(),
+            occurred_at(),
+            json!({"value": "signature\0value"}),
+        ),
+        Err(EventProjectionError::NulByteNotAllowed)
+    ));
 
     let mut nul_cou = complete_event();
     nul_cou.decision.as_mut().unwrap().cou_id = "COU\0-001".to_owned();

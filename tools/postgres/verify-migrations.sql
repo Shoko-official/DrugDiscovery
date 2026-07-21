@@ -8,6 +8,13 @@ DECLARE
   actual_types jsonb;
   expected_constraint text;
   object_count bigint;
+  tenant_bytes_constraint_definition text;
+  event_type_constraint_definition text;
+  schema_version_constraint_definition text;
+  aggregate_type_constraint_definition text;
+  aggregate_id_constraint_definition text;
+  payload_constraint_definition text;
+  signature_constraint_definition text;
 BEGIN
   IF current_setting('server_version_num')::integer <> 180004 THEN
     RAISE EXCEPTION 'expected PostgreSQL server_version_num 180004, got %',
@@ -46,7 +53,14 @@ BEGIN
     'scientific_event_aggregate_version_u64_check',
     'scientific_event_tenant_id_check',
     'scientific_event_payload_sha256_check',
-    'scientific_event_signature_check'
+    'scientific_event_signature_check',
+    'scientific_event_tenant_id_bytes_check',
+    'scientific_event_event_type_envelope_check',
+    'scientific_event_schema_version_envelope_check',
+    'scientific_event_aggregate_type_envelope_check',
+    'scientific_event_aggregate_id_envelope_check',
+    'scientific_event_payload_bytes_check',
+    'scientific_event_signature_bytes_check'
   ]
   LOOP
     IF NOT EXISTS (
@@ -60,6 +74,125 @@ BEGIN
       RAISE EXCEPTION 'missing or unvalidated constraint: %', expected_constraint;
     END IF;
   END LOOP;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO tenant_bytes_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_tenant_id_bytes_check';
+
+  IF tenant_bytes_constraint_definition IS DISTINCT FROM
+    'CHECK (octet_length(tenant_id) <= 128)' THEN
+    RAISE EXCEPTION 'tenant byte constraint differs from contract: %',
+      tenant_bytes_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO event_type_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_event_type_envelope_check';
+
+  IF event_type_constraint_definition IS DISTINCT FROM
+    'CHECK (char_length(event_type) <= 200 AND octet_length(event_type) <= 800)' THEN
+    RAISE EXCEPTION 'event type constraint differs from contract: %',
+      event_type_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO schema_version_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_schema_version_envelope_check';
+
+  IF schema_version_constraint_definition IS DISTINCT FROM
+    'CHECK (char_length(schema_version) <= 200 AND octet_length(schema_version) <= 800)' THEN
+    RAISE EXCEPTION 'schema version constraint differs from contract: %',
+      schema_version_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO aggregate_type_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_aggregate_type_envelope_check';
+
+  IF aggregate_type_constraint_definition IS DISTINCT FROM
+    'CHECK (char_length(aggregate_type) <= 200 AND octet_length(aggregate_type) <= 800)' THEN
+    RAISE EXCEPTION 'aggregate type constraint differs from contract: %',
+      aggregate_type_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO aggregate_id_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_aggregate_id_envelope_check';
+
+  IF aggregate_id_constraint_definition IS DISTINCT FROM
+    'CHECK (char_length(aggregate_id) <= 200 AND octet_length(aggregate_id) <= 800)' THEN
+    RAISE EXCEPTION 'aggregate ID constraint differs from contract: %',
+      aggregate_id_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO payload_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_payload_bytes_check';
+
+  IF payload_constraint_definition IS DISTINCT FROM
+    'CHECK (octet_length(payload::text) <= 524288)' THEN
+    RAISE EXCEPTION 'payload byte constraint differs from contract: %',
+      payload_constraint_definition;
+  END IF;
+
+  SELECT regexp_replace(
+    pg_get_constraintdef(constraint_definition.oid, true),
+    '\s+',
+    ' ',
+    'g'
+  )
+  INTO signature_constraint_definition
+  FROM pg_constraint AS constraint_definition
+  WHERE constraint_definition.conrelid = 'public.scientific_event'::regclass
+    AND constraint_definition.conname = 'scientific_event_signature_bytes_check';
+
+  IF signature_constraint_definition IS DISTINCT FROM
+    'CHECK (octet_length(signature::text) <= 20480)' THEN
+    RAISE EXCEPTION 'signature byte constraint differs from contract: %',
+      signature_constraint_definition;
+  END IF;
 
   IF EXISTS (
     SELECT 1
@@ -483,7 +616,301 @@ $tenant_catalog_checks$;
 BEGIN;
 
 DO $behavior_checks$
+DECLARE
+  exact_tenant text := repeat('t', 128);
+  oversized_tenant text := repeat('t', 129);
+  exact_identifier text := repeat(chr(128512), 200);
+  oversized_identifier text := repeat(chr(128512), 201);
+  identifier_column text;
+  exact_payload jsonb := to_jsonb(repeat('p', 524286));
+  oversized_payload jsonb := to_jsonb(repeat('p', 524287));
+  signature_overhead integer :=
+    octet_length(jsonb_build_object('v', '')::text);
+  exact_signature jsonb;
+  oversized_signature jsonb;
 BEGIN
+  exact_signature :=
+    jsonb_build_object('v', repeat('s', 20480 - signature_overhead));
+  oversized_signature :=
+    jsonb_build_object('v', repeat('s', 20481 - signature_overhead));
+
+  IF octet_length(exact_tenant) <> 128
+    OR octet_length(oversized_tenant) <> 129
+    OR char_length(exact_identifier) <> 200
+    OR octet_length(exact_identifier) <> 800
+    OR char_length(oversized_identifier) <> 201
+    OR octet_length(oversized_identifier) <> 804
+    OR octet_length(exact_payload::text) <> 524288
+    OR octet_length(oversized_payload::text) <> 524289
+    OR octet_length(exact_signature::text) <> 20480
+    OR octet_length(oversized_signature::text) <> 20481 THEN
+    RAISE EXCEPTION 'envelope boundary fixtures differ from contract';
+  END IF;
+
+  INSERT INTO scientific_event (
+    event_id,
+    event_type,
+    schema_version,
+    aggregate_type,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    ingested_at,
+    tenant_id,
+    payload,
+    payload_sha256,
+    signature
+  )
+  VALUES (
+    '00000000-0000-4000-8000-000000000011',
+    'decision.recorded',
+    '2',
+    'decision',
+    'payload-byte-limit',
+    1,
+    '2026-01-02 03:04:05+00',
+    '2026-01-02 03:04:06+00',
+    'tenant-fixture',
+    exact_payload,
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    '{"alg":"Ed25519"}'::jsonb
+  );
+
+  INSERT INTO scientific_event (
+    event_id,
+    event_type,
+    schema_version,
+    aggregate_type,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    ingested_at,
+    tenant_id,
+    payload,
+    payload_sha256,
+    signature
+  )
+  VALUES (
+    '00000000-0000-4000-8000-000000000012',
+    'decision.recorded',
+    '2',
+    'decision',
+    'signature-byte-limit',
+    1,
+    '2026-01-02 03:04:05+00',
+    '2026-01-02 03:04:06+00',
+    'tenant-fixture',
+    '{"status":"approved"}'::jsonb,
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    exact_signature
+  );
+
+  INSERT INTO scientific_event (
+    event_id,
+    event_type,
+    schema_version,
+    aggregate_type,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    ingested_at,
+    tenant_id,
+    payload,
+    payload_sha256,
+    signature
+  )
+  VALUES (
+    '00000000-0000-4000-8000-000000000015',
+    'decision.recorded',
+    '2',
+    'decision',
+    'tenant-byte-limit',
+    1,
+    '2026-01-02 03:04:05+00',
+    '2026-01-02 03:04:06+00',
+    exact_tenant,
+    '{"status":"approved"}'::jsonb,
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    '{"alg":"Ed25519"}'::jsonb
+  );
+
+  INSERT INTO scientific_event (
+    event_id,
+    event_type,
+    schema_version,
+    aggregate_type,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    ingested_at,
+    tenant_id,
+    payload,
+    payload_sha256,
+    signature
+  )
+  VALUES (
+    '00000000-0000-4000-8000-000000000017',
+    exact_identifier,
+    exact_identifier,
+    exact_identifier,
+    exact_identifier,
+    1,
+    '2026-01-02 03:04:05+00',
+    '2026-01-02 03:04:06+00',
+    'tenant-fixture',
+    '{"status":"approved"}'::jsonb,
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    '{"alg":"Ed25519"}'::jsonb
+  );
+
+  BEGIN
+    INSERT INTO scientific_event (
+      event_id,
+      event_type,
+      schema_version,
+      aggregate_type,
+      aggregate_id,
+      aggregate_version,
+      occurred_at,
+      ingested_at,
+      tenant_id,
+      payload,
+      payload_sha256,
+      signature
+    )
+    VALUES (
+      '00000000-0000-4000-8000-000000000013',
+      'decision.recorded',
+      '2',
+      'decision',
+      'payload-byte-limit-exceeded',
+      1,
+      '2026-01-02 03:04:05+00',
+      '2026-01-02 03:04:06+00',
+      'tenant-fixture',
+      oversized_payload,
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      '{"alg":"Ed25519"}'::jsonb
+    );
+    RAISE EXCEPTION 'oversized payload was accepted';
+  EXCEPTION
+    WHEN SQLSTATE '23514' THEN NULL;
+  END;
+
+  BEGIN
+    INSERT INTO scientific_event (
+      event_id,
+      event_type,
+      schema_version,
+      aggregate_type,
+      aggregate_id,
+      aggregate_version,
+      occurred_at,
+      ingested_at,
+      tenant_id,
+      payload,
+      payload_sha256,
+      signature
+    )
+    VALUES (
+      '00000000-0000-4000-8000-000000000014',
+      'decision.recorded',
+      '2',
+      'decision',
+      'signature-byte-limit-exceeded',
+      1,
+      '2026-01-02 03:04:05+00',
+      '2026-01-02 03:04:06+00',
+      'tenant-fixture',
+      '{"status":"approved"}'::jsonb,
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      oversized_signature
+    );
+    RAISE EXCEPTION 'oversized signature was accepted';
+  EXCEPTION
+    WHEN SQLSTATE '23514' THEN NULL;
+  END;
+
+  BEGIN
+    INSERT INTO scientific_event (
+      event_id,
+      event_type,
+      schema_version,
+      aggregate_type,
+      aggregate_id,
+      aggregate_version,
+      occurred_at,
+      ingested_at,
+      tenant_id,
+      payload,
+      payload_sha256,
+      signature
+    )
+    VALUES (
+      '00000000-0000-4000-8000-000000000016',
+      'decision.recorded',
+      '2',
+      'decision',
+      'tenant-byte-limit-exceeded',
+      1,
+      '2026-01-02 03:04:05+00',
+      '2026-01-02 03:04:06+00',
+      oversized_tenant,
+      '{"status":"approved"}'::jsonb,
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      '{"alg":"Ed25519"}'::jsonb
+    );
+    RAISE EXCEPTION 'oversized tenant was accepted';
+  EXCEPTION
+    WHEN SQLSTATE '23514' THEN NULL;
+  END;
+
+  FOREACH identifier_column IN ARRAY ARRAY[
+    'event_type',
+    'schema_version',
+    'aggregate_type',
+    'aggregate_id'
+  ]
+  LOOP
+    BEGIN
+      INSERT INTO scientific_event (
+        event_id,
+        event_type,
+        schema_version,
+        aggregate_type,
+        aggregate_id,
+        aggregate_version,
+        occurred_at,
+        ingested_at,
+        tenant_id,
+        payload,
+        payload_sha256,
+        signature
+      )
+      VALUES (
+        '00000000-0000-4000-8000-000000000018',
+        CASE WHEN identifier_column = 'event_type'
+          THEN oversized_identifier ELSE 'decision.recorded' END,
+        CASE WHEN identifier_column = 'schema_version'
+          THEN oversized_identifier ELSE '2' END,
+        CASE WHEN identifier_column = 'aggregate_type'
+          THEN oversized_identifier ELSE 'decision' END,
+        CASE WHEN identifier_column = 'aggregate_id'
+          THEN oversized_identifier ELSE 'identifier-byte-limit-exceeded' END,
+        1,
+        '2026-01-02 03:04:05+00',
+        '2026-01-02 03:04:06+00',
+        'tenant-fixture',
+        '{"status":"approved"}'::jsonb,
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        '{"alg":"Ed25519"}'::jsonb
+      );
+      RAISE EXCEPTION 'oversized % was accepted', identifier_column;
+    EXCEPTION
+      WHEN SQLSTATE '23514' THEN NULL;
+    END;
+  END LOOP;
+
   INSERT INTO scientific_event (
     event_id,
     event_type,

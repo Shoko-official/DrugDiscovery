@@ -170,6 +170,8 @@ version = "0.1.0"
 dependencies = [
  "bioworld-contracts",
  "bioworld-decision-query",
+ "http-body-util",
+ "prost",
  "tokio",
  "tonic",
 ]

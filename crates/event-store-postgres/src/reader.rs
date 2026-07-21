@@ -1,11 +1,16 @@
-use bioworld_contracts::v2::{DecisionEvent, DecisionRecord};
+use bioworld_contracts::{
+    tenant_id_is_valid,
+    v2::{DecisionEvent, DecisionRecord},
+};
 use bioworld_decision_query::{
     GetDecisionQuery, LatestDecisionFuture, LatestDecisionSource, LatestDecisionSourceError,
 };
 use bioworld_event_store_contracts::{
-    DECISION_AGGREGATE_TYPE, ScientificEventRow, reconstruct_decision_event,
+    DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
+    MAX_STORED_EVENT_IDENTIFIER_BYTES, MAX_STORED_EVENT_IDENTIFIER_CHARS,
+    MAX_STORED_EVENT_PAYLOAD_BYTES, MAX_STORED_EVENT_SIGNATURE_BYTES, ScientificEventRow,
+    parse_stored_decision_payload, parse_stored_event_signature, reconstruct_decision_event,
 };
-use serde_json::Value;
 use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 use uuid::Uuid;
@@ -15,8 +20,78 @@ use crate::{
 };
 
 const READER_ROLE: &str = "bioworld_reader";
-const SELECT_DECISION_EVENT: &str = "SELECT event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version::text AS aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature FROM public.scientific_event WHERE tenant_id = $1 AND event_id = $2";
-const SELECT_LATEST_DECISION_EVENT: &str = "SELECT event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version::text AS aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature FROM public.scientific_event WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3 ORDER BY public.scientific_event.aggregate_version DESC LIMIT 1";
+const SELECT_DECISION_EVENT: &str = r#"
+SELECT
+  event_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_id END AS aggregate_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_version::text END AS aggregate_version,
+  occurred_at,
+  CASE WHEN decision_envelope_is_bounded THEN payload::text END AS payload_json,
+  CASE WHEN decision_envelope_is_bounded THEN payload_sha256 END AS payload_sha256,
+  CASE WHEN decision_envelope_is_bounded THEN signature::text END AS signature_json,
+  decision_envelope_is_bounded
+FROM (
+  SELECT
+    event_id,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    payload,
+    payload_sha256,
+    signature,
+    event_type = $3
+      AND schema_version = $4
+      AND aggregate_type = $5
+      AND pg_catalog.char_length(aggregate_id) <= $6
+      AND pg_catalog.octet_length(aggregate_id) <= $7
+      AND aggregate_version >= 1
+      AND aggregate_version <= 18446744073709551615
+      AND aggregate_version = pg_catalog.trunc(aggregate_version)
+      AND payload_sha256 COLLATE "C" ~ '^[0-9a-f]{64}$'
+      AND pg_catalog.octet_length(payload::text) <= $8
+      AND pg_catalog.octet_length(signature::text) <= $9
+      AS decision_envelope_is_bounded
+  FROM public.scientific_event
+  WHERE tenant_id = $1 AND event_id = $2
+) AS bounded_event
+"#;
+const SELECT_LATEST_DECISION_EVENT: &str = r#"
+SELECT
+  event_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_id END AS aggregate_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_version::text END AS aggregate_version,
+  occurred_at,
+  CASE WHEN decision_envelope_is_bounded THEN payload::text END AS payload_json,
+  CASE WHEN decision_envelope_is_bounded THEN payload_sha256 END AS payload_sha256,
+  CASE WHEN decision_envelope_is_bounded THEN signature::text END AS signature_json,
+  decision_envelope_is_bounded
+FROM (
+  SELECT
+    event_id,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    payload,
+    payload_sha256,
+    signature,
+    event_type = $4
+      AND schema_version = $5
+      AND aggregate_type = $2
+      AND pg_catalog.char_length(aggregate_id) <= $6
+      AND pg_catalog.octet_length(aggregate_id) <= $7
+      AND aggregate_version >= 1
+      AND aggregate_version <= 18446744073709551615
+      AND aggregate_version = pg_catalog.trunc(aggregate_version)
+      AND payload_sha256 COLLATE "C" ~ '^[0-9a-f]{64}$'
+      AND pg_catalog.octet_length(payload::text) <= $8
+      AND pg_catalog.octet_length(signature::text) <= $9
+      AS decision_envelope_is_bounded
+  FROM public.scientific_event
+  WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3
+  ORDER BY aggregate_version DESC
+  LIMIT 1
+) AS bounded_event
+"#;
 
 #[derive(Clone, Copy)]
 enum DecisionEventLookup {
@@ -154,11 +229,32 @@ async fn read_in_transaction(
     set_tenant_context(transaction, tenant_id)
         .await
         .map_err(map_append_error)?;
+    let identifier_chars_limit = i32::try_from(MAX_STORED_EVENT_IDENTIFIER_CHARS)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let identifier_bytes_limit = i32::try_from(MAX_STORED_EVENT_IDENTIFIER_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let payload_limit = i32::try_from(MAX_STORED_EVENT_PAYLOAD_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let signature_limit = i32::try_from(MAX_STORED_EVENT_SIGNATURE_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
 
     let row = match lookup {
         DecisionEventLookup::Event(event_id) => {
             transaction
-                .query_opt(SELECT_DECISION_EVENT, &[&tenant_id, &event_id])
+                .query_opt(
+                    SELECT_DECISION_EVENT,
+                    &[
+                        &tenant_id,
+                        &event_id,
+                        &DECISION_EVENT_TYPE,
+                        &DECISION_SCHEMA_VERSION,
+                        &DECISION_AGGREGATE_TYPE,
+                        &identifier_chars_limit,
+                        &identifier_bytes_limit,
+                        &payload_limit,
+                        &signature_limit,
+                    ],
+                )
                 .await
         }
         DecisionEventLookup::Latest(decision_id) => {
@@ -166,7 +262,17 @@ async fn read_in_transaction(
             transaction
                 .query_opt(
                     SELECT_LATEST_DECISION_EVENT,
-                    &[&tenant_id, &DECISION_AGGREGATE_TYPE, &aggregate_id],
+                    &[
+                        &tenant_id,
+                        &DECISION_AGGREGATE_TYPE,
+                        &aggregate_id,
+                        &DECISION_EVENT_TYPE,
+                        &DECISION_SCHEMA_VERSION,
+                        &identifier_chars_limit,
+                        &identifier_bytes_limit,
+                        &payload_limit,
+                        &signature_limit,
+                    ],
                 )
                 .await
         }
@@ -200,66 +306,59 @@ fn reconstruct_row(
     tenant_id: &str,
     lookup: DecisionEventLookup,
 ) -> Result<DecisionEvent, ReadDecisionEventError> {
+    let envelope_is_bounded = row
+        .try_get::<_, bool>("decision_envelope_is_bounded")
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+    if !envelope_is_bounded {
+        return Err(ReadDecisionEventError::StoredEventRejected);
+    }
+    let event_id = row
+        .try_get("event_id")
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+    let aggregate_id = row
+        .try_get::<_, String>("aggregate_id")
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+    let identity_matches = match lookup {
+        DecisionEventLookup::Event(expected_event_id) => event_id == expected_event_id,
+        DecisionEventLookup::Latest(decision_id) => aggregate_id == decision_id.to_string(),
+    };
+    if !identity_matches {
+        return Err(ReadDecisionEventError::StoredEventRejected);
+    }
     let aggregate_version = row
         .try_get::<_, String>("aggregate_version")
         .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
     let aggregate_version = parse_aggregate_version(&aggregate_version)
         .ok_or(ReadDecisionEventError::StoredEventRejected)?;
-    let signature = row
-        .try_get::<_, Value>("signature")
+    let payload_json = row
+        .try_get::<_, String>("payload_json")
         .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
-    let signature = signature
-        .as_object()
-        .cloned()
-        .ok_or(ReadDecisionEventError::StoredEventRejected)?;
+    let payload = parse_stored_decision_payload(&payload_json)
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+    let signature_json = row
+        .try_get::<_, String>("signature_json")
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+    let signature = parse_stored_event_signature(&signature_json)
+        .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
     let stored = ScientificEventRow {
-        event_id: row
-            .try_get("event_id")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        event_type: row
-            .try_get("event_type")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        schema_version: row
-            .try_get("schema_version")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        aggregate_type: row
-            .try_get("aggregate_type")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        aggregate_id: row
-            .try_get("aggregate_id")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
+        event_id,
+        event_type: DECISION_EVENT_TYPE.to_owned(),
+        schema_version: DECISION_SCHEMA_VERSION.to_owned(),
+        aggregate_type: DECISION_AGGREGATE_TYPE.to_owned(),
+        aggregate_id,
         aggregate_version,
         occurred_at: row
             .try_get("occurred_at")
             .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        tenant_id: row
-            .try_get("tenant_id")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
-        payload: row
-            .try_get("payload")
-            .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
+        tenant_id: tenant_id.to_owned(),
+        payload,
         payload_sha256: row
             .try_get("payload_sha256")
             .map_err(|_| ReadDecisionEventError::StoredEventRejected)?,
         signature,
     };
 
-    let identity_matches = match lookup {
-        DecisionEventLookup::Event(event_id) => stored.event_id == event_id,
-        DecisionEventLookup::Latest(decision_id) => {
-            stored.aggregate_type == DECISION_AGGREGATE_TYPE
-                && stored.aggregate_id == decision_id.to_string()
-        }
-    };
-    if stored.tenant_id != tenant_id || !identity_matches {
-        return Err(ReadDecisionEventError::StoredEventRejected);
-    }
-
     reconstruct_decision_event(&stored).map_err(|_| ReadDecisionEventError::StoredEventRejected)
-}
-
-fn tenant_id_is_valid(tenant_id: &str) -> bool {
-    !tenant_id.is_empty() && tenant_id.trim() == tenant_id && !tenant_id.contains('\0')
 }
 
 fn map_read_error(error: ReadDecisionEventError) -> LatestDecisionSourceError {
@@ -334,12 +433,13 @@ fn map_append_error(error: AppendDecisionEventError) -> ReadDecisionEventError {
 
 #[cfg(test)]
 mod tests {
-    use bioworld_contracts::v2::DecisionEvent;
+    use bioworld_contracts::{MAX_TENANT_ID_BYTES, v2::DecisionEvent};
     use bioworld_decision_query::LatestDecisionSourceError;
 
     use super::{
-        READER_ROLE, ReadDecisionEventError, decision_from_event, map_append_error, map_read_error,
-        parse_aggregate_version, tenant_id_is_valid,
+        READER_ROLE, ReadDecisionEventError, SELECT_DECISION_EVENT, SELECT_LATEST_DECISION_EVENT,
+        decision_from_event, map_append_error, map_read_error, parse_aggregate_version,
+        tenant_id_is_valid,
     };
     use crate::{AppendDecisionEventError, RoleAttributes, role_identity_is_valid};
 
@@ -384,7 +484,8 @@ mod tests {
 
     #[test]
     fn validates_tenant_identifiers_before_database_access() {
-        assert!(tenant_id_is_valid("tenant-a"));
+        assert!(tenant_id_is_valid(&"t".repeat(MAX_TENANT_ID_BYTES)));
+        assert!(!tenant_id_is_valid(&"t".repeat(MAX_TENANT_ID_BYTES + 1)));
         for invalid in [
             "",
             " tenant-a",
@@ -393,6 +494,24 @@ mod tests {
             "\u{2003}tenant-a",
         ] {
             assert!(!tenant_id_is_valid(invalid));
+        }
+    }
+
+    #[test]
+    fn guards_json_fields_before_client_deserialization() {
+        for query in [SELECT_DECISION_EVENT, SELECT_LATEST_DECISION_EVENT] {
+            assert!(query.contains("CASE WHEN"));
+            assert!(query.contains("THEN aggregate_id END AS aggregate_id"));
+            assert!(query.contains("THEN aggregate_version::text END AS aggregate_version"));
+            assert!(query.contains("THEN payload::text END AS payload_json"));
+            assert!(query.contains("THEN payload_sha256 END AS payload_sha256"));
+            assert!(query.contains("THEN signature::text END AS signature_json"));
+            assert!(query.contains("AS decision_envelope_is_bounded"));
+            assert!(query.contains("pg_catalog.char_length(aggregate_id)"));
+            assert!(query.contains("pg_catalog.octet_length(aggregate_id)"));
+            assert!(!query.contains("public.scientific_event.*"));
+            assert!(!query.contains("THEN payload END"));
+            assert!(!query.contains("THEN signature END"));
         }
     }
 

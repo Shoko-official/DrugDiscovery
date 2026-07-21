@@ -2,12 +2,15 @@ use std::num::NonZeroU64;
 
 use bioworld_domain::{
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
-    Recommendation as DomainRecommendation,
+    MAX_DECISION_RATIONALE_ITEMS, Recommendation as DomainRecommendation,
 };
+use prost::Message;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::v2;
+
+pub const MAX_DECISION_WIRE_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedDecisionRecord {
@@ -34,6 +37,8 @@ impl VersionedDecisionRecord {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecisionContractError {
+    #[error("decision record exceeds the wire size limit")]
+    DecisionTooLarge,
     #[error("decision_id must be a UUID")]
     InvalidDecisionId,
     #[error("cou_id is required")]
@@ -59,6 +64,12 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
     type Error = DecisionContractError;
 
     fn try_from(value: v2::DecisionRecord) -> Result<Self, Self::Error> {
+        if value.rationale.len() > MAX_DECISION_RATIONALE_ITEMS {
+            return Err(Self::Error::InvalidDomain(DomainError::TooManyRationales));
+        }
+        if value.encoded_len() > MAX_DECISION_WIRE_BYTES {
+            return Err(Self::Error::DecisionTooLarge);
+        }
         let decision_id =
             Uuid::parse_str(&value.decision_id).map_err(|_| Self::Error::InvalidDecisionId)?;
         if value.cou_id.trim().is_empty() {

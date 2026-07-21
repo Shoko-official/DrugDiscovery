@@ -1,7 +1,7 @@
 use bioworld_contracts::v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation};
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
-    ScientificEventRow, project_decision_event,
+    MAX_EVENT_SIGNATURE_JSON_BYTES, ScientificEventRow, project_decision_event,
 };
 use bioworld_event_store_postgres::{AppendDecisionEventError, PostgresDecisionEventWriter};
 use chrono::{DateTime, Utc};
@@ -237,6 +237,27 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
         append(&mut client, invalid, tenant_a).await,
         Err(AppendDecisionEventError::EventRejected),
     );
+    assert!(tenant_context_is_absent(&client).await);
+
+    let signature_overhead = serde_json::to_vec(&json!({"value": ""})).unwrap().len();
+    let boundary_metadata = DecisionEventMetadata::try_new(
+        tenant_a.to_owned(),
+        occurred_at(),
+        json!({
+            "value": "s".repeat(MAX_EVENT_SIGNATURE_JSON_BYTES - signature_overhead)
+        }),
+    )
+    .unwrap();
+    PostgresDecisionEventWriter::new(&mut client)
+        .append(
+            decision_event(
+                "01910d47-6f80-7a31-8c29-1d5c4f6b7015",
+                "018f5a72-9c4b-7d31-8f6a-26f08f3f4d96",
+            ),
+            boundary_metadata,
+        )
+        .await
+        .expect("signature boundary must persist");
     assert!(tenant_context_is_absent(&client).await);
 
     connection_task.abort();

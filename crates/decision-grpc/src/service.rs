@@ -2,10 +2,13 @@ use std::{
     error::Error, fmt, future::Future, num::NonZeroUsize, pin::Pin, sync::Arc, time::Duration,
 };
 
-use bioworld_contracts::v2::{
-    DecisionEvent, DecisionRecord, GetDecisionRequest, ProposeDecisionRequest,
-    WatchDecisionRequest,
-    decision_service_server::{DecisionService, DecisionServiceServer},
+use bioworld_contracts::{
+    MAX_DECISION_WIRE_BYTES,
+    v2::{
+        DecisionEvent, DecisionRecord, GetDecisionRequest, ProposeDecisionRequest,
+        WatchDecisionRequest,
+        decision_service_server::{DecisionService, DecisionServiceServer},
+    },
 };
 use tokio::sync::Semaphore;
 use tonic::{Extensions, Request, Response, Status, metadata::MetadataMap};
@@ -168,6 +171,8 @@ impl<A, E> DecisionGrpcService<A, E> {
 
     pub fn into_server(self) -> DecisionServiceServer<Self> {
         DecisionServiceServer::new(self)
+            .max_decoding_message_size(MAX_DECISION_WIRE_BYTES)
+            .max_encoding_message_size(MAX_DECISION_WIRE_BYTES)
     }
 }
 
