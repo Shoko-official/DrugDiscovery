@@ -183,6 +183,27 @@ fn executes_a_canonical_request_once_and_returns_a_canonical_record() {
 }
 
 #[test]
+fn executes_a_prevalidated_query_once_and_returns_a_canonical_record() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+    let stored = record(decision_id.to_string(), u64::MAX);
+    let expected =
+        DecisionRecord::from(&VersionedDecisionRecord::try_from(stored.clone()).unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut get_decision = GetDecision::new(RecordingSource {
+        calls: Arc::clone(&calls),
+        query: Arc::new(Mutex::new(None)),
+        result: Ok(Some(stored)),
+    });
+
+    let actual =
+        block_on_ready(get_decision.execute_validated(GetDecisionQuery::new(decision_id))).unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.aggregate_version, u64::MAX);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn rejects_an_invalid_request_before_source_access() {
     let submitted = "sensitive-invalid-decision-id";
     let calls = Arc::new(AtomicUsize::new(0));

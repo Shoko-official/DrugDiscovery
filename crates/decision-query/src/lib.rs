@@ -103,6 +103,14 @@ where
                 return Err(GetDecisionRequestExecutionError::InvalidRequest);
             }
         };
+
+        self.execute_validated(query).await
+    }
+
+    pub async fn execute_validated(
+        &mut self,
+        query: GetDecisionQuery,
+    ) -> Result<v2::DecisionRecord, GetDecisionRequestExecutionError> {
         let decision = match self.execute(query).await {
             Ok(Some(decision)) => decision,
             Ok(None) => return Err(GetDecisionRequestExecutionError::NotFound),
