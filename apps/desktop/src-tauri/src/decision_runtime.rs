@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use bioworld_contracts::v2;
-#[cfg(test)]
-pub(crate) use bioworld_desktop_core::DecisionRuntimeError;
 pub(crate) use bioworld_desktop_core::{
-    CurrentDecisionSource, DecisionProvenance, DecisionReadFuture, DecisionRuntime, SourcedDecision,
+    CurrentDecisionSource, DecisionProvenance, DecisionReadFuture, DecisionRuntime,
+    DecisionRuntimeError, SourcedDecision,
 };
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

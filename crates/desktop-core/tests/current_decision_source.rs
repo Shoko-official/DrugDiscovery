@@ -91,12 +91,12 @@ fn preserves_the_exact_source_error() {
     let calls = Arc::new(AtomicUsize::new(0));
     let runtime = DecisionRuntime::from_source(Arc::new(CountingSource {
         calls: Arc::clone(&calls),
-        result: Err(DecisionRuntimeError),
+        result: Err(DecisionRuntimeError::AccessDenied),
     }));
 
     let actual = block_on_ready(runtime.read_current_decision());
 
-    assert_eq!(actual, Err(DecisionRuntimeError));
+    assert_eq!(actual, Err(DecisionRuntimeError::AccessDenied));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
