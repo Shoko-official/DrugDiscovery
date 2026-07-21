@@ -154,6 +154,9 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component clippy
           rustup default 1.95.0
 
+      - name: Test decision gRPC client
+        run: cargo test -p bioworld-decision-grpc-client --locked
+
       - name: Test JWT authentication adapter
         run: cargo test -p bioworld-decision-grpc-jwt --locked
 

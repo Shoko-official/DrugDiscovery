@@ -664,6 +664,20 @@ test("builds PostgreSQL integration tests without credentials and runs them only
     sourceCommand,
     /crates\/decision-grpc\/tests\/decision_service\.rs/,
   );
+  assert.match(sourceCommand, /crates\/decision-grpc-client\/Cargo\.toml/);
+  assert.match(sourceCommand, /crates\/decision-grpc-client\/src\/lib\.rs/);
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-client\/tests\/access_token\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-client\/tests\/client_config\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-client\/tests\/client_transport\.rs/,
+  );
   assert.match(sourceCommand, /crates\/decision-grpc-server\/Cargo\.toml/);
   assert.match(sourceCommand, /crates\/decision-grpc-server\/src\/lib\.rs/);
   assert.match(sourceCommand, /crates\/decision-grpc-server\/src\/config\.rs/);

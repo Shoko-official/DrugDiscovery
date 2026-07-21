@@ -271,6 +271,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bioworld-decision-grpc-client"
+version = "0.1.0"
+dependencies = [
+ "bioworld-contracts",
+ "bioworld-decision-grpc",
+ "bioworld-decision-grpc-server",
+ "bioworld-decision-query",
+ "http",
+ "prost",
+ "rcgen",
+ "rustls",
+ "thiserror 2.0.19",
+ "tokio",
+ "tonic",
+ "zeroize",
+]
+
+[[package]]
 name = "bioworld-decision-grpc-jwt"
 version = "0.1.0"
 dependencies = [

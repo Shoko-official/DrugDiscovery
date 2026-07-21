@@ -4,6 +4,7 @@ members = [
     "apps/decision-server",
     "crates/contracts",
     "crates/decision-grpc",
+    "crates/decision-grpc-client",
     "crates/decision-grpc-jwt",
     "crates/decision-grpc-postgres",
     "crates/decision-grpc-server",
