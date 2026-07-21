@@ -27,7 +27,10 @@ export type DecisionSummary = {
 };
 
 export type DecisionReviewContext = "runtime" | "preview";
-export type DecisionReviewSource = "bundled_sample" | "preview_fixture";
+export type DecisionReviewSource =
+  | "bundled_sample"
+  | "decision_service"
+  | "preview_fixture";
 
 export type DecisionReviewState =
   | { kind: "loading"; context: DecisionReviewContext }
@@ -52,19 +55,32 @@ const recommendationLabels: Record<Recommendation, string> = {
   stop_program: "Stop program",
 };
 
-const recommendationTones: Record<Recommendation, string> = {
-  promote: "positive",
-  reject: "negative",
-  abstain: "caution",
-  defer: "neutral",
-  stop_program: "negative",
-};
-
 const assessmentLabels: Record<DomainAssessment, string> = {
   in_domain: "In domain",
   borderline: "Borderline",
   out_of_domain: "Out of domain",
   unknown: "Unknown",
+};
+
+const sourcePresentation: Record<
+  DecisionReviewSource,
+  { label: string; detail: string; tone: "fixture" | "service" }
+> = {
+  bundled_sample: {
+    label: "Bundled sample",
+    detail: "Loaded through local runtime. Not persisted.",
+    tone: "fixture",
+  },
+  decision_service: {
+    label: "Decision service",
+    detail: "Loaded through authenticated runtime. Not stored for offline use.",
+    tone: "service",
+  },
+  preview_fixture: {
+    label: "Preview fixture",
+    detail: "Not connected to decision runtime.",
+    tone: "fixture",
+  },
 };
 
 function LoadingState({
@@ -128,7 +144,7 @@ function ErrorState({
       <p className="section-label">Decision state</p>
       <h2 id="error-state-title">
         {context === "runtime"
-          ? "Decision runtime unavailable"
+          ? "Decision could not be loaded"
           : "Decision preview unavailable"}
       </h2>
       <p className="state-detail">{message}</p>
@@ -150,17 +166,16 @@ function ReadyState({
 }): React.JSX.Element {
   const recommendation = recommendationLabels[decision.recommendation];
   const assessment = assessmentLabels[decision.domainAssessment];
-  const isRuntime = source === "bundled_sample";
+  const sourceDetails = sourcePresentation[source];
 
   return (
     <>
-      <aside className="fixture-boundary" aria-label="Data source">
-        <strong>{isRuntime ? "Bundled sample" : "Preview fixture"}</strong>
-        <span>
-          {isRuntime
-            ? "Loaded through local runtime. Not persisted."
-            : "Not connected to decision runtime."}
-        </span>
+      <aside
+        className={`source-boundary source-boundary--${sourceDetails.tone}`}
+        aria-label="Data source"
+      >
+        <strong>{sourceDetails.label}</strong>
+        <span>{sourceDetails.detail}</span>
       </aside>
 
       <article className="decision-record" aria-labelledby="decision-record-title">
@@ -169,11 +184,6 @@ function ReadyState({
             <p className="section-label">Decision record</p>
             <h2 id="decision-record-title">{decision.decisionId}</h2>
           </div>
-          <span
-            className={`status status--${recommendationTones[decision.recommendation]}`}
-          >
-            {recommendation}
-          </span>
         </header>
 
         <dl className="decision-facts">
@@ -194,17 +204,6 @@ function ReadyState({
             <dd className="technical-value">{decision.aggregateVersion}</dd>
           </div>
         </dl>
-
-        <section
-          className="review-interpretation"
-          aria-labelledby="review-status-title"
-        >
-          <h3 id="review-status-title">Review status</h3>
-          <p>
-            Assessment incomplete. Review remains blocked until evidence coverage
-            and domain status are available.
-          </p>
-        </section>
 
         <section
           className="rationale-section"
@@ -258,7 +257,7 @@ export function DecisionReview({
 }: DecisionReviewProps): React.JSX.Element {
   const isRuntime =
     state.kind === "ready"
-      ? state.source === "bundled_sample"
+      ? state.source !== "preview_fixture"
       : state.context === "runtime";
   let content: React.JSX.Element;
   switch (state.kind) {

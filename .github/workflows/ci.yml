@@ -157,6 +157,9 @@ jobs:
       - name: Test decision gRPC client
         run: cargo test -p bioworld-decision-grpc-client --locked
 
+      - name: Test authenticated desktop decision source
+        run: cargo test -p bioworld-desktop-decision-grpc --locked
+
       - name: Test JWT authentication adapter
         run: cargo test -p bioworld-decision-grpc-jwt --locked
 

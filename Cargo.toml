@@ -10,6 +10,7 @@ members = [
     "crates/decision-grpc-server",
     "crates/decision-query",
     "crates/domain",
+    "crates/desktop-decision-grpc",
     "crates/desktop-core",
     "crates/event-store-contracts",
     "crates/event-store-postgres",

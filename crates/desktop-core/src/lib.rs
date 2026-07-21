@@ -8,6 +8,7 @@ use bioworld_domain::DecisionRecord;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionProvenance {
     BundledSample,
+    DecisionService,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,8 +27,23 @@ impl SourcedDecision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecisionRuntimeError;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecisionRuntimeError {
+    #[error("decision runtime authentication is unavailable")]
+    AuthenticationUnavailable,
+    #[error("decision runtime authentication was rejected")]
+    AuthenticationRejected,
+    #[error("decision runtime access was denied")]
+    AccessDenied,
+    #[error("decision runtime capacity is exhausted")]
+    CapacityExhausted,
+    #[error("decision runtime deadline exceeded")]
+    DeadlineExceeded,
+    #[error("decision runtime is unavailable")]
+    Unavailable,
+    #[error("decision runtime response is invalid")]
+    InvalidResponse,
+}
 
 pub type DecisionReadFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<SourcedDecision>, DecisionRuntimeError>> + Send + 'a>,

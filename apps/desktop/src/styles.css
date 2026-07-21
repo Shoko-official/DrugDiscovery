@@ -139,20 +139,30 @@ h3 {
   background: var(--surface-primary);
 }
 
-.fixture-boundary {
+.source-boundary {
   display: flex;
   gap: 0.625rem 1rem;
   align-items: baseline;
   margin-top: 1.5rem;
   padding: 0.875rem 1rem;
+  border-radius: 0.25rem;
+}
+
+.source-boundary--fixture {
   border: 1px solid color-mix(in srgb, var(--caution) 45%, var(--outline));
   border-left: 3px solid var(--caution);
-  border-radius: 0.25rem;
   background: var(--surface-caution);
   color: var(--text-caution);
 }
 
-.fixture-boundary span {
+.source-boundary--service {
+  border: 1px solid var(--outline);
+  border-left: 3px solid var(--focus);
+  background: var(--surface-secondary);
+  color: var(--text-primary);
+}
+
+.source-boundary span {
   color: var(--text-secondary);
 }
 
@@ -209,7 +219,6 @@ h3 {
   overflow-wrap: anywhere;
 }
 
-.review-interpretation,
 .rationale-section,
 .evidence-reference {
   margin-top: 1.75rem;
@@ -217,7 +226,6 @@ h3 {
   border-top: 1px solid var(--outline);
 }
 
-.review-interpretation p,
 .state-detail {
   max-width: 68ch;
   margin-bottom: 0;
@@ -352,7 +360,7 @@ h3 {
   .product-header,
   .record-header,
   .evidence-reference__header,
-  .fixture-boundary {
+  .source-boundary {
     flex-direction: column;
   }
 

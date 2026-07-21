@@ -14,6 +14,8 @@ pub(crate) struct DecisionPayload {
 enum DecisionSource {
     #[serde(rename = "bundled_sample")]
     BundledSample,
+    #[serde(rename = "decision_service")]
+    DecisionService,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -24,21 +26,48 @@ pub(crate) struct DecisionCommandError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DecisionCommandErrorCode {
+    RuntimeAuthenticationUnavailable,
+    RuntimeAuthenticationRejected,
+    RuntimeAccessDenied,
+    RuntimeCapacityExhausted,
+    RuntimeDeadlineExceeded,
     RuntimeUnavailable,
     InvalidRuntimeRecord,
 }
 
 impl DecisionCommandError {
-    fn runtime_unavailable() -> Self {
-        Self {
-            code: DecisionCommandErrorCode::RuntimeUnavailable,
-        }
-    }
-
     fn invalid_runtime_record() -> Self {
         Self {
             code: DecisionCommandErrorCode::InvalidRuntimeRecord,
         }
+    }
+
+    fn from_runtime(error: crate::decision_runtime::DecisionRuntimeError) -> Self {
+        let code = match error {
+            crate::decision_runtime::DecisionRuntimeError::AuthenticationUnavailable => {
+                DecisionCommandErrorCode::RuntimeAuthenticationUnavailable
+            }
+            crate::decision_runtime::DecisionRuntimeError::AuthenticationRejected => {
+                DecisionCommandErrorCode::RuntimeAuthenticationRejected
+            }
+            crate::decision_runtime::DecisionRuntimeError::AccessDenied => {
+                DecisionCommandErrorCode::RuntimeAccessDenied
+            }
+            crate::decision_runtime::DecisionRuntimeError::CapacityExhausted => {
+                DecisionCommandErrorCode::RuntimeCapacityExhausted
+            }
+            crate::decision_runtime::DecisionRuntimeError::DeadlineExceeded => {
+                DecisionCommandErrorCode::RuntimeDeadlineExceeded
+            }
+            crate::decision_runtime::DecisionRuntimeError::Unavailable => {
+                DecisionCommandErrorCode::RuntimeUnavailable
+            }
+            crate::decision_runtime::DecisionRuntimeError::InvalidResponse => {
+                DecisionCommandErrorCode::InvalidRuntimeRecord
+            }
+        };
+
+        Self { code }
     }
 }
 
@@ -55,7 +84,7 @@ async fn read_current_decision_from(
     runtime
         .read_current_decision()
         .await
-        .map_err(|_| DecisionCommandError::runtime_unavailable())?
+        .map_err(DecisionCommandError::from_runtime)?
         .map(payload_from_decision)
         .transpose()
 }
@@ -78,6 +107,7 @@ impl From<DecisionProvenance> for DecisionSource {
     fn from(provenance: DecisionProvenance) -> Self {
         match provenance {
             DecisionProvenance::BundledSample => Self::BundledSample,
+            DecisionProvenance::DecisionService => Self::DecisionService,
         }
     }
 }
@@ -153,7 +183,7 @@ mod tests {
 
     #[test]
     fn unavailable_runtime_uses_stable_public_error_code() {
-        let runtime = runtime_with(Err(DecisionRuntimeError));
+        let runtime = runtime_with(Err(DecisionRuntimeError::Unavailable));
         let error =
             tauri::async_runtime::block_on(read_current_decision_from(&runtime)).unwrap_err();
 
@@ -161,6 +191,46 @@ mod tests {
             serde_json::to_value(error).unwrap(),
             serde_json::json!({ "code": "runtime_unavailable" })
         );
+    }
+
+    #[test]
+    fn runtime_errors_use_fixed_public_error_codes() {
+        let cases = [
+            (
+                DecisionRuntimeError::AuthenticationUnavailable,
+                "runtime_authentication_unavailable",
+            ),
+            (
+                DecisionRuntimeError::AuthenticationRejected,
+                "runtime_authentication_rejected",
+            ),
+            (DecisionRuntimeError::AccessDenied, "runtime_access_denied"),
+            (
+                DecisionRuntimeError::CapacityExhausted,
+                "runtime_capacity_exhausted",
+            ),
+            (
+                DecisionRuntimeError::DeadlineExceeded,
+                "runtime_deadline_exceeded",
+            ),
+            (DecisionRuntimeError::Unavailable, "runtime_unavailable"),
+            (
+                DecisionRuntimeError::InvalidResponse,
+                "invalid_runtime_record",
+            ),
+        ];
+
+        for (runtime_error, expected_code) in cases {
+            let error = tauri::async_runtime::block_on(read_current_decision_from(&runtime_with(
+                Err(runtime_error),
+            )))
+            .unwrap_err();
+
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                serde_json::json!({ "code": expected_code })
+            );
+        }
     }
 
     #[test]
@@ -208,6 +278,23 @@ mod tests {
         assert_eq!(
             serde_json::to_value(payload.source).unwrap(),
             "bundled_sample"
+        );
+    }
+
+    #[test]
+    fn decision_service_provenance_is_serialized_exactly() {
+        let runtime = runtime_with(Ok(Some(SourcedDecision::new(
+            bundled_decision_record(),
+            DecisionProvenance::DecisionService,
+        ))));
+
+        let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(payload.source).unwrap(),
+            "decision_service"
         );
     }
 

@@ -408,6 +408,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bioworld-desktop-decision-grpc"
+version = "0.1.0"
+dependencies = [
+ "bioworld-contracts",
+ "bioworld-decision-grpc",
+ "bioworld-decision-grpc-client",
+ "bioworld-decision-grpc-server",
+ "bioworld-decision-query",
+ "bioworld-desktop-core",
+ "rcgen",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "bioworld-domain"
 version = "0.1.0"
 dependencies = [

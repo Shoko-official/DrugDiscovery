@@ -95,7 +95,8 @@ describe("DecisionReview", () => {
     expect(markup).toContain("COU-001");
     expect(markup).toContain("Aggregate version");
     expect(markup).toContain(">1</dd>");
-    expect(markup).toContain("Review remains blocked");
+    expect(markup).not.toContain("Review status");
+    expect(markup).not.toContain("Review remains blocked");
   });
 
   it("renders rationale in source order and an honest evidence reference", () => {
@@ -176,7 +177,7 @@ describe("DecisionReview", () => {
     );
 
     expect(markup).toContain("Stop program");
-    expect(markup).toContain('status status--negative">Stop program');
+    expect(markup).not.toContain('status status--negative">Stop program');
   });
 
   it("identifies a bundled sample loaded through the desktop runtime", () => {
@@ -197,6 +198,29 @@ describe("DecisionReview", () => {
       "Evidence content is not included in this decision review.",
     );
     expect(markup).not.toContain("Not connected to decision runtime.");
+  });
+
+  it("identifies an authenticated decision service before record values", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: tracedDecision,
+        }}
+      />,
+    );
+    const sourceIndex = markup.indexOf("Decision service");
+    const decisionIndex = markup.indexOf(tracedDecision.decisionId);
+
+    expect(markup).toContain("Desktop runtime");
+    expect(sourceIndex).toBeGreaterThanOrEqual(0);
+    expect(decisionIndex).toBeGreaterThan(sourceIndex);
+    expect(markup).toContain(
+      "Loaded through authenticated runtime. Not stored for offline use.",
+    );
+    expect(markup).not.toContain("Bundled sample");
+    expect(markup).not.toContain("Preview fixture");
   });
 
   it("uses runtime-specific copy for non-ready states", () => {
@@ -222,7 +246,7 @@ describe("DecisionReview", () => {
       "No current decision is available from the local runtime.",
     );
     expect(emptyMarkup).toContain("No current decision");
-    expect(errorMarkup).toContain("Decision runtime unavailable");
+    expect(errorMarkup).toContain("Decision could not be loaded");
     expect(errorMarkup).toContain("Retry runtime");
   });
 });

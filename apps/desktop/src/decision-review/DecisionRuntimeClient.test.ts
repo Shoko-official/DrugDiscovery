@@ -12,7 +12,10 @@ const runtimeErrorMessage =
 const validSha256 =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-function validPayload(aggregateVersion = 7n) {
+function validPayload(
+  aggregateVersion = 7n,
+  source: "bundled_sample" | "decision_service" = "bundled_sample",
+) {
   const evidence = create(EvidenceSnapshotRefSchema, {
     id: "ES-001",
     sha256: validSha256,
@@ -29,7 +32,7 @@ function validPayload(aggregateVersion = 7n) {
 
   return {
     protobuf: Array.from(toBinary(DecisionRecordSchema, record)),
-    source: "bundled_sample",
+    source,
   } as const;
 }
 
@@ -79,6 +82,20 @@ describe("createDecisionReviewLoader", () => {
     });
   });
 
+  it("returns an authenticated decision service result with exact provenance", async () => {
+    const loader = createDecisionReviewLoader(async () =>
+      validPayload(18_446_744_073_709_551_615n, "decision_service"),
+    );
+
+    await expect(loader()).resolves.toMatchObject({
+      kind: "ready",
+      source: "decision_service",
+      decision: {
+        aggregateVersion: "18446744073709551615",
+      },
+    });
+  });
+
   it.each([
     ["undefined response", undefined],
     ["array response", []],
@@ -123,6 +140,44 @@ describe("createDecisionReviewLoader", () => {
 
     expectSafeRuntimeError(state);
     expect(JSON.stringify(state)).not.toContain(privateMessage);
+  });
+
+  it.each([
+    [
+      "runtime_authentication_unavailable",
+      "The authenticated decision session is unavailable. Retry after the session is restored.",
+    ],
+    [
+      "runtime_authentication_rejected",
+      "The decision service rejected the current session. Retry after authentication is restored.",
+    ],
+    [
+      "runtime_access_denied",
+      "The current session is not permitted to read this decision.",
+    ],
+    [
+      "runtime_capacity_exhausted",
+      "The decision runtime is busy. Retry shortly.",
+    ],
+    [
+      "runtime_deadline_exceeded",
+      "The decision service did not respond before the request deadline.",
+    ],
+    ["runtime_unavailable", runtimeErrorMessage],
+    [
+      "invalid_runtime_record",
+      "The decision runtime returned a record that could not be validated.",
+    ],
+  ])("maps native error %s to fixed safe copy", async (code, message) => {
+    const loader = createDecisionReviewLoader(async () =>
+      Promise.reject({ code, privateDetail: "must not escape" }),
+    );
+
+    const state = await loader();
+
+    expect(state).toEqual({ kind: "error", context: "runtime", message });
+    expect(JSON.stringify(state)).not.toContain("privateDetail");
+    expect(JSON.stringify(state)).not.toContain("must not escape");
   });
 
   it("invokes the runtime again and can recover after a failure", async () => {
