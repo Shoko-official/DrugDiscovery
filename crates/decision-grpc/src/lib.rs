@@ -8,6 +8,14 @@ use bioworld_decision_query::{
 };
 use tonic::{Request, Response, Status};
 
+mod service;
+
+pub use service::{
+    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
+    DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig, TenantAuthenticationContext,
+    TenantAuthenticator,
+};
+
 pub struct TenantScope(Box<str>);
 
 impl TenantScope {

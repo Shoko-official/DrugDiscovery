@@ -8,4 +8,8 @@ rust-version.workspace = true
 [dependencies]
 bioworld-contracts = { path = "../contracts" }
 bioworld-decision-query = { path = "../decision-query" }
+tokio = { workspace = true, features = ["sync", "time"] }
 tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
