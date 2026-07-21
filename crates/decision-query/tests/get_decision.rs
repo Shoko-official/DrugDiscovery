@@ -10,7 +10,7 @@ use std::{
 
 use bioworld_contracts::{
     VersionedDecisionRecord,
-    v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation},
+    v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus, Recommendation},
 };
 use bioworld_decision_query::{
     GetDecision, GetDecisionError, GetDecisionQuery, GetDecisionRequestError,
@@ -146,6 +146,7 @@ fn record(decision_id: String, aggregate_version: u64) -> DecisionRecord {
             id: "ES-QUERY-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+        ood_status: Some(OodStatus::OutOfDomain as i32),
     }
 }
 
@@ -172,6 +173,7 @@ fn executes_a_canonical_request_once_and_returns_a_canonical_record() {
 
     assert_eq!(actual, expected);
     assert_eq!(actual.aggregate_version, u64::MAX);
+    assert_eq!(actual.ood_status, Some(OodStatus::OutOfDomain as i32));
     assert_eq!(actual.evidence_snapshot_id, "ES-QUERY-001");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let observed_decision_id = observed_query

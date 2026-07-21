@@ -20,6 +20,16 @@ pub enum Recommendation {
     StopProgram,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OodStatus {
+    InDomain,
+    Borderline,
+    OutOfDomain,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "EvidenceSnapshotRefData")]
 pub struct EvidenceSnapshotRef {
@@ -39,6 +49,7 @@ pub struct DecisionRecord {
     id: Uuid,
     cou_id: String,
     recommendation: Recommendation,
+    ood_status: OodStatus,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -48,6 +59,8 @@ struct DecisionRecordData {
     id: Uuid,
     cou_id: String,
     recommendation: Recommendation,
+    #[serde(default)]
+    ood_status: OodStatus,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -116,6 +129,7 @@ impl DecisionRecord {
         id: Uuid,
         cou_id: String,
         recommendation: Recommendation,
+        ood_status: OodStatus,
         evidence: EvidenceSnapshotRef,
         rationale: Vec<String>,
     ) -> Result<Self, DomainError> {
@@ -123,6 +137,7 @@ impl DecisionRecord {
             id,
             cou_id,
             recommendation,
+            ood_status,
             evidence,
             rationale,
         };
@@ -140,6 +155,10 @@ impl DecisionRecord {
 
     pub fn recommendation(&self) -> &Recommendation {
         &self.recommendation
+    }
+
+    pub fn ood_status(&self) -> &OodStatus {
+        &self.ood_status
     }
 
     pub fn evidence(&self) -> &EvidenceSnapshotRef {
@@ -203,6 +222,7 @@ impl TryFrom<DecisionRecordData> for DecisionRecord {
             value.id,
             value.cou_id,
             value.recommendation,
+            value.ood_status,
             value.evidence,
             value.rationale,
         )

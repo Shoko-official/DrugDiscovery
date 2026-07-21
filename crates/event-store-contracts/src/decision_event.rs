@@ -118,6 +118,8 @@ struct CanonicalDecisionPayload {
     decision_id: String,
     cou_id: String,
     recommendation: CanonicalRecommendation,
+    #[serde(default)]
+    ood_status: CanonicalOodStatus,
     evidence: CanonicalEvidence,
     rationale: Vec<String>,
     aggregate_version: String,
@@ -138,6 +140,16 @@ enum CanonicalRecommendation {
     Abstain,
     Defer,
     StopProgram,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CanonicalOodStatus {
+    InDomain,
+    Borderline,
+    OutOfDomain,
+    #[default]
+    Unknown,
 }
 
 pub fn project_decision_event(
@@ -243,6 +255,7 @@ impl CanonicalDecisionPayload {
             decision_id: value.decision_id.clone(),
             cou_id: value.cou_id.clone(),
             recommendation: CanonicalRecommendation::try_from(value.recommendation)?,
+            ood_status: CanonicalOodStatus::try_from(value.ood_status)?,
             evidence: CanonicalEvidence {
                 id: evidence.id.clone(),
                 sha256: evidence.sha256.clone(),
@@ -267,6 +280,7 @@ impl CanonicalDecisionPayload {
             rationale: self.rationale,
             aggregate_version,
             evidence: Some(evidence),
+            ood_status: Some(self.ood_status.to_wire() as i32),
         }
     }
 }
@@ -298,6 +312,37 @@ impl CanonicalRecommendation {
             Self::Abstain => v2::Recommendation::Abstain,
             Self::Defer => v2::Recommendation::Defer,
             Self::StopProgram => v2::Recommendation::StopProgram,
+        }
+    }
+}
+
+impl TryFrom<Option<i32>> for CanonicalOodStatus {
+    type Error = EventProjectionError;
+
+    fn try_from(value: Option<i32>) -> Result<Self, Self::Error> {
+        let Some(value) = value else {
+            return Ok(Self::Unknown);
+        };
+
+        match v2::OodStatus::try_from(value)
+            .map_err(|_| DecisionContractError::UnknownOodStatus(value))?
+        {
+            v2::OodStatus::Unspecified => Err(DecisionContractError::UnspecifiedOodStatus.into()),
+            v2::OodStatus::InDomain => Ok(Self::InDomain),
+            v2::OodStatus::Borderline => Ok(Self::Borderline),
+            v2::OodStatus::OutOfDomain => Ok(Self::OutOfDomain),
+            v2::OodStatus::Unknown => Ok(Self::Unknown),
+        }
+    }
+}
+
+impl CanonicalOodStatus {
+    fn to_wire(self) -> v2::OodStatus {
+        match self {
+            Self::InDomain => v2::OodStatus::InDomain,
+            Self::Borderline => v2::OodStatus::Borderline,
+            Self::OutOfDomain => v2::OodStatus::OutOfDomain,
+            Self::Unknown => v2::OodStatus::Unknown,
         }
     }
 }

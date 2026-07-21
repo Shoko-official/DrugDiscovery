@@ -247,6 +247,7 @@ fn decision_record() -> v2::DecisionRecord {
             id: "ES-M30".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+        ood_status: Some(v2::OodStatus::InDomain as i32),
     }
 }
 

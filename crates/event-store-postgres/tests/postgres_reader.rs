@@ -2,7 +2,7 @@ use std::future::Future;
 
 use bioworld_contracts::{
     VersionedDecisionRecord,
-    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation},
+    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation},
 };
 use bioworld_decision_query::{
     GetDecision, GetDecisionError, GetDecisionQuery, LatestDecisionSource,
@@ -55,6 +55,21 @@ fn decision_event_at_version(
     decision_id: &str,
     aggregate_version: u64,
 ) -> DecisionEvent {
+    decision_event_at_version_with_ood_status(
+        event_id,
+        decision_id,
+        aggregate_version,
+        OodStatus::OutOfDomain,
+    )
+}
+
+#[allow(deprecated)]
+fn decision_event_at_version_with_ood_status(
+    event_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+    ood_status: OodStatus,
+) -> DecisionEvent {
     DecisionEvent {
         event_id: event_id.to_owned(),
         decision: Some(DecisionRecord {
@@ -69,8 +84,61 @@ fn decision_event_at_version(
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
             }),
+            ood_status: Some(ood_status as i32),
         }),
     }
+}
+
+#[tokio::test]
+async fn preserves_every_ood_status_through_postgresql_write_and_read() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m31-ood-status";
+
+    for (index, (ood_status, canonical_ood_status)) in [
+        (OodStatus::InDomain, "in_domain"),
+        (OodStatus::Borderline, "borderline"),
+        (OodStatus::OutOfDomain, "out_of_domain"),
+        (OodStatus::Unknown, "unknown"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event_id = format!("01910d47-6f80-7a31-8c29-1d5c4f6b82{:02}", index + 1);
+        let decision_id = format!("018f5a72-9c4b-7d31-8f6a-26f08f3fe7{:02}", index + 1);
+        let expected =
+            decision_event_at_version_with_ood_status(&event_id, &decision_id, 1, ood_status);
+
+        append(&mut writer, expected.clone(), tenant_id).await;
+        assert!(tenant_context_is_absent(&writer).await);
+
+        let stored = PostgresDecisionEventReader::new(&mut reader)
+            .get(
+                tenant_id,
+                Uuid::parse_str(&event_id).expect("fixed event identifier must parse"),
+            )
+            .await
+            .expect("reader must load the written event")
+            .expect("written event must exist");
+
+        assert_eq!(stored, expected);
+        assert_eq!(
+            stored
+                .decision
+                .as_ref()
+                .expect("stored event must contain a decision")
+                .ood_status,
+            Some(ood_status as i32),
+            "PostgreSQL must preserve {canonical_ood_status} exactly"
+        );
+        assert!(tenant_context_is_absent(&reader).await);
+    }
+
+    writer_task.abort();
+    reader_task.abort();
 }
 
 #[tokio::test]

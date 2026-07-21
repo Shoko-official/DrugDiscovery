@@ -2,14 +2,16 @@ use std::num::NonZeroU64;
 
 use bioworld_contracts::{
     DecisionContractError, MAX_DECISION_WIRE_BYTES, VersionedDecisionRecord,
-    v2::{DecisionRecord, EvidenceSnapshotRef, Recommendation},
+    v2::{DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation},
 };
 use bioworld_domain::{
-    DomainError, MAX_DECISION_RATIONALE_ITEMS, Recommendation as DomainRecommendation,
+    DomainError, MAX_DECISION_RATIONALE_ITEMS, OodStatus as DomainOodStatus,
+    Recommendation as DomainRecommendation,
 };
 use prost::Message;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const COMPLETE_LEGACY_WIRE_WITHOUT_OOD_STATUS: &[u8] = b"\x0a\x24018f5a72-9c4b-7d31-8f6a-26f08f3f4d99\x12\x07COU-001\x1a\x06ES-001\x20\x05\x2a\x1fEvidence threshold was not met.\x30\x07\x3a\x4a\x0a\x06ES-001\x12\x400123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[allow(deprecated)]
 fn complete_wire_record() -> DecisionRecord {
@@ -24,6 +26,7 @@ fn complete_wire_record() -> DecisionRecord {
             id: "ES-001".to_owned(),
             sha256: VALID_SHA256.to_owned(),
         }),
+        ood_status: Some(OodStatus::Borderline as i32),
     }
 }
 
@@ -109,6 +112,7 @@ fn converts_complete_wire_record_to_valid_domain_boundary() {
     assert_eq!(decision.evidence().id(), "ES-001");
     assert_eq!(decision.evidence().sha256(), VALID_SHA256);
     assert_eq!(decision.rationale(), ["Evidence threshold was not met."]);
+    assert_eq!(decision.ood_status(), &DomainOodStatus::Borderline);
     assert_eq!(boundary.aggregate_version(), NonZeroU64::new(7).unwrap());
 }
 
@@ -257,6 +261,60 @@ fn maps_every_supported_recommendation_without_loss() {
         assert_eq!(boundary.decision().recommendation(), &domain_recommendation);
         assert_eq!(emitted.recommendation, wire_recommendation as i32);
     }
+}
+
+#[test]
+fn maps_every_supported_ood_status_without_loss() {
+    let cases = [
+        (OodStatus::InDomain, DomainOodStatus::InDomain),
+        (OodStatus::Borderline, DomainOodStatus::Borderline),
+        (OodStatus::OutOfDomain, DomainOodStatus::OutOfDomain),
+        (OodStatus::Unknown, DomainOodStatus::Unknown),
+    ];
+
+    for (wire_status, domain_status) in cases {
+        let mut wire = complete_wire_record();
+        wire.ood_status = Some(wire_status as i32);
+
+        let boundary = VersionedDecisionRecord::try_from(wire).unwrap();
+        let emitted = DecisionRecord::from(&boundary);
+
+        assert_eq!(boundary.decision().ood_status(), &domain_status);
+        assert_eq!(emitted.ood_status, Some(wire_status as i32));
+    }
+}
+
+#[test]
+#[allow(deprecated)]
+fn maps_frozen_historical_wire_without_ood_status_to_explicit_unknown() {
+    let historical = DecisionRecord::decode(COMPLETE_LEGACY_WIRE_WITHOUT_OOD_STATUS).unwrap();
+
+    assert_eq!(historical.evidence_snapshot_id, "ES-001");
+    assert_eq!(historical.evidence.as_ref().unwrap().id, "ES-001");
+    assert_eq!(historical.ood_status, None);
+
+    let boundary = VersionedDecisionRecord::try_from(historical).unwrap();
+    let emitted = DecisionRecord::from(&boundary);
+
+    assert_eq!(boundary.decision().ood_status(), &DomainOodStatus::Unknown);
+    assert_eq!(emitted.ood_status, Some(OodStatus::Unknown as i32));
+}
+
+#[test]
+fn rejects_unspecified_and_unknown_ood_statuses_distinctly() {
+    let mut unspecified = complete_wire_record();
+    unspecified.ood_status = Some(OodStatus::Unspecified as i32);
+    let mut unknown = complete_wire_record();
+    unknown.ood_status = Some(99);
+
+    assert_eq!(
+        VersionedDecisionRecord::try_from(unspecified),
+        Err(DecisionContractError::UnspecifiedOodStatus),
+    );
+    assert_eq!(
+        VersionedDecisionRecord::try_from(unknown),
+        Err(DecisionContractError::UnknownOodStatus(99)),
+    );
 }
 
 #[test]

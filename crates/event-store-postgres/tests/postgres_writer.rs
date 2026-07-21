@@ -1,4 +1,6 @@
-use bioworld_contracts::v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation};
+use bioworld_contracts::v2::{
+    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation,
+};
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
     MAX_EVENT_SIGNATURE_JSON_BYTES, ScientificEventRow, project_decision_event,
@@ -38,6 +40,7 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
             }),
+            ood_status: Some(OodStatus::OutOfDomain as i32),
         }),
     }
 }
@@ -198,6 +201,7 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
     assert_eq!(stored.occurred_at, expected.occurred_at);
     assert_eq!(stored.tenant_id, tenant_a);
     assert_eq!(stored.payload, expected.payload);
+    assert_eq!(stored.payload["ood_status"], json!("out_of_domain"));
     assert_eq!(stored.payload_sha256, expected.payload_sha256);
     assert_eq!(stored.signature, expected.signature);
     assert!(tenant_context_is_absent(&client).await);

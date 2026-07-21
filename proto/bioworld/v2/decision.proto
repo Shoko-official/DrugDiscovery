@@ -28,6 +28,7 @@ message DecisionRecord {
   repeated string rationale = 5;
   uint64 aggregate_version = 6;
   EvidenceSnapshotRef evidence = 7;
+  optional OodStatus ood_status = 8;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {
@@ -37,4 +38,11 @@ enum Recommendation {
   RECOMMENDATION_ABSTAIN = 3;
   RECOMMENDATION_DEFER = 4;
   RECOMMENDATION_STOP_PROGRAM = 5;
+}
+enum OodStatus {
+  OOD_STATUS_UNSPECIFIED = 0;
+  OOD_STATUS_IN_DOMAIN = 1;
+  OOD_STATUS_BORDERLINE = 2;
+  OOD_STATUS_OUT_OF_DOMAIN = 3;
+  OOD_STATUS_UNKNOWN = 4;
 }

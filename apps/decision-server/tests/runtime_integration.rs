@@ -17,8 +17,9 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, ProposeDecisionRequest,
-    Recommendation, WatchDecisionRequest, decision_service_client::DecisionServiceClient,
+    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus,
+    ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
+    decision_service_client::DecisionServiceClient,
 };
 use bioworld_decision_grpc_jwt::BIOWORLD_TENANT_CLAIM;
 use bioworld_decision_server::{DecisionServerConfig, DecisionServerRuntime};
@@ -336,6 +337,7 @@ fn decision_record() -> DecisionRecord {
             id: "ES-RUNTIME-INTEGRATION".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+        ood_status: Some(OodStatus::OutOfDomain as i32),
     }
 }
 
@@ -515,6 +517,7 @@ async fn serves_tls_authenticated_tenant_isolated_reads_and_stops_cleanly() {
     .await
     .expect("signed tenant must load its decision")
     .into_inner();
+    assert_eq!(actual.ood_status, Some(OodStatus::OutOfDomain as i32));
     assert_eq!(actual, expected);
 
     let hidden = guarded(client.get_decision(authenticated_request(

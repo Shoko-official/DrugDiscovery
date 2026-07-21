@@ -2,6 +2,7 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodStatus,
   Recommendation,
 } from "@bioworld/contracts";
 import { describe, expect, it } from "vitest";
@@ -11,10 +12,23 @@ const runtimeErrorMessage =
   "The local decision runtime could not load the current record.";
 const validSha256 =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const legacyDecisionWithoutOodStatus = Uint8Array.from([
+  10, 36, 48, 49, 56, 102, 53, 97, 55, 50, 45, 57, 99, 52, 98, 45, 55, 100,
+  51, 49, 45, 56, 102, 54, 97, 45, 50, 54, 102, 48, 56, 102, 51, 102, 52, 100,
+  57, 57, 18, 7, 67, 79, 85, 45, 48, 48, 49, 26, 6, 69, 83, 45, 48, 48, 49,
+  32, 5, 42, 31, 69, 118, 105, 100, 101, 110, 99, 101, 32, 116, 104, 114,
+  101, 115, 104, 111, 108, 100, 32, 119, 97, 115, 32, 110, 111, 116, 32, 109,
+  101, 116, 46, 48, 7, 58, 74, 10, 6, 69, 83, 45, 48, 48, 49, 18, 64, 48, 49,
+  50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102, 48, 49, 50, 51,
+  52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102, 48, 49, 50, 51, 52, 53,
+  54, 55, 56, 57, 97, 98, 99, 100, 101, 102, 48, 49, 50, 51, 52, 53, 54, 55,
+  56, 57, 97, 98, 99, 100, 101, 102,
+]);
 
 function validPayload(
   aggregateVersion = 7n,
   source: "bundled_sample" | "decision_service" = "bundled_sample",
+  oodStatus = OodStatus.IN_DOMAIN,
 ) {
   const evidence = create(EvidenceSnapshotRefSchema, {
     id: "ES-001",
@@ -28,6 +42,7 @@ function validPayload(
     rationale: ["Evidence coverage is incomplete."],
     aggregateVersion,
     evidence,
+    oodStatus,
   });
 
   return {
@@ -62,7 +77,7 @@ describe("createDecisionReviewLoader", () => {
         couId: "COU-001",
         aggregateVersion: "7",
         recommendation: "abstain",
-        domainAssessment: "unknown",
+        domainAssessment: "in_domain",
         rationale: ["Evidence coverage is incomplete."],
         evidence: {
           id: "ES-001",
@@ -71,6 +86,42 @@ describe("createDecisionReviewLoader", () => {
       },
     });
     expect(commands).toEqual(["read_current_decision"]);
+  });
+
+  it.each([
+    [OodStatus.IN_DOMAIN, "in_domain"],
+    [OodStatus.BORDERLINE, "borderline"],
+    [OodStatus.OUT_OF_DOMAIN, "out_of_domain"],
+    [OodStatus.UNKNOWN, "unknown"],
+  ] as const)(
+    "maps OOD status %s to domain assessment %s",
+    async (oodStatus, domainAssessment) => {
+      const loader = createDecisionReviewLoader(async () =>
+        validPayload(7n, "bundled_sample", oodStatus),
+      );
+
+      await expect(loader()).resolves.toMatchObject({
+        kind: "ready",
+        source: "bundled_sample",
+        decision: { domainAssessment },
+      });
+    },
+  );
+
+  it("maps a frozen legacy record without OOD status to unknown", async () => {
+    const loader = createDecisionReviewLoader(async () => ({
+      protobuf: Array.from(legacyDecisionWithoutOodStatus),
+      source: "bundled_sample",
+    }));
+
+    await expect(loader()).resolves.toMatchObject({
+      kind: "ready",
+      source: "bundled_sample",
+      decision: {
+        decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+        domainAssessment: "unknown",
+      },
+    });
   });
 
   it("maps a null runtime response to empty", async () => {

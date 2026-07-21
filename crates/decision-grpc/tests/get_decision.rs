@@ -11,7 +11,7 @@ use std::{
 
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES, MAX_TENANT_ID_BYTES,
-    v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation},
+    v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus, Recommendation},
 };
 use bioworld_decision_grpc::{
     InvalidTenantScope, TenantScope, TenantScopedGetDecisionExecutor,
@@ -89,6 +89,7 @@ fn record(aggregate_version: u64) -> DecisionRecord {
             id: "ES-GRPC-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+        ood_status: Some(OodStatus::OutOfDomain as i32),
     }
 }
 
@@ -123,6 +124,10 @@ fn passes_the_exact_scope_and_typed_query_once() {
 
     assert_eq!(response.get_ref(), &expected);
     assert_eq!(response.get_ref().aggregate_version, u64::MAX);
+    assert_eq!(
+        response.get_ref().ood_status,
+        Some(OodStatus::OutOfDomain as i32)
+    );
     assert!(response.metadata().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(

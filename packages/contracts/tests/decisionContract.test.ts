@@ -4,6 +4,7 @@ import {
   DecisionService,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodStatus,
   Recommendation,
 } from "../src/index.js";
 
@@ -24,6 +25,7 @@ describe("generated decision contract", () => {
       rationale: ["Evidence threshold was not met."],
       aggregateVersion: 9_007_199_254_740_993n,
       evidence,
+      oodStatus: OodStatus.OUT_OF_DOMAIN,
     });
 
     const encoded = toBinary(DecisionRecordSchema, expected);
@@ -33,6 +35,7 @@ describe("generated decision contract", () => {
     expect(decoded.aggregateVersion).toBe(9_007_199_254_740_993n);
     expect(decoded.recommendation).toBe(Recommendation.STOP_PROGRAM);
     expect(decoded.evidence).toEqual(evidence);
+    expect(decoded.oodStatus).toBe(OodStatus.OUT_OF_DOMAIN);
   });
 
   it("exports the complete recommendation and service surface", () => {
@@ -52,5 +55,12 @@ describe("generated decision contract", () => {
     expect(DecisionService.method.watchDecision.methodKind).toBe(
       "server_streaming",
     );
+    expect([
+      OodStatus.UNSPECIFIED,
+      OodStatus.IN_DOMAIN,
+      OodStatus.BORDERLINE,
+      OodStatus.OUT_OF_DOMAIN,
+      OodStatus.UNKNOWN,
+    ]).toEqual([0, 1, 2, 3, 4]);
   });
 });

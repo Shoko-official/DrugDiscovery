@@ -101,7 +101,7 @@ export function createDecisionReviewLoader(
       return {
         kind: "ready",
         source: response.source,
-        decision: toDecisionSummary(record, "unknown"),
+        decision: toDecisionSummary(record),
       };
     } catch (error) {
       return runtimeErrorState(error);
