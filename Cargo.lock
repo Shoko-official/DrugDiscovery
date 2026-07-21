@@ -141,6 +141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bioworld-decision-query"
+version = "0.1.0"
+dependencies = [
+ "bioworld-contracts",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "bioworld-desktop"
 version = "0.1.0"
 dependencies = [
