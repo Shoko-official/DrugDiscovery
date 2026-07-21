@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    future::pending,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,12 +10,18 @@ use std::{
 
 use bioworld_contracts::v2::{
     DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation,
+    decision_service_server::DecisionService as GeneratedDecisionService,
 };
-use bioworld_decision_grpc::{TenantScope, get_decision};
+use bioworld_decision_grpc::{
+    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
+    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantScope,
+    get_decision,
+};
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
-    PostgresGetDecisionExecutor, PostgresReaderLease, PostgresReaderLeaseDisposition,
-    PostgresReaderLeaseProvider, PostgresReaderPool, PostgresReaderPoolConfig,
+    PooledPostgresReaderLease, PostgresGetDecisionExecutor, PostgresReaderLease,
+    PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider, PostgresReaderPool,
+    PostgresReaderPoolConfig,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
@@ -44,6 +51,9 @@ const TENANT_A: &str = "tenant-grpc-postgres-a";
 const TENANT_B: &str = "tenant-grpc-postgres-b";
 const POOL_TENANT_A: &str = "tenant-grpc-pool-a";
 const POOL_TENANT_B: &str = "tenant-grpc-pool-b";
+const SERVICE_TENANT_A: &str = "tenant-grpc-service-a";
+const SERVICE_TENANT_B: &str = "tenant-grpc-service-b";
+const SERVICE_TIMEOUT_TENANT: &str = "tenant-grpc-service-timeout";
 const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
     "22735232adcac85cc4bd3d3b0fee84866ec86d41e112733a1ceeac3ef699ca0c";
@@ -62,6 +72,48 @@ struct EventFixture {
     payload: &'static str,
     payload_sha256: &'static str,
     record: DecisionRecord,
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedTestTenant(&'static str);
+
+struct TestTenantAuthenticator;
+
+impl TenantAuthenticator for TestTenantAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        let result = context
+            .extensions()
+            .get::<VerifiedTestTenant>()
+            .map(|tenant| tenant.0.to_owned())
+            .ok_or(AuthenticateTenantError);
+        Box::pin(async move { result })
+    }
+}
+
+#[derive(Clone)]
+struct DelayFirstProductionLease {
+    pool: PostgresReaderPool,
+    acquired: Arc<AtomicUsize>,
+}
+
+impl PostgresReaderLeaseProvider for DelayFirstProductionLease {
+    type Lease<'provider>
+        = PooledPostgresReaderLease
+    where
+        Self: 'provider;
+
+    fn acquire(&self) -> AcquirePostgresReaderFuture<'_, Self::Lease<'_>> {
+        Box::pin(async move {
+            let lease = self.pool.acquire().await?;
+            if self.acquired.fetch_add(1, Ordering::SeqCst) == 0 {
+                pending::<()>().await;
+            }
+            Ok(lease)
+        })
+    }
 }
 
 struct ReaderConnection {
@@ -478,6 +530,36 @@ fn pool_tenant_b_fixture() -> EventFixture {
     }
 }
 
+fn service_tenant_a_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc621",
+        tenant_id: SERVICE_TENANT_A,
+        payload: TENANT_A_PAYLOAD,
+        payload_sha256: TENANT_A_PAYLOAD_SHA256,
+        record: tenant_a_fixture().record,
+    }
+}
+
+fn service_tenant_b_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc622",
+        tenant_id: SERVICE_TENANT_B,
+        payload: TENANT_B_PAYLOAD,
+        payload_sha256: TENANT_B_PAYLOAD_SHA256,
+        record: tenant_b_fixture().record,
+    }
+}
+
+fn service_timeout_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc623",
+        tenant_id: SERVICE_TIMEOUT_TENANT,
+        payload: TENANT_A_PAYLOAD,
+        payload_sha256: TENANT_A_PAYLOAD_SHA256,
+        record: tenant_a_fixture().record,
+    }
+}
+
 fn scope(tenant_id: &str) -> TenantScope {
     TenantScope::try_from_trusted_tenant_id(tenant_id.to_owned())
         .expect("fixed tenant scope must be valid")
@@ -487,6 +569,20 @@ fn request(decision_id: &str) -> Request<GetDecisionRequest> {
     Request::new(GetDecisionRequest {
         decision_id: decision_id.to_owned(),
     })
+}
+
+fn authenticated_request(
+    tenant_id: &'static str,
+    decision_id: &str,
+) -> Request<GetDecisionRequest> {
+    let mut request = request(decision_id);
+    request
+        .extensions_mut()
+        .insert(VerifiedTestTenant(tenant_id));
+    request
+        .metadata_mut()
+        .insert("x-tenant-id", "hostile-client-tenant".parse().unwrap());
+    request
 }
 
 fn assert_public_status(status: &Status, code: Code, message: &str) {
@@ -821,6 +917,147 @@ async fn production_pool_executes_concurrent_tenant_isolated_reads() {
         .finish(PostgresReaderLeaseDisposition::Discard)
         .expect("second lease must be discarded");
 
+    pool.close();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn generated_service_executes_concurrent_tenant_isolated_postgres_reads() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let tenant_a = service_tenant_a_fixture();
+    let tenant_b = service_tenant_b_fixture();
+    seed_event(&mut writer.client, &tenant_a).await;
+    seed_event(&mut writer.client, &tenant_b).await;
+    let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
+    let service = DecisionGrpcService::new(
+        TestTenantAuthenticator,
+        PostgresGetDecisionExecutor::new(pool.clone()),
+        DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(2)).unwrap(),
+    );
+
+    let (tenant_a_response, tenant_b_response) = tokio::join!(
+        GeneratedDecisionService::get_decision(
+            &service,
+            authenticated_request(SERVICE_TENANT_A, SHARED_DECISION_ID),
+        ),
+        GeneratedDecisionService::get_decision(
+            &service,
+            authenticated_request(SERVICE_TENANT_B, SHARED_DECISION_ID),
+        ),
+    );
+
+    assert_eq!(
+        tenant_a_response
+            .expect("tenant A service response must succeed")
+            .into_inner(),
+        tenant_a.record
+    );
+    assert_eq!(
+        tenant_b_response
+            .expect("tenant B service response must succeed")
+            .into_inner(),
+        tenant_b.record
+    );
+
+    let mut first = pool.acquire().await.expect("first clean lease must return");
+    let mut second = pool
+        .acquire()
+        .await
+        .expect("second clean lease must return");
+    assert!(tenant_context_is_absent(first.client()).await);
+    assert!(tenant_context_is_absent(second.client()).await);
+    first
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("first lease must be discarded");
+    second
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("second lease must be discarded");
+
+    pool.close();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn service_timeout_discards_an_acquired_production_lease_and_recovers() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let fixture = service_timeout_fixture();
+    seed_event(&mut writer.client, &fixture).await;
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let mut baseline = pool
+        .acquire()
+        .await
+        .expect("baseline lease must be acquired");
+    let baseline_backend: i32 = baseline
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("baseline backend identity must be queryable")
+        .get(0);
+    baseline
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("baseline lease must return to the pool");
+    let acquired = Arc::new(AtomicUsize::new(0));
+    let service = DecisionGrpcService::new(
+        TestTenantAuthenticator,
+        PostgresGetDecisionExecutor::new(DelayFirstProductionLease {
+            pool: pool.clone(),
+            acquired: Arc::clone(&acquired),
+        }),
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_millis(100)).unwrap(),
+    );
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(1),
+        GeneratedDecisionService::get_decision(
+            &service,
+            authenticated_request(SERVICE_TIMEOUT_TENANT, SHARED_DECISION_ID),
+        ),
+    )
+    .await
+    .expect("service timeout must remain bounded")
+    .expect_err("delayed acquisition must time out");
+
+    assert_public_status(
+        &status,
+        Code::DeadlineExceeded,
+        "decision request deadline exceeded",
+    );
+    assert_eq!(acquired.load(Ordering::SeqCst), 1);
+
+    let mut replacement = pool
+        .acquire()
+        .await
+        .expect("discarded capacity must be replaced");
+    let replacement_backend: i32 = replacement
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("replacement backend identity must be queryable")
+        .get(0);
+    assert_ne!(replacement_backend, baseline_backend);
+    replacement
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("replacement lease must return to the pool");
+
+    let response = GeneratedDecisionService::get_decision(
+        &service,
+        authenticated_request(SERVICE_TIMEOUT_TENANT, SHARED_DECISION_ID),
+    )
+    .await
+    .expect("capacity must recover after service timeout");
+    assert_eq!(response.into_inner(), fixture.record);
+
+    let mut clean = pool.acquire().await.expect("clean lease must return");
+    assert!(tenant_context_is_absent(clean.client()).await);
+    clean
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("clean lease must be discarded");
     pool.close();
     writer.discard();
 }

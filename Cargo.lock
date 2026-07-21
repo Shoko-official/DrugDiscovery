@@ -146,6 +146,7 @@ version = "0.1.0"
 dependencies = [
  "bioworld-contracts",
  "bioworld-decision-query",
+ "tokio",
  "tonic",
 ]
 
