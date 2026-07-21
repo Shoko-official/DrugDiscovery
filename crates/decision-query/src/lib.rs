@@ -22,6 +22,26 @@ impl GetDecisionQuery {
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum GetDecisionRequestError {
+    #[error("decision request identifier is invalid")]
+    InvalidDecisionId,
+}
+
+impl TryFrom<v2::GetDecisionRequest> for GetDecisionQuery {
+    type Error = GetDecisionRequestError;
+
+    fn try_from(request: v2::GetDecisionRequest) -> Result<Self, Self::Error> {
+        let decision_id = Uuid::parse_str(&request.decision_id)
+            .map_err(|_| GetDecisionRequestError::InvalidDecisionId)?;
+        if decision_id.to_string() != request.decision_id {
+            return Err(GetDecisionRequestError::InvalidDecisionId);
+        }
+
+        Ok(Self::new(decision_id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum LatestDecisionSourceError {
     #[error("latest decision source is unavailable")]
     Unavailable,
