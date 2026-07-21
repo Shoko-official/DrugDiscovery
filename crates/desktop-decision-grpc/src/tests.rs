@@ -248,6 +248,10 @@ fn decision_record() -> v2::DecisionRecord {
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
         ood_status: Some(v2::OodStatus::InDomain as i32),
+        ood_detector: Some(v2::OodDetectorRef {
+            detector_id: "desktop-service-detector".to_owned(),
+            detector_version: "2026.07".to_owned(),
+        }),
     }
 }
 

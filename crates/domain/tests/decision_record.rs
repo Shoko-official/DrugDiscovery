@@ -1,11 +1,65 @@
 use bioworld_domain::{
     DecisionRecord, DomainError, EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES,
     MAX_DECISION_IDENTIFIER_CHARS, MAX_DECISION_RATIONALE_ITEM_BYTES, MAX_DECISION_RATIONALE_ITEMS,
-    MAX_DECISION_RATIONALE_TOTAL_BYTES, OodStatus, Recommendation,
+    MAX_DECISION_RATIONALE_TOTAL_BYTES, MAX_OOD_DETECTOR_ID_BYTES, MAX_OOD_DETECTOR_VERSION_BYTES,
+    OodDetectorRef, OodStatus, Recommendation,
 };
 use uuid::Uuid;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn constructs_canonical_ood_detector_reference() {
+    let detector =
+        OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap();
+
+    assert_eq!(detector.detector_id(), "mahalanobis");
+    assert_eq!(detector.detector_version(), "model-2026.07");
+}
+
+#[test]
+fn validates_ood_detector_id_with_an_exact_byte_budget() {
+    let exact = OodDetectorRef::try_new(
+        "d".repeat(MAX_OOD_DETECTOR_ID_BYTES),
+        "model-2026.07".to_owned(),
+    );
+
+    assert!(exact.is_ok());
+    for detector_id in [
+        String::new(),
+        " detector".to_owned(),
+        "detector ".to_owned(),
+        "detector\0id".to_owned(),
+        "d".repeat(MAX_OOD_DETECTOR_ID_BYTES + 1),
+    ] {
+        assert_eq!(
+            OodDetectorRef::try_new(detector_id, "model-2026.07".to_owned()),
+            Err(DomainError::InvalidOodDetectorId),
+        );
+    }
+}
+
+#[test]
+fn validates_ood_detector_version_with_an_exact_byte_budget() {
+    let exact = OodDetectorRef::try_new(
+        "mahalanobis".to_owned(),
+        "v".repeat(MAX_OOD_DETECTOR_VERSION_BYTES),
+    );
+
+    assert!(exact.is_ok());
+    for detector_version in [
+        String::new(),
+        " version".to_owned(),
+        "version ".to_owned(),
+        "version\0build".to_owned(),
+        "v".repeat(MAX_OOD_DETECTOR_VERSION_BYTES + 1),
+    ] {
+        assert_eq!(
+            OodDetectorRef::try_new("mahalanobis".to_owned(), detector_version),
+            Err(DomainError::InvalidOodDetectorVersion),
+        );
+    }
+}
 
 #[test]
 fn constructs_decision_with_explicit_ood_status() {
@@ -22,6 +76,26 @@ fn constructs_decision_with_explicit_ood_status() {
     .unwrap();
 
     assert_eq!(record.ood_status(), &OodStatus::Borderline);
+}
+
+#[test]
+fn constructs_decision_with_qualified_ood_detector_reference() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let detector =
+        OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap();
+    let record = DecisionRecord::try_new_with_ood_detector(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        Some(detector.clone()),
+        evidence,
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(record.ood_detector(), Some(&detector));
 }
 
 #[test]
@@ -42,6 +116,8 @@ fn historical_decision_json_without_ood_status_maps_to_unknown() {
 
     assert_eq!(record.ood_status(), &OodStatus::Unknown);
     assert_eq!(current["ood_status"], "unknown");
+    assert_eq!(record.ood_detector(), None);
+    assert!(current.get("ood_detector").is_none());
 }
 
 #[test]
@@ -424,11 +500,14 @@ fn decision_json_round_trip_preserves_wire_shape() {
     let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
     let evidence =
         EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
-    let record = DecisionRecord::try_new(
+    let detector =
+        OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap();
+    let record = DecisionRecord::try_new_with_ood_detector(
         decision_id,
         "COU-001".to_owned(),
         Recommendation::Abstain,
         OodStatus::Borderline,
+        Some(detector),
         evidence,
         vec!["Evidence coverage is incomplete.".to_owned()],
     )
@@ -438,6 +517,10 @@ fn decision_json_round_trip_preserves_wire_shape() {
         "cou_id": "COU-001",
         "recommendation": "abstain",
         "ood_status": "borderline",
+        "ood_detector": {
+            "detector_id": "mahalanobis",
+            "detector_version": "model-2026.07"
+        },
         "evidence": {
             "id": "ES-001",
             "sha256": VALID_SHA256

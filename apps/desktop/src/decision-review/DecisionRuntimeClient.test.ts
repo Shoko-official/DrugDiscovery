@@ -2,6 +2,7 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodDetectorRefSchema,
   OodStatus,
   Recommendation,
 } from "@bioworld/contracts";
@@ -34,6 +35,10 @@ function validPayload(
     id: "ES-001",
     sha256: validSha256,
   });
+  const oodDetector = create(OodDetectorRefSchema, {
+    detectorId: "mahalanobis",
+    detectorVersion: "model-2026.07",
+  });
   const record = create(DecisionRecordSchema, {
     decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
     couId: "COU-001",
@@ -43,6 +48,7 @@ function validPayload(
     aggregateVersion,
     evidence,
     oodStatus,
+    oodDetector,
   });
 
   return {
@@ -78,6 +84,10 @@ describe("createDecisionReviewLoader", () => {
         aggregateVersion: "7",
         recommendation: "abstain",
         domainAssessment: "in_domain",
+        oodDetector: {
+          detectorId: "mahalanobis",
+          detectorVersion: "model-2026.07",
+        },
         rationale: ["Evidence coverage is incomplete."],
         evidence: {
           id: "ES-001",
@@ -120,6 +130,7 @@ describe("createDecisionReviewLoader", () => {
       decision: {
         decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
         domainAssessment: "unknown",
+        oodDetector: null,
       },
     });
   });

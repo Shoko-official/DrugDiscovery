@@ -12,8 +12,8 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES,
     v2::{
-        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus, ProposeDecisionRequest,
-        Recommendation, WatchDecisionRequest,
+        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
+        ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
         decision_service_server::DecisionService as GeneratedDecisionService,
     },
 };
@@ -296,7 +296,11 @@ fn record() -> DecisionRecord {
             id: "ES-SERVICE-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
-        ood_status: Some(OodStatus::OutOfDomain as i32),
+        ood_status: Some(OodStatus::InDomain as i32),
+        ood_detector: Some(OodDetectorRef {
+            detector_id: "service-domain-detector".to_owned(),
+            detector_version: "2026.07".to_owned(),
+        }),
     }
 }
 
@@ -478,7 +482,7 @@ async fn authenticates_and_executes_the_exact_tenant_scoped_query() {
         .unwrap();
 
     let response = response.into_inner();
-    assert_eq!(response.ood_status, Some(OodStatus::OutOfDomain as i32));
+    assert_eq!(response.ood_status, Some(OodStatus::InDomain as i32));
     assert_eq!(response, expected);
     assert_eq!(
         *observed.lock().unwrap(),

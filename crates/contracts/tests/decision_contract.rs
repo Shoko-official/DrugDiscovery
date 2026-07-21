@@ -2,16 +2,17 @@ use std::num::NonZeroU64;
 
 use bioworld_contracts::{
     DecisionContractError, MAX_DECISION_WIRE_BYTES, VersionedDecisionRecord,
-    v2::{DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation},
+    v2::{DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation},
 };
 use bioworld_domain::{
-    DomainError, MAX_DECISION_RATIONALE_ITEMS, OodStatus as DomainOodStatus,
-    Recommendation as DomainRecommendation,
+    DomainError, MAX_DECISION_RATIONALE_ITEMS, MAX_OOD_DETECTOR_VERSION_BYTES,
+    OodStatus as DomainOodStatus, Recommendation as DomainRecommendation,
 };
 use prost::Message;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const COMPLETE_LEGACY_WIRE_WITHOUT_OOD_STATUS: &[u8] = b"\x0a\x24018f5a72-9c4b-7d31-8f6a-26f08f3f4d99\x12\x07COU-001\x1a\x06ES-001\x20\x05\x2a\x1fEvidence threshold was not met.\x30\x07\x3a\x4a\x0a\x06ES-001\x12\x400123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const M31_WIRE_WITHOUT_OOD_DETECTOR: &[u8] = b"\x0a\x24018f5a72-9c4b-7d31-8f6a-26f08f3f4d99\x12\x07COU-001\x1a\x06ES-001\x20\x05\x2a\x1fEvidence threshold was not met.\x30\x07\x3a\x4a\x0a\x06ES-001\x12\x400123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\x40\x03";
 
 #[allow(deprecated)]
 fn complete_wire_record() -> DecisionRecord {
@@ -27,6 +28,10 @@ fn complete_wire_record() -> DecisionRecord {
             sha256: VALID_SHA256.to_owned(),
         }),
         ood_status: Some(OodStatus::Borderline as i32),
+        ood_detector: Some(OodDetectorRef {
+            detector_id: "mahalanobis".to_owned(),
+            detector_version: "model-2026.07".to_owned(),
+        }),
     }
 }
 
@@ -113,6 +118,9 @@ fn converts_complete_wire_record_to_valid_domain_boundary() {
     assert_eq!(decision.evidence().sha256(), VALID_SHA256);
     assert_eq!(decision.rationale(), ["Evidence threshold was not met."]);
     assert_eq!(decision.ood_status(), &DomainOodStatus::Borderline);
+    let detector = decision.ood_detector().unwrap();
+    assert_eq!(detector.detector_id(), "mahalanobis");
+    assert_eq!(detector.detector_version(), "model-2026.07");
     assert_eq!(boundary.aggregate_version(), NonZeroU64::new(7).unwrap());
 }
 
@@ -179,6 +187,30 @@ fn rejects_invalid_wire_records_with_specific_errors() {
         "invalid evidence digest",
         invalid_digest,
         DecisionContractError::InvalidDomain(DomainError::InvalidEvidenceDigest),
+    ));
+
+    let mut invalid_detector_id = complete_wire_record();
+    invalid_detector_id
+        .ood_detector
+        .as_mut()
+        .unwrap()
+        .detector_id = " detector".to_owned();
+    cases.push((
+        "invalid OOD detector id",
+        invalid_detector_id,
+        DecisionContractError::InvalidDomain(DomainError::InvalidOodDetectorId),
+    ));
+
+    let mut invalid_detector_version = complete_wire_record();
+    invalid_detector_version
+        .ood_detector
+        .as_mut()
+        .unwrap()
+        .detector_version = "v".repeat(MAX_OOD_DETECTOR_VERSION_BYTES + 1);
+    cases.push((
+        "invalid OOD detector version",
+        invalid_detector_version,
+        DecisionContractError::InvalidDomain(DomainError::InvalidOodDetectorVersion),
     ));
 
     let mut missing_rationale = complete_wire_record();
@@ -292,12 +324,34 @@ fn maps_frozen_historical_wire_without_ood_status_to_explicit_unknown() {
     assert_eq!(historical.evidence_snapshot_id, "ES-001");
     assert_eq!(historical.evidence.as_ref().unwrap().id, "ES-001");
     assert_eq!(historical.ood_status, None);
+    assert_eq!(historical.ood_detector, None);
 
     let boundary = VersionedDecisionRecord::try_from(historical).unwrap();
     let emitted = DecisionRecord::from(&boundary);
 
     assert_eq!(boundary.decision().ood_status(), &DomainOodStatus::Unknown);
     assert_eq!(emitted.ood_status, Some(OodStatus::Unknown as i32));
+    assert_eq!(boundary.decision().ood_detector(), None);
+    assert_eq!(emitted.ood_detector, None);
+}
+
+#[test]
+fn maps_frozen_m31_wire_without_detector_metadata_without_backfill() {
+    let historical = DecisionRecord::decode(M31_WIRE_WITHOUT_OOD_DETECTOR).unwrap();
+
+    assert_eq!(historical.ood_status, Some(OodStatus::OutOfDomain as i32));
+    assert_eq!(historical.ood_detector, None);
+
+    let boundary = VersionedDecisionRecord::try_from(historical).unwrap();
+    let emitted = DecisionRecord::from(&boundary);
+
+    assert_eq!(
+        boundary.decision().ood_status(),
+        &DomainOodStatus::OutOfDomain
+    );
+    assert_eq!(boundary.decision().ood_detector(), None);
+    assert_eq!(emitted.ood_status, Some(OodStatus::OutOfDomain as i32));
+    assert_eq!(emitted.ood_detector, None);
 }
 
 #[test]

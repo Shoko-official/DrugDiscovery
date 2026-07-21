@@ -550,6 +550,7 @@ fn record(
             sha256: evidence_sha256.to_owned(),
         }),
         ood_status: Some(OodStatus::Unknown as i32),
+        ood_detector: None,
     }
 }
 

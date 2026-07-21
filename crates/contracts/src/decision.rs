@@ -2,8 +2,8 @@ use std::num::NonZeroU64;
 
 use bioworld_domain::{
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
-    MAX_DECISION_RATIONALE_ITEMS, OodStatus as DomainOodStatus,
-    Recommendation as DomainRecommendation,
+    MAX_DECISION_RATIONALE_ITEMS, OodDetectorRef as DomainOodDetectorRef,
+    OodStatus as DomainOodStatus, Recommendation as DomainRecommendation,
 };
 use prost::Message;
 use thiserror::Error;
@@ -97,12 +97,19 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
             .map(ood_status_from_wire)
             .transpose()?
             .unwrap_or(DomainOodStatus::Unknown);
+        let ood_detector = value
+            .ood_detector
+            .map(|detector| {
+                DomainOodDetectorRef::try_new(detector.detector_id, detector.detector_version)
+            })
+            .transpose()?;
         let evidence = EvidenceSnapshotRef::try_new(evidence.id, evidence.sha256)?;
-        let decision = DomainDecisionRecord::try_new(
+        let decision = DomainDecisionRecord::try_new_with_ood_detector(
             decision_id,
             value.cou_id,
             recommendation,
             ood_status,
+            ood_detector,
             evidence,
             value.rationale,
         )?;
@@ -129,6 +136,10 @@ impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
                 sha256: evidence.sha256().to_owned(),
             }),
             ood_status: Some(ood_status_to_wire(decision.ood_status()) as i32),
+            ood_detector: decision.ood_detector().map(|detector| v2::OodDetectorRef {
+                detector_id: detector.detector_id().to_owned(),
+                detector_version: detector.detector_version().to_owned(),
+            }),
         }
     }
 }

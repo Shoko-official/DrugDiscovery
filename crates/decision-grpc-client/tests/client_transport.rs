@@ -12,8 +12,8 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES,
     v2::{
-        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus,
-        ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
+        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef,
+        OodStatus, ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
         decision_service_server::{DecisionService, DecisionServiceServer},
     },
 };
@@ -247,7 +247,11 @@ fn decision_record() -> DecisionRecord {
             id: "ES-CLIENT-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
-        ood_status: Some(OodStatus::OutOfDomain as i32),
+        ood_status: Some(OodStatus::InDomain as i32),
+        ood_detector: Some(OodDetectorRef {
+            detector_id: "client-domain-detector".to_owned(),
+            detector_version: "2026.07".to_owned(),
+        }),
     }
 }
 
@@ -364,7 +368,7 @@ where
 }
 
 enum RawReply {
-    Record(DecisionRecord),
+    Record(Box<DecisionRecord>),
     Status(Code),
 }
 
@@ -385,7 +389,7 @@ impl DecisionService for RawDecisionService {
             .pop_front()
             .expect("raw test reply must exist")
         {
-            RawReply::Record(record) => Ok(Response::new(record)),
+            RawReply::Record(record) => Ok(Response::new(*record)),
             RawReply::Status(code) => Err(Status::new(code, "PRIVATE-SERVER-MARKER")),
         }
     }
@@ -787,7 +791,7 @@ async fn rejects_a_valid_response_with_a_different_decision_identity() {
 async fn rejects_a_contract_invalid_response_from_the_transport() {
     let mut invalid = decision_record();
     invalid.aggregate_version = 0;
-    let server = start_raw_server(vec![RawReply::Record(invalid)]).await;
+    let server = start_raw_server(vec![RawReply::Record(Box::new(invalid))]).await;
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let client = guarded(DecisionGrpcClient::connect(
         server.client_config(client_limits()),
@@ -884,7 +888,7 @@ async fn maps_every_server_status_to_a_fixed_redacted_client_category() {
 async fn rejects_a_response_above_the_decoding_budget() {
     let response = decision_response_with_encoded_len(MAX_DECISION_WIRE_BYTES + 1);
     assert_eq!(response.encoded_len(), MAX_DECISION_WIRE_BYTES + 1);
-    let server = start_raw_server(vec![RawReply::Record(response)]).await;
+    let server = start_raw_server(vec![RawReply::Record(Box::new(response))]).await;
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let client = guarded(DecisionGrpcClient::connect(
         server.client_config(client_limits()),

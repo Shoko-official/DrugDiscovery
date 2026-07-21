@@ -74,6 +74,14 @@ pub struct ScientificEventRow {
 pub enum EventProjectionError {
     #[error("decision event is missing its decision")]
     MissingDecision,
+    #[error("new decision events require an explicit ood_status")]
+    MissingOodStatus,
+    #[error("new decision events require a qualified ood_status")]
+    UnqualifiedOodStatus,
+    #[error("new decision events require an OOD detector reference")]
+    MissingOodDetector,
+    #[error("out-of-domain decisions must abstain")]
+    OutOfDomainRequiresAbstain,
     #[error("event_id must be a canonical UUID")]
     InvalidEventId,
     #[error("tenant_id must be non-empty, at most 128 bytes, and have no surrounding whitespace")]
@@ -120,6 +128,8 @@ struct CanonicalDecisionPayload {
     recommendation: CanonicalRecommendation,
     #[serde(default)]
     ood_status: CanonicalOodStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ood_detector: Option<CanonicalOodDetector>,
     evidence: CanonicalEvidence,
     rationale: Vec<String>,
     aggregate_version: String,
@@ -130,6 +140,13 @@ struct CanonicalDecisionPayload {
 struct CanonicalEvidence {
     id: String,
     sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalOodDetector {
+    detector_id: String,
+    detector_version: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -163,8 +180,14 @@ pub fn project_decision_event(
     if canonical_uuid(&decision.decision_id).is_none() {
         return Err(DecisionContractError::InvalidDecisionId.into());
     }
+    validate_new_ood_metadata(&decision)?;
     let boundary = VersionedDecisionRecord::try_from(decision)?;
     let decision = v2::DecisionRecord::from(&boundary);
+    if decision.ood_status == Some(v2::OodStatus::OutOfDomain as i32)
+        && decision.recommendation != v2::Recommendation::Abstain as i32
+    {
+        return Err(EventProjectionError::OutOfDomainRequiresAbstain);
+    }
     let payload = CanonicalDecisionPayload::from_wire(&decision)?;
     let (payload, payload_sha256) = canonical_payload(&payload)?;
 
@@ -256,6 +279,13 @@ impl CanonicalDecisionPayload {
             cou_id: value.cou_id.clone(),
             recommendation: CanonicalRecommendation::try_from(value.recommendation)?,
             ood_status: CanonicalOodStatus::try_from(value.ood_status)?,
+            ood_detector: value
+                .ood_detector
+                .as_ref()
+                .map(|detector| CanonicalOodDetector {
+                    detector_id: detector.detector_id.clone(),
+                    detector_version: detector.detector_version.clone(),
+                }),
             evidence: CanonicalEvidence {
                 id: evidence.id.clone(),
                 sha256: evidence.sha256.clone(),
@@ -281,8 +311,28 @@ impl CanonicalDecisionPayload {
             aggregate_version,
             evidence: Some(evidence),
             ood_status: Some(self.ood_status.to_wire() as i32),
+            ood_detector: self.ood_detector.map(|detector| v2::OodDetectorRef {
+                detector_id: detector.detector_id,
+                detector_version: detector.detector_version,
+            }),
         }
     }
+}
+
+fn validate_new_ood_metadata(value: &v2::DecisionRecord) -> Result<(), EventProjectionError> {
+    let Some(status) = value.ood_status else {
+        return Err(EventProjectionError::MissingOodStatus);
+    };
+    match v2::OodStatus::try_from(status) {
+        Ok(v2::OodStatus::InDomain | v2::OodStatus::Borderline | v2::OodStatus::OutOfDomain) => {}
+        Ok(v2::OodStatus::Unspecified | v2::OodStatus::Unknown) | Err(_) => {
+            return Err(EventProjectionError::UnqualifiedOodStatus);
+        }
+    }
+    if value.ood_detector.is_none() {
+        return Err(EventProjectionError::MissingOodDetector);
+    }
+    Ok(())
 }
 
 impl TryFrom<i32> for CanonicalRecommendation {
