@@ -30,8 +30,61 @@ impl<'request> TenantAuthenticationContext<'request> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AuthenticateTenantError;
+#[derive(Clone, Copy, Eq, PartialEq)]
+/// Fixed, redacted failure returned by tenant authentication adapters.
+pub struct AuthenticateTenantError {
+    kind: AuthenticateTenantErrorKind,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthenticateTenantErrorKind {
+    Rejected,
+    CapacityExhausted,
+    Unavailable,
+}
+
+impl AuthenticateTenantError {
+    /// Reports invalid, missing, or rejected credentials.
+    pub const fn rejected() -> Self {
+        Self {
+            kind: AuthenticateTenantErrorKind::Rejected,
+        }
+    }
+
+    /// Reports that bounded authentication capacity is currently exhausted.
+    pub const fn capacity_exhausted() -> Self {
+        Self {
+            kind: AuthenticateTenantErrorKind::CapacityExhausted,
+        }
+    }
+
+    /// Reports that authentication infrastructure is unavailable.
+    pub const fn unavailable() -> Self {
+        Self {
+            kind: AuthenticateTenantErrorKind::Unavailable,
+        }
+    }
+
+    fn status(self) -> Status {
+        match self.kind {
+            AuthenticateTenantErrorKind::Rejected => {
+                Status::unauthenticated("authentication is required")
+            }
+            AuthenticateTenantErrorKind::CapacityExhausted => {
+                Status::resource_exhausted("authentication service is at capacity")
+            }
+            AuthenticateTenantErrorKind::Unavailable => {
+                Status::unavailable("authentication service is unavailable")
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AuthenticateTenantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticateTenantError")
+    }
+}
 
 impl fmt::Display for AuthenticateTenantError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -139,7 +192,7 @@ where
                     extensions: request.extensions(),
                 })
                 .await
-                .map_err(|_| Status::unauthenticated("authentication is required"))?;
+                .map_err(AuthenticateTenantError::status)?;
             let scope = TenantScope::try_from_trusted_tenant_id(tenant_id)
                 .map_err(|_| Status::unauthenticated("authentication is required"))?;
 

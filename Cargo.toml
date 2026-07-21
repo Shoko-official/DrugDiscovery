@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/contracts",
     "crates/decision-grpc",
+    "crates/decision-grpc-jwt",
     "crates/decision-grpc-postgres",
     "crates/decision-query",
     "crates/domain",
@@ -20,8 +21,12 @@ license = "Proprietary"
 rust-version = "1.95"
 
 [workspace.dependencies]
+aws-lc-rs = "=1.17.3"
+base64 = "=0.22.1"
 chrono = { version = "=0.4.45", default-features = false, features = ["serde", "std"] }
 deadpool-postgres = { version = "=0.14.1", default-features = false, features = ["rt_tokio_1"] }
+http = "=1.4.2"
+jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["aws_lc_rs"] }
 prost = "0.14.4"
 protoc-bin-vendored = "3.2.0"
 serde = { version = "1", features = ["derive"] }
