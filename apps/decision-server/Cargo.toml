@@ -1,0 +1,42 @@
+[package]
+name = "bioworld-decision-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bioworld-decision-grpc = { path = "../../crates/decision-grpc" }
+bioworld-decision-grpc-jwt = { path = "../../crates/decision-grpc-jwt" }
+bioworld-decision-grpc-postgres = { path = "../../crates/decision-grpc-postgres" }
+bioworld-decision-grpc-server = { path = "../../crates/decision-grpc-server" }
+bioworld-decision-query = { path = "../../crates/decision-query" }
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+same-file.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres.workspace = true
+tokio-postgres-rustls = { workspace = true, features = ["aws-lc-rs"] }
+uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+aws-lc-rs.workspace = true
+base64.workspace = true
+bioworld-contracts = { path = "../../crates/contracts" }
+bioworld-event-store-contracts = { path = "../../crates/event-store-contracts" }
+bioworld-event-store-postgres = { path = "../../crates/event-store-postgres" }
+chrono.workspace = true
+rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "zeroize"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
