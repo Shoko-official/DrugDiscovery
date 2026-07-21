@@ -398,6 +398,14 @@ test("builds PostgreSQL integration tests without credentials and runs them only
     sourceCommand,
     /crates\/event-store-postgres\/tests\/postgres_reader\.rs/,
   );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-postgres\/src\/pool\.rs/,
+  );
+  assert.match(
+    sourceCommand,
+    /crates\/decision-grpc-postgres\/tests\/reader_pool\.rs/,
+  );
 
   const fetch = calls.find(
     ({ args, options }) => commandKind(args, options) === "writer-fetch",

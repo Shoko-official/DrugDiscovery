@@ -39,7 +39,7 @@ const WRITER_SOURCE_STAGE_SCRIPT = [
   "umask 077",
   "cd /workspace",
   "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri crates proto | tar --null --files-from=- --create | tar --extract --no-same-owner --directory=/sanitized",
-  "for source_path in crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/src/reader.rs crates/event-store-postgres/tests/postgres_writer.rs crates/event-store-postgres/tests/postgres_reader.rs; do",
+  "for source_path in crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/src/reader.rs crates/event-store-postgres/tests/postgres_writer.rs crates/event-store-postgres/tests/postgres_reader.rs crates/decision-grpc-postgres/src/pool.rs crates/decision-grpc-postgres/tests/reader_pool.rs; do",
   '  test -f "$source_path"',
   '  test ! -L "$source_path"',
   '  mkdir -p "/sanitized/$(dirname "$source_path")"',

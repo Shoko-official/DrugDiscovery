@@ -4,6 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use bioworld_contracts::v2::{
@@ -13,7 +14,7 @@ use bioworld_decision_grpc::{TenantScope, get_decision};
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
     PostgresGetDecisionExecutor, PostgresReaderLease, PostgresReaderLeaseDisposition,
-    PostgresReaderLeaseProvider,
+    PostgresReaderLeaseProvider, PostgresReaderPool, PostgresReaderPoolConfig,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
@@ -27,6 +28,7 @@ const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_DATABASE: &str = "bioworld_migrations";
 const POSTGRES_WRITER_USER: &str = "bioworld_writer";
 const POSTGRES_READER_USER: &str = "bioworld_reader";
+const POSTGRES_READER_APPLICATION_NAME: &str = "bioworld-decision-reader";
 const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PASSWORD";
 const READER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_READER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
@@ -40,6 +42,8 @@ const INSERT_EVENT: &str = "INSERT INTO public.scientific_event (event_id, event
 const SHARED_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fa601";
 const TENANT_A: &str = "tenant-grpc-postgres-a";
 const TENANT_B: &str = "tenant-grpc-postgres-b";
+const POOL_TENANT_A: &str = "tenant-grpc-pool-a";
+const POOL_TENANT_B: &str = "tenant-grpc-pool-b";
 const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
     "22735232adcac85cc4bd3d3b0fee84866ec86d41e112733a1ceeac3ef699ca0c";
@@ -325,6 +329,26 @@ async fn connect(role: &str, password: String) -> ReaderConnection {
     }
 }
 
+fn production_reader_pool(
+    password: String,
+    max_size: usize,
+    acquire_timeout: Duration,
+) -> PostgresReaderPool {
+    let mut configuration = tokio_postgres::Config::new();
+    configuration
+        .host(POSTGRES_HOST)
+        .port(POSTGRES_PORT)
+        .dbname(POSTGRES_DATABASE)
+        .user(POSTGRES_READER_USER)
+        .application_name(POSTGRES_READER_APPLICATION_NAME)
+        .password(password);
+    let pool_config = PostgresReaderPoolConfig::try_new(max_size, acquire_timeout)
+        .expect("fixed reader pool configuration must be valid");
+
+    PostgresReaderPool::try_new(configuration, tokio_postgres::NoTls, pool_config)
+        .expect("reader pool must be constructible")
+}
+
 async fn seed_event(writer: &mut Client, fixture: &EventFixture) {
     let transaction = writer
         .transaction()
@@ -434,6 +458,26 @@ fn tenant_b_fixture() -> EventFixture {
     }
 }
 
+fn pool_tenant_a_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc611",
+        tenant_id: POOL_TENANT_A,
+        payload: TENANT_A_PAYLOAD,
+        payload_sha256: TENANT_A_PAYLOAD_SHA256,
+        record: tenant_a_fixture().record,
+    }
+}
+
+fn pool_tenant_b_fixture() -> EventFixture {
+    EventFixture {
+        event_id: "01910d47-6f80-7a31-8c29-1d5c4f6bc612",
+        tenant_id: POOL_TENANT_B,
+        payload: TENANT_B_PAYLOAD,
+        payload_sha256: TENANT_B_PAYLOAD_SHA256,
+        record: tenant_b_fixture().record,
+    }
+}
+
 fn scope(tenant_id: &str) -> TenantScope {
     TenantScope::try_from_trusted_tenant_id(tenant_id.to_owned())
         .expect("fixed tenant scope must be valid")
@@ -457,6 +501,328 @@ fn assert_status_does_not_reflect(status: &Status, sensitive_values: &[&str]) {
     for sensitive in sensitive_values {
         assert!(!rendered.contains(sensitive));
     }
+}
+
+#[tokio::test]
+async fn production_pool_preserves_startup_config_and_reuses_a_finished_session() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+
+    let mut first = pool.acquire().await.expect("first lease must be acquired");
+    let first_backend: i32 = first
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("first lease must be queryable")
+        .get(0);
+    let first_application_name: String = first
+        .client()
+        .query_one("SELECT pg_catalog.current_setting('application_name')", &[])
+        .await
+        .expect("startup application name must be queryable")
+        .get(0);
+    assert_eq!(first_application_name, POSTGRES_READER_APPLICATION_NAME);
+    first
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("healthy lease must return to the pool");
+
+    let mut second = pool.acquire().await.expect("second lease must be acquired");
+    let second_backend: i32 = second
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("reused lease must be queryable")
+        .get(0);
+    let second_application_name: String = second
+        .client()
+        .query_one("SELECT pg_catalog.current_setting('application_name')", &[])
+        .await
+        .expect("reused startup application name must be queryable")
+        .get(0);
+    second
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("final lease must be discarded");
+
+    assert_eq!(second_backend, first_backend);
+    assert_eq!(second_application_name, POSTGRES_READER_APPLICATION_NAME);
+    pool.close();
+}
+
+#[tokio::test]
+async fn production_pool_bounds_saturated_waits_and_recovers_after_reuse() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_millis(500));
+    let first = pool.acquire().await.expect("first lease must be acquired");
+    let wait_started = Instant::now();
+    let wait_error = tokio::time::timeout(Duration::from_millis(750), pool.acquire())
+        .await
+        .expect("pool wait must remain bounded")
+        .err();
+    let wait_elapsed = wait_started.elapsed();
+    assert_eq!(wait_error, Some(AcquirePostgresReaderError));
+    assert!(wait_elapsed >= Duration::from_millis(450));
+    assert!(wait_elapsed < Duration::from_millis(750));
+
+    first
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("healthy lease must release capacity");
+    let recovered = pool
+        .acquire()
+        .await
+        .expect("released capacity must serve the next acquisition");
+    recovered
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("final lease must be discarded");
+    pool.close();
+}
+
+#[tokio::test]
+async fn cancelled_pool_wait_does_not_consume_reader_capacity() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let first = pool.acquire().await.expect("first lease must be acquired");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), pool.acquire())
+            .await
+            .is_err()
+    );
+
+    first
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("healthy lease must release capacity");
+    let recovered = pool
+        .acquire()
+        .await
+        .expect("cancelled waiter must not consume capacity");
+    recovered
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("final lease must be discarded");
+    pool.close();
+}
+
+#[tokio::test]
+async fn closing_pool_releases_a_saturated_waiter_with_a_fixed_error() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let first = pool.acquire().await.expect("first lease must be acquired");
+    let mut waiter = Box::pin(pool.acquire());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), waiter.as_mut())
+            .await
+            .is_err()
+    );
+
+    pool.close();
+
+    assert_eq!(waiter.await.err(), Some(AcquirePostgresReaderError));
+    first
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("active lease must be discarded after closure");
+}
+
+#[tokio::test]
+async fn production_pool_replaces_an_explicitly_discarded_session() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let marker = "m23-explicit-discard";
+    let mut first = pool.acquire().await.expect("first lease must be acquired");
+    let first_backend: i32 = first
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("first backend identity must be queryable")
+        .get(0);
+    let configured: String = first
+        .client()
+        .query_one(
+            "SELECT pg_catalog.set_config('application_name', $1, false)",
+            &[&marker],
+        )
+        .await
+        .expect("session marker must be configured")
+        .get(0);
+    assert_eq!(configured, marker);
+    first
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("discard must remove the marked session");
+
+    let mut replacement = pool
+        .acquire()
+        .await
+        .expect("discarded capacity must be replaced");
+    let replacement_marker: String = replacement
+        .client()
+        .query_one("SELECT pg_catalog.current_setting('application_name')", &[])
+        .await
+        .expect("replacement session must be queryable")
+        .get(0);
+    let replacement_backend: i32 = replacement
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("replacement backend identity must be queryable")
+        .get(0);
+    assert_ne!(replacement_marker, marker);
+    assert_ne!(replacement_backend, first_backend);
+    replacement
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("replacement must be discarded");
+    pool.close();
+}
+
+#[tokio::test]
+async fn production_pool_replaces_an_unfinished_reader_lease() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let marker = "m23-unfinished-lease";
+    let mut unfinished = pool.acquire().await.expect("lease must be acquired");
+    let unfinished_backend: i32 = unfinished
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("unfinished backend identity must be queryable")
+        .get(0);
+    let configured: String = unfinished
+        .client()
+        .query_one(
+            "SELECT pg_catalog.set_config('application_name', $1, false)",
+            &[&marker],
+        )
+        .await
+        .expect("session marker must be configured")
+        .get(0);
+    assert_eq!(configured, marker);
+    drop(unfinished);
+
+    let mut replacement = pool
+        .acquire()
+        .await
+        .expect("abandoned capacity must be replaced");
+    let replacement_marker: String = replacement
+        .client()
+        .query_one("SELECT pg_catalog.current_setting('application_name')", &[])
+        .await
+        .expect("replacement session must be queryable")
+        .get(0);
+    let replacement_backend: i32 = replacement
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("replacement backend identity must be queryable")
+        .get(0);
+    assert_ne!(replacement_marker, marker);
+    assert_ne!(replacement_backend, unfinished_backend);
+    replacement
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("replacement must be discarded");
+    pool.close();
+}
+
+#[tokio::test]
+async fn production_pool_replaces_a_closed_reader_session() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let mut closed = pool.acquire().await.expect("lease must be acquired");
+    let closed_backend: i32 = closed
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("backend identity must be queryable")
+        .get(0);
+    let _ = closed
+        .client()
+        .simple_query("SELECT pg_catalog.pg_terminate_backend(pg_backend_pid())")
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !closed.client().is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminated reader session must close");
+    closed
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("closed lease must be removed instead of reused");
+
+    let mut replacement = pool
+        .acquire()
+        .await
+        .expect("closed capacity must be replaced");
+    let replacement_backend: i32 = replacement
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("replacement backend must be queryable")
+        .get(0);
+    assert_ne!(replacement_backend, closed_backend);
+    replacement
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("replacement must be discarded");
+    pool.close();
+}
+
+#[tokio::test]
+async fn production_pool_executes_concurrent_tenant_isolated_reads() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let tenant_a = pool_tenant_a_fixture();
+    let tenant_b = pool_tenant_b_fixture();
+    seed_event(&mut writer.client, &tenant_a).await;
+    seed_event(&mut writer.client, &tenant_b).await;
+    let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
+    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+
+    let (tenant_a_response, tenant_b_response) = tokio::join!(
+        get_decision(&executor, scope(POOL_TENANT_A), request(SHARED_DECISION_ID),),
+        get_decision(&executor, scope(POOL_TENANT_B), request(SHARED_DECISION_ID),),
+    );
+
+    assert_eq!(
+        tenant_a_response
+            .expect("tenant A decision must be returned")
+            .get_ref(),
+        &tenant_a.record
+    );
+    assert_eq!(
+        tenant_b_response
+            .expect("tenant B decision must be returned")
+            .get_ref(),
+        &tenant_b.record
+    );
+
+    let mut first = pool.acquire().await.expect("first clean lease must return");
+    let mut second = pool
+        .acquire()
+        .await
+        .expect("second clean lease must return");
+    assert!(tenant_context_is_absent(first.client()).await);
+    assert!(tenant_context_is_absent(second.client()).await);
+    first
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("first lease must be discarded");
+    second
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("second lease must be discarded");
+
+    pool.close();
+    writer.discard();
 }
 
 #[tokio::test]

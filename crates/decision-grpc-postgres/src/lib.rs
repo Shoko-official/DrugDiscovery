@@ -9,10 +9,16 @@ use bioworld_decision_query::{GetDecision, GetDecisionQuery, GetDecisionRequestE
 use bioworld_event_store_postgres::{PostgresDecisionEventReader, PostgresLatestDecisionSource};
 use tokio_postgres::Client;
 
+mod pool;
+
+pub use pool::{
+    InvalidPostgresReaderPoolConfig, PooledPostgresReaderLease, PostgresReaderPool,
+    PostgresReaderPoolConfig,
+};
+
 const ROLLBACK_READER_SESSION: &str = "ROLLBACK";
 const TENANT_CONTEXT_IS_ABSENT: &str =
     "SELECT NULLIF(pg_catalog.current_setting('bioworld.tenant_id', true), '') IS NULL";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AcquirePostgresReaderError;
 
@@ -37,6 +43,7 @@ impl Error for FinishPostgresReaderLeaseError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PostgresReaderLeaseDisposition {
+    /// Returns a session whose caller-managed state has been restored.
     Reuse,
     Discard,
 }
