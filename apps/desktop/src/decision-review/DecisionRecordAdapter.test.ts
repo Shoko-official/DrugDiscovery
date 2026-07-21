@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodDetectorRefSchema,
   OodStatus,
   Recommendation,
 } from "@bioworld/contracts";
@@ -61,6 +62,7 @@ describe("toDecisionSummary", () => {
       aggregateVersion: "7",
       recommendation: "stop_program",
       domainAssessment: "unknown",
+      oodDetector: null,
       rationale: ["Evidence coverage is incomplete."],
       evidence: {
         id: "ES-001",
@@ -98,6 +100,23 @@ describe("toDecisionSummary", () => {
     record.oodStatus = undefined;
 
     expect(toDecisionSummary(record).domainAssessment).toBe("unknown");
+  });
+
+  it("maps exact OOD detector metadata", () => {
+    const record = completeRecord();
+    record.oodDetector = create(OodDetectorRefSchema, {
+      detectorId: "mahalanobis",
+      detectorVersion: "model-2026.07",
+    });
+
+    expect(toDecisionSummary(record).oodDetector).toEqual({
+      detectorId: "mahalanobis",
+      detectorVersion: "model-2026.07",
+    });
+  });
+
+  it("maps absent historical OOD detector metadata to null", () => {
+    expect(toDecisionSummary(completeRecord()).oodDetector).toBeNull();
   });
 
   it.each([

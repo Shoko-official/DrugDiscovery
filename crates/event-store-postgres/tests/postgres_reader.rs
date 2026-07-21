@@ -2,13 +2,17 @@ use std::future::Future;
 
 use bioworld_contracts::{
     VersionedDecisionRecord,
-    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation},
+    v2::{
+        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
+        Recommendation,
+    },
 };
 use bioworld_decision_query::{
     GetDecision, GetDecisionError, GetDecisionQuery, LatestDecisionSource,
 };
 use bioworld_event_store_contracts::{
-    DecisionEventMetadata, ScientificEventRow, project_decision_event,
+    DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
+    ScientificEventRow, project_decision_event,
 };
 use bioworld_event_store_postgres::{
     AppendDecisionEventError, InvalidDecisionSourceScope, PostgresDecisionEventReader,
@@ -76,7 +80,11 @@ fn decision_event_at_version_with_ood_status(
             decision_id: decision_id.to_owned(),
             cou_id: "COU-M11".to_owned(),
             evidence_snapshot_id: "ES-M11".to_owned(),
-            recommendation: Recommendation::StopProgram as i32,
+            recommendation: if ood_status == OodStatus::OutOfDomain {
+                Recommendation::Abstain as i32
+            } else {
+                Recommendation::StopProgram as i32
+            },
             rationale: vec!["PostgreSQL reader integration event.".to_owned()],
             aggregate_version,
             evidence: Some(EvidenceSnapshotRef {
@@ -85,12 +93,16 @@ fn decision_event_at_version_with_ood_status(
                     .to_owned(),
             }),
             ood_status: Some(ood_status as i32),
+            ood_detector: Some(OodDetectorRef {
+                detector_id: "mahalanobis".to_owned(),
+                detector_version: "model-2026.07".to_owned(),
+            }),
         }),
     }
 }
 
 #[tokio::test]
-async fn preserves_every_ood_status_through_postgresql_write_and_read() {
+async fn preserves_every_qualified_ood_status_through_postgresql_write_and_read() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -102,7 +114,6 @@ async fn preserves_every_ood_status_through_postgresql_write_and_read() {
         (OodStatus::InDomain, "in_domain"),
         (OodStatus::Borderline, "borderline"),
         (OodStatus::OutOfDomain, "out_of_domain"),
-        (OodStatus::Unknown, "unknown"),
     ]
     .into_iter()
     .enumerate()
@@ -137,6 +148,35 @@ async fn preserves_every_ood_status_through_postgresql_write_and_read() {
         assert!(tenant_context_is_absent(&reader).await);
     }
 
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn reads_an_exact_m31_event_without_detector() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m32-m31-read";
+    let row = historical_m31_row(tenant_id);
+    let event_id = row.event_id;
+
+    insert_scientific_event_row(&mut writer, row).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let stored = PostgresDecisionEventReader::new(&mut reader)
+        .get(tenant_id, event_id)
+        .await
+        .expect("reader must accept the M31 event")
+        .expect("M31 event must exist");
+    let decision = stored.decision.expect("M31 event must contain a decision");
+
+    assert_eq!(decision.ood_status, Some(OodStatus::Unknown as i32));
+    assert!(decision.ood_detector.is_none());
+    assert_eq!(decision.recommendation, Recommendation::StopProgram as i32);
+    assert!(tenant_context_is_absent(&reader).await);
     writer_task.abort();
     reader_task.abort();
 }
@@ -578,6 +618,46 @@ fn metadata_at(tenant_id: &str, event_occurred_at: DateTime<Utc>) -> DecisionEve
     .expect("fixed metadata must be valid")
 }
 
+fn historical_m31_row(tenant_id: &str) -> ScientificEventRow {
+    ScientificEventRow {
+        event_id: Uuid::parse_str("01910d47-6f80-7a31-8c29-1d5c4f6b7012")
+            .expect("fixed event identifier must parse"),
+        event_type: DECISION_EVENT_TYPE.to_owned(),
+        schema_version: DECISION_SCHEMA_VERSION.to_owned(),
+        aggregate_type: DECISION_AGGREGATE_TYPE.to_owned(),
+        aggregate_id: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99".to_owned(),
+        aggregate_version: u64::MAX,
+        occurred_at: occurred_at(),
+        tenant_id: tenant_id.to_owned(),
+        payload: json!({
+            "aggregate_version": "18446744073709551615",
+            "cou_id": "COU-001",
+            "decision_id": "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+            "evidence": {
+                "id": "ES-001",
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
+            "ood_status": "unknown",
+            "rationale": [
+                "Primary threshold was not met.",
+                "Confirmatory evidence was absent.",
+                "Primary threshold was not met."
+            ],
+            "recommendation": "stop_program"
+        }),
+        payload_sha256: "46bf4726814bddfc9d1005766bf2b68fd11932b41306ac85d8676ab23ac995e1"
+            .to_owned(),
+        signature: json!({
+            "algorithm": "Ed25519",
+            "key_id": "m31-test",
+            "value": "test-signature"
+        })
+        .as_object()
+        .expect("fixed signature must be an object")
+        .clone(),
+    }
+}
+
 fn integration_passwords() -> Option<IntegrationPasswords> {
     let writer = std::env::var(WRITER_PASSWORD_ENVIRONMENT_VARIABLE)
         .ok()
@@ -632,6 +712,11 @@ async fn append_at(
 async fn insert_corrupt_event(client: &mut Client, event: DecisionEvent, tenant_id: &str) {
     let mut row = projected_row(&event, tenant_id);
     row.payload_sha256 = "0".repeat(64);
+    insert_scientific_event_row(client, row).await;
+}
+
+async fn insert_scientific_event_row(client: &mut Client, row: ScientificEventRow) {
+    let tenant_id = row.tenant_id.clone();
     let aggregate_version = row.aggregate_version.to_string();
     let signature = serde_json::Value::Object(row.signature);
     let parameters: [&(dyn ToSql + Sync); 11] = [

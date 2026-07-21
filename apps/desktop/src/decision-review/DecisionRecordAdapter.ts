@@ -163,6 +163,12 @@ export function toDecisionSummary(
   }
   const recommendation = toRecommendation(record.recommendation);
   const domainAssessment = toDomainAssessment(record.oodStatus);
+  const oodDetector = record.oodDetector
+    ? {
+        detectorId: record.oodDetector.detectorId,
+        detectorVersion: record.oodDetector.detectorVersion,
+      }
+    : null;
   validateEvidenceDigest(evidence);
   const rationale = record.rationale.filter(
     (entry) => entry.trim().length > 0,
@@ -180,6 +186,7 @@ export function toDecisionSummary(
     aggregateVersion: record.aggregateVersion.toString(),
     recommendation,
     domainAssessment,
+    oodDetector,
     rationale,
     evidence: {
       id: evidence.id,

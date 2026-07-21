@@ -165,7 +165,24 @@ mod tests {
 
             assert_eq!(decoded, v2::DecisionRecord::from(&expected));
             assert_eq!(decoded.ood_status, Some(status as i32));
+            assert_eq!(
+                decoded.ood_detector,
+                Some(v2::OodDetectorRef {
+                    detector_id: "mahalanobis".to_owned(),
+                    detector_version: "model-2026.07".to_owned(),
+                })
+            );
         }
+    }
+
+    #[test]
+    fn bundled_sample_has_coherent_ood_status_and_detector_metadata() {
+        let record = bundled_decision_record();
+        let detector = record.ood_detector.as_ref().unwrap();
+
+        assert_eq!(record.ood_status, Some(v2::OodStatus::InDomain as i32));
+        assert_eq!(detector.detector_id, "mahalanobis");
+        assert_eq!(detector.detector_version, "model-2026.07");
     }
 
     #[test]

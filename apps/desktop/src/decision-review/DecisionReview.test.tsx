@@ -122,6 +122,75 @@ describe("DecisionReview", () => {
     },
   );
 
+  it("renders OOD detector provenance next to the domain assessment", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            oodDetector: {
+              detectorId: "mahalanobis",
+              detectorVersion: "model-2026.07",
+            },
+          },
+        }}
+      />,
+    );
+    const assessmentIndex = markup.indexOf("Domain assessment");
+    const detectorIndex = markup.indexOf("OOD detector");
+
+    expect(detectorIndex).toBeGreaterThan(assessmentIndex);
+    expect(markup).toContain("Detector ID");
+    expect(markup).toContain(">mahalanobis</dd>");
+    expect(markup).toContain("Detector version");
+    expect(markup).toContain(">model-2026.07</dd>");
+  });
+
+  it("states when historical OOD detector metadata is unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "bundled_sample",
+          decision: { ...tracedDecision, oodDetector: null },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("OOD detector");
+    expect(markup).toContain("Historical metadata unavailable");
+    expect(markup).toContain(
+      "This historical decision does not include an OOD detector ID or version.",
+    );
+    expect(markup).not.toContain("Detector ID</dt>");
+    expect(markup).not.toContain("Detector version</dt>");
+  });
+
+  it("renders detector metadata as escaped React text", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            oodDetector: {
+              detectorId: "<img src=x onerror=alert(1)>",
+              detectorVersion: "<script>alert(2)</script>",
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(markup).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
+    expect(markup).not.toContain("<img");
+    expect(markup).not.toContain("<script");
+  });
+
   it("renders rationale in source order and an honest evidence reference", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview

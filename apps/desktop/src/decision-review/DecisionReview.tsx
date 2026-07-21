@@ -13,12 +13,18 @@ export type DomainAssessment =
   | "out_of_domain"
   | "unknown";
 
+export type OodDetectorMetadata = {
+  detectorId: string;
+  detectorVersion: string;
+};
+
 export type DecisionSummary = {
   decisionId: string;
   couId: string;
   aggregateVersion: string;
   recommendation: Recommendation;
   domainAssessment: DomainAssessment;
+  oodDetector?: OodDetectorMetadata | null;
   rationale: readonly string[];
   evidence: {
     id: string;
@@ -204,6 +210,44 @@ function ReadyState({
             <dd className="technical-value">{decision.aggregateVersion}</dd>
           </div>
         </dl>
+
+        <section
+          className="ood-detector"
+          aria-labelledby="ood-detector-title"
+        >
+          <header className="ood-detector__header">
+            <div>
+              <p className="section-label">Domain provenance</p>
+              <h3 id="ood-detector-title">OOD detector</h3>
+            </div>
+            <span className="status status--neutral">
+              {decision.oodDetector
+                ? "Recorded"
+                : "Historical metadata unavailable"}
+            </span>
+          </header>
+          {decision.oodDetector ? (
+            <dl className="ood-detector__facts">
+              <div>
+                <dt>Detector ID</dt>
+                <dd className="technical-value">
+                  {decision.oodDetector.detectorId}
+                </dd>
+              </div>
+              <div>
+                <dt>Detector version</dt>
+                <dd className="technical-value">
+                  {decision.oodDetector.detectorVersion}
+                </dd>
+              </div>
+            </dl>
+          ) : (
+            <p className="ood-detector__note">
+              This historical decision does not include an OOD detector ID or
+              version.
+            </p>
+          )}
+        </section>
 
         <section
           className="rationale-section"

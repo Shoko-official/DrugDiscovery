@@ -38,6 +38,10 @@ pub(crate) fn bundled_decision_record() -> v2::DecisionRecord {
             id: "ES-001".to_owned(),
             sha256: VALID_SHA256.to_owned(),
         }),
-        ood_status: Some(v2::OodStatus::Unknown as i32),
+        ood_status: Some(v2::OodStatus::InDomain as i32),
+        ood_detector: Some(v2::OodDetectorRef {
+            detector_id: "mahalanobis".to_owned(),
+            detector_version: "model-2026.07".to_owned(),
+        }),
     }
 }

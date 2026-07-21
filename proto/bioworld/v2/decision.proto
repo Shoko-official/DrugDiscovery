@@ -20,6 +20,10 @@ message EvidenceSnapshotRef {
   string id = 1;
   string sha256 = 2;
 }
+message OodDetectorRef {
+  string detector_id = 1;
+  string detector_version = 2;
+}
 message DecisionRecord {
   string decision_id = 1;
   string cou_id = 2;
@@ -29,6 +33,7 @@ message DecisionRecord {
   uint64 aggregate_version = 6;
   EvidenceSnapshotRef evidence = 7;
   optional OodStatus ood_status = 8;
+  OodDetectorRef ood_detector = 9;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {

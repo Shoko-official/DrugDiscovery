@@ -226,6 +226,52 @@ h3 {
   border-top: 1px solid var(--outline);
 }
 
+.ood-detector {
+  margin-top: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--outline);
+  border-left: 3px solid var(--focus);
+  border-radius: 0.375rem;
+  background: var(--surface-secondary);
+}
+
+.ood-detector__header {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.ood-detector__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1rem 0 0;
+}
+
+.ood-detector__facts div {
+  min-width: 0;
+}
+
+.ood-detector__facts dt {
+  margin-bottom: 0.375rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+}
+
+.ood-detector__facts dd {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.ood-detector__note {
+  max-width: 68ch;
+  margin: 1rem 0 0;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
 .state-detail {
   max-width: 68ch;
   margin-bottom: 0;
@@ -360,12 +406,14 @@ h3 {
   .product-header,
   .record-header,
   .evidence-reference__header,
+  .ood-detector__header,
   .source-boundary {
     flex-direction: column;
   }
 
   .decision-facts,
-  .evidence-reference__facts {
+  .evidence-reference__facts,
+  .ood-detector__facts {
     grid-template-columns: 1fr;
   }
 

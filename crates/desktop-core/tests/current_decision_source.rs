@@ -55,6 +55,7 @@ fn record() -> DecisionRecord {
         aggregate_version: 1,
         evidence: None,
         ood_status: Some(OodStatus::Unknown as i32),
+        ood_detector: None,
     }
 }
 

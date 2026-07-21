@@ -1,5 +1,5 @@
 use bioworld_contracts::v2::{
-    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation,
+    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
@@ -32,7 +32,7 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
             decision_id: decision_id.to_owned(),
             cou_id: "COU-M10".to_owned(),
             evidence_snapshot_id: "ES-M10".to_owned(),
-            recommendation: Recommendation::StopProgram as i32,
+            recommendation: Recommendation::Abstain as i32,
             rationale: vec!["Integration verification event.".to_owned()],
             aggregate_version: u64::MAX,
             evidence: Some(EvidenceSnapshotRef {
@@ -41,6 +41,10 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
                     .to_owned(),
             }),
             ood_status: Some(OodStatus::OutOfDomain as i32),
+            ood_detector: Some(OodDetectorRef {
+                detector_id: "mahalanobis".to_owned(),
+                detector_version: "model-2026.07".to_owned(),
+            }),
         }),
     }
 }
@@ -202,6 +206,13 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
     assert_eq!(stored.tenant_id, tenant_a);
     assert_eq!(stored.payload, expected.payload);
     assert_eq!(stored.payload["ood_status"], json!("out_of_domain"));
+    assert_eq!(
+        stored.payload["ood_detector"],
+        json!({
+            "detector_id": "mahalanobis",
+            "detector_version": "model-2026.07"
+        })
+    );
     assert_eq!(stored.payload_sha256, expected.payload_sha256);
     assert_eq!(stored.signature, expected.signature);
     assert!(tenant_context_is_absent(&client).await);

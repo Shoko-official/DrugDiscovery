@@ -9,6 +9,8 @@ pub const MAX_DECISION_IDENTIFIER_BYTES: usize = 800;
 pub const MAX_DECISION_RATIONALE_ITEMS: usize = 32;
 pub const MAX_DECISION_RATIONALE_ITEM_BYTES: usize = 4_096;
 pub const MAX_DECISION_RATIONALE_TOTAL_BYTES: usize = 32_768;
+pub const MAX_OOD_DETECTOR_ID_BYTES: usize = 200;
+pub const MAX_OOD_DETECTOR_VERSION_BYTES: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +33,50 @@ pub enum OodStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "OodDetectorRefData")]
+pub struct OodDetectorRef {
+    detector_id: String,
+    detector_version: String,
+}
+
+#[derive(Deserialize)]
+struct OodDetectorRefData {
+    detector_id: String,
+    detector_version: String,
+}
+
+impl OodDetectorRef {
+    pub fn try_new(detector_id: String, detector_version: String) -> Result<Self, DomainError> {
+        if !bounded_opaque_value_is_valid(&detector_id, MAX_OOD_DETECTOR_ID_BYTES) {
+            return Err(DomainError::InvalidOodDetectorId);
+        }
+        if !bounded_opaque_value_is_valid(&detector_version, MAX_OOD_DETECTOR_VERSION_BYTES) {
+            return Err(DomainError::InvalidOodDetectorVersion);
+        }
+        Ok(Self {
+            detector_id,
+            detector_version,
+        })
+    }
+
+    pub fn detector_id(&self) -> &str {
+        &self.detector_id
+    }
+
+    pub fn detector_version(&self) -> &str {
+        &self.detector_version
+    }
+}
+
+impl TryFrom<OodDetectorRefData> for OodDetectorRef {
+    type Error = DomainError;
+
+    fn try_from(value: OodDetectorRefData) -> Result<Self, Self::Error> {
+        Self::try_new(value.detector_id, value.detector_version)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "EvidenceSnapshotRefData")]
 pub struct EvidenceSnapshotRef {
     id: String,
@@ -50,6 +96,8 @@ pub struct DecisionRecord {
     cou_id: String,
     recommendation: Recommendation,
     ood_status: OodStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ood_detector: Option<OodDetectorRef>,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -61,6 +109,8 @@ struct DecisionRecordData {
     recommendation: Recommendation,
     #[serde(default)]
     ood_status: OodStatus,
+    #[serde(default)]
+    ood_detector: Option<OodDetectorRef>,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -71,6 +121,10 @@ pub enum DomainError {
     InvalidCouId,
     #[error("evidence identifier is invalid")]
     InvalidEvidenceId,
+    #[error("OOD detector identifier is invalid")]
+    InvalidOodDetectorId,
+    #[error("OOD detector version is invalid")]
+    InvalidOodDetectorVersion,
     #[error("a qualified decision requires at least one rationale")]
     MissingRationale,
     #[error("a decision has too many rationales")]
@@ -133,11 +187,32 @@ impl DecisionRecord {
         evidence: EvidenceSnapshotRef,
         rationale: Vec<String>,
     ) -> Result<Self, DomainError> {
+        Self::try_new_with_ood_detector(
+            id,
+            cou_id,
+            recommendation,
+            ood_status,
+            None,
+            evidence,
+            rationale,
+        )
+    }
+
+    pub fn try_new_with_ood_detector(
+        id: Uuid,
+        cou_id: String,
+        recommendation: Recommendation,
+        ood_status: OodStatus,
+        ood_detector: Option<OodDetectorRef>,
+        evidence: EvidenceSnapshotRef,
+        rationale: Vec<String>,
+    ) -> Result<Self, DomainError> {
         let decision = Self {
             id,
             cou_id,
             recommendation,
             ood_status,
+            ood_detector,
             evidence,
             rationale,
         };
@@ -159,6 +234,10 @@ impl DecisionRecord {
 
     pub fn ood_status(&self) -> &OodStatus {
         &self.ood_status
+    }
+
+    pub fn ood_detector(&self) -> Option<&OodDetectorRef> {
+        self.ood_detector.as_ref()
     }
 
     pub fn evidence(&self) -> &EvidenceSnapshotRef {
@@ -214,15 +293,20 @@ fn decision_identifier_is_valid(value: &str) -> bool {
         && !value.contains('\0')
 }
 
+fn bounded_opaque_value_is_valid(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && value.trim() == value && !value.contains('\0')
+}
+
 impl TryFrom<DecisionRecordData> for DecisionRecord {
     type Error = DomainError;
 
     fn try_from(value: DecisionRecordData) -> Result<Self, Self::Error> {
-        Self::try_new(
+        Self::try_new_with_ood_detector(
             value.id,
             value.cou_id,
             value.recommendation,
             value.ood_status,
+            value.ood_detector,
             value.evidence,
             value.rationale,
         )
