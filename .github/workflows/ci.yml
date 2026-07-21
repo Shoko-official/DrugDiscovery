@@ -160,6 +160,9 @@ jobs:
       - name: Test TLS gRPC server transport
         run: cargo test -p bioworld-decision-grpc-server --locked
 
+      - name: Test decision server process
+        run: cargo test -p bioworld-decision-server --locked
+
       - name: Run native desktop preflight
         run: pnpm desktop:native:preflight
 

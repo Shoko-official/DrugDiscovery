@@ -35,11 +35,28 @@ const COMMAND_TIMEOUT_MS = 120_000;
 const CLEANUP_TIMEOUT_MS = 30_000;
 const WRITER_BUILD_TIMEOUT_MS = 10 * 60_000;
 const WRITER_TEST_TIMEOUT_MS = 5 * 60_000;
+const POSTGRES_TLS_CA_FILE = "/postgres-tls/ca.crt";
+const POSTGRES_TLS_SETUP_SCRIPT = [
+  "umask 077",
+  "mkdir -p /postgres-tls",
+  "openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 -subj /CN=bioworld-postgres-test-ca -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -keyout /postgres-tls/ca.key -out /postgres-tls/ca.crt",
+  "openssl req -newkey rsa:2048 -nodes -sha256 -subj /CN=127.0.0.1 -keyout /postgres-tls/server.key -out /postgres-tls/server.csr",
+  "printf '%s\\n' 'subjectAltName=IP:127.0.0.1' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' 'extendedKeyUsage=serverAuth' > /postgres-tls/server.ext",
+  "openssl x509 -req -in /postgres-tls/server.csr -CA /postgres-tls/ca.crt -CAkey /postgres-tls/ca.key -CAcreateserial -days 1 -sha256 -extfile /postgres-tls/server.ext -out /postgres-tls/server.crt",
+  "rm -f /postgres-tls/ca.key /postgres-tls/ca.srl /postgres-tls/server.csr /postgres-tls/server.ext",
+  "chmod 600 /postgres-tls/server.key",
+  "chmod 644 /postgres-tls/server.crt /postgres-tls/ca.crt",
+  "chown postgres:postgres /postgres-tls/server.key /postgres-tls/server.crt",
+].join("\n");
+const WRITER_TEST_SOURCE_STAGE_SCRIPT = [
+  "cp -R /source/apps/decision-server/. /workspace/apps/decision-server/",
+  'exec "$@"',
+].join("\n");
 const WRITER_SOURCE_STAGE_SCRIPT = [
   "umask 077",
   "cd /workspace",
-  "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri crates proto | tar --null --files-from=- --create | tar --extract --no-same-owner --directory=/sanitized",
-  "for source_path in crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/src/reader.rs crates/event-store-postgres/tests/postgres_writer.rs crates/event-store-postgres/tests/postgres_reader.rs crates/decision-grpc/src/service.rs crates/decision-grpc/tests/decision_service.rs crates/decision-grpc-jwt/Cargo.toml crates/decision-grpc-jwt/src/lib.rs crates/decision-grpc-jwt/tests/jwt_authenticator.rs crates/decision-grpc-postgres/Cargo.toml crates/decision-grpc-postgres/src/pool.rs crates/decision-grpc-postgres/tests/postgres_executor.rs crates/decision-grpc-postgres/tests/reader_pool.rs crates/decision-grpc-server/Cargo.toml crates/decision-grpc-server/src/lib.rs crates/decision-grpc-server/src/config.rs crates/decision-grpc-server/src/server.rs crates/decision-grpc-server/tests/server_config.rs crates/decision-grpc-server/tests/server_startup.rs crates/decision-grpc-server/tests/server_transport.rs; do",
+  "git -c safe.directory=/workspace ls-files -z -- Cargo.toml Cargo.lock rust-toolchain.toml apps/desktop/src-tauri apps/decision-server crates proto | tar --null --files-from=- --create | tar --extract --no-same-owner --directory=/sanitized",
+  "for source_path in apps/decision-server/Cargo.toml apps/decision-server/src/config.rs apps/decision-server/src/lib.rs apps/decision-server/src/main.rs apps/decision-server/src/runtime.rs apps/decision-server/src/secure_file.rs apps/decision-server/src/windows_acl.rs apps/decision-server/tests/process.rs apps/decision-server/tests/runtime_config.rs apps/decision-server/tests/runtime_integration.rs crates/event-store-postgres/Cargo.toml crates/event-store-postgres/src/lib.rs crates/event-store-postgres/src/reader.rs crates/event-store-postgres/tests/postgres_writer.rs crates/event-store-postgres/tests/postgres_reader.rs crates/decision-grpc/src/service.rs crates/decision-grpc/tests/decision_service.rs crates/decision-grpc-jwt/Cargo.toml crates/decision-grpc-jwt/src/lib.rs crates/decision-grpc-jwt/tests/jwt_authenticator.rs crates/decision-grpc-postgres/Cargo.toml crates/decision-grpc-postgres/src/pool.rs crates/decision-grpc-postgres/tests/postgres_executor.rs crates/decision-grpc-postgres/tests/reader_pool.rs crates/decision-grpc-server/Cargo.toml crates/decision-grpc-server/src/lib.rs crates/decision-grpc-server/src/config.rs crates/decision-grpc-server/src/server.rs crates/decision-grpc-server/tests/server_config.rs crates/decision-grpc-server/tests/server_startup.rs crates/decision-grpc-server/tests/server_transport.rs; do",
   '  test -f "$source_path"',
   '  test ! -L "$source_path"',
   '  mkdir -p "/sanitized/$(dirname "$source_path")"',
@@ -270,6 +287,14 @@ function createWriterIntegrationResources(nonce) {
     cargoVolume: `bioworld-postgres-writer-cargo-${nonce}`,
     targetVolume: `bioworld-postgres-writer-target-${nonce}`,
     sourceVolume: `bioworld-postgres-writer-source-${nonce}`,
+  };
+}
+
+function createPostgresTlsResources(nonce) {
+  createContainerName(nonce);
+  return {
+    setupContainer: `bioworld-postgres-tls-setup-${nonce}`,
+    volume: `bioworld-postgres-tls-${nonce}`,
   };
 }
 
@@ -524,6 +549,7 @@ export async function runPostgresMigrations({
   const writerResources = writerIntegration
     ? createWriterIntegrationResources(nonce)
     : undefined;
+  const postgresTlsResources = createPostgresTlsResources(nonce);
   const diagnosticSecrets = [
     postgresPassword,
     migratorPassword,
@@ -630,9 +656,50 @@ export async function runPostgresMigrations({
   let fetchContainerAttempted = false;
   let buildContainerAttempted = false;
   let testContainerAttempted = false;
+  let tlsSetupContainerAttempted = false;
   let primaryError;
 
   try {
+    const tlsVolume = await invoke(
+      runCommand,
+      ["volume", "create", "--name", postgresTlsResources.volume],
+      activeOptions(dockerEnvironment, { timeout: CLEANUP_TIMEOUT_MS }),
+    );
+    if (tlsVolume.status !== 0) {
+      reportResult(tlsVolume);
+      throw new Error("PostgreSQL TLS storage failed.");
+    }
+
+    tlsSetupContainerAttempted = true;
+    const tlsIdentityGenerated = await invoke(
+      runCommand,
+      [
+        "run",
+        "--name",
+        postgresTlsResources.setupContainer,
+        "--pull=always",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--mount",
+        `type=volume,source=${postgresTlsResources.volume},target=/postgres-tls`,
+        POSTGRES_IMAGE,
+        "sh",
+        "-ceu",
+        POSTGRES_TLS_SETUP_SCRIPT,
+      ],
+      activeOptions(dockerEnvironment),
+    );
+    if (tlsIdentityGenerated.status !== 0) {
+      reportResult(tlsIdentityGenerated);
+      throw new Error("PostgreSQL TLS identity generation failed.");
+    }
+
     if (writerResources !== undefined) {
       const rustImagePulled = await invoke(
         runCommand,
@@ -777,6 +844,8 @@ export async function runPostgresMigrations({
           "bioworld-event-store-postgres",
           "-p",
           "bioworld-decision-grpc-postgres",
+          "-p",
+          "bioworld-decision-server",
           "--tests",
           "--locked",
           "--offline",
@@ -805,7 +874,20 @@ export async function runPostgresMigrations({
         "POSTGRES_PASSWORD",
         "--env",
         `POSTGRES_DB=${DATABASE_NAME}`,
+        "--env",
+        "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+        "--mount",
+        `type=volume,source=${postgresTlsResources.volume},target=/postgres-tls,readonly`,
         POSTGRES_IMAGE,
+        "postgres",
+        "-c",
+        "ssl=on",
+        "-c",
+        "ssl_cert_file=/postgres-tls/server.crt",
+        "-c",
+        "ssl_key_file=/postgres-tls/server.key",
+        "-c",
+        "ssl_min_protocol_version=TLSv1.2",
       ],
       activeOptions(startEnvironment),
     );
@@ -1046,13 +1128,21 @@ export async function runPostgresMigrations({
           "--mount",
           `type=volume,source=${writerResources.sourceVolume},target=/workspace,readonly`,
           "--mount",
+          `type=volume,source=${writerResources.sourceVolume},target=/source,readonly`,
+          "--mount",
           `type=volume,source=${writerResources.cargoVolume},target=/cargo`,
           "--mount",
           `type=volume,source=${writerResources.targetVolume},target=/target`,
+          "--mount",
+          `type=volume,source=${postgresTlsResources.volume},target=/postgres-tls,readonly`,
+          "--tmpfs",
+          "/workspace/apps/decision-server:rw,noexec,nosuid,nodev,size=1048576",
           "--env",
           "BIOWORLD_POSTGRES_WRITER_PASSWORD",
           "--env",
           "BIOWORLD_POSTGRES_READER_PASSWORD",
+          "--env",
+          `BIOWORLD_POSTGRES_TLS_CA_FILE=${POSTGRES_TLS_CA_FILE}`,
           "--env",
           "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED=1",
           "--env",
@@ -1066,12 +1156,20 @@ export async function runPostgresMigrations({
           "--workdir",
           "/workspace",
           RUST_INTEGRATION_IMAGE,
+          "sh",
+          "-ceu",
+          WRITER_TEST_SOURCE_STAGE_SCRIPT,
+          "sh",
           "cargo",
           "test",
+          "--manifest-path",
+          "/workspace/Cargo.toml",
           "--package",
           "bioworld-event-store-postgres",
           "--package",
           "bioworld-decision-grpc-postgres",
+          "--package",
+          "bioworld-decision-server",
           "--tests",
           "--locked",
           "--offline",
@@ -1110,6 +1208,14 @@ export async function runPostgresMigrations({
     }
     const removed = await cleanupDatabase();
     cleanupFailed ||= removed.status !== 0;
+    if (tlsSetupContainerAttempted) {
+      const removedTlsSetup = await cleanupContainer(
+        postgresTlsResources.setupContainer,
+      );
+      cleanupFailed ||= removedTlsSetup.status !== 0;
+    }
+    const removedTlsVolume = await cleanupVolume(postgresTlsResources.volume);
+    cleanupFailed ||= removedTlsVolume.status !== 0;
     if (writerResources !== undefined) {
       const removedVolume = await cleanupVolume(writerResources.sourceVolume);
       cleanupFailed ||= removedVolume.status !== 0;

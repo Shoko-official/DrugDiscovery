@@ -23,6 +23,8 @@ const WRITER_TEST_CONTAINER = `bioworld-postgres-writer-test-${NONCE}`;
 const WRITER_CARGO_VOLUME = `bioworld-postgres-writer-cargo-${NONCE}`;
 const WRITER_TARGET_VOLUME = `bioworld-postgres-writer-target-${NONCE}`;
 const WRITER_SOURCE_VOLUME = `bioworld-postgres-writer-source-${NONCE}`;
+const POSTGRES_TLS_VOLUME = `bioworld-postgres-tls-${NONCE}`;
+const POSTGRES_TLS_SETUP_CONTAINER = `bioworld-postgres-tls-setup-${NONCE}`;
 const POSTGRES_PASSWORD = "0123456789abcdef".repeat(4);
 const MIGRATOR_PASSWORD = "123456789abcdef0".repeat(4);
 const WRITER_PASSWORD = "23456789abcdef01".repeat(4);
@@ -113,6 +115,9 @@ function commandKind(args, options = {}) {
     return "writer-image-pull";
   }
   if (args[0] === "volume" && args[1] === "create") {
+    if (args.includes(POSTGRES_TLS_VOLUME)) {
+      return "postgres-tls-volume-create";
+    }
     if (args.includes(WRITER_CARGO_VOLUME)) {
       return "writer-cargo-volume-create";
     }
@@ -121,6 +126,9 @@ function commandKind(args, options = {}) {
       : "writer-source-volume-create";
   }
   if (args[0] === "volume" && args[1] === "rm") {
+    if (args.includes(POSTGRES_TLS_VOLUME)) {
+      return "postgres-tls-volume-cleanup";
+    }
     if (args.includes(WRITER_CARGO_VOLUME)) {
       return "writer-cargo-volume-cleanup";
     }
@@ -129,6 +137,9 @@ function commandKind(args, options = {}) {
       : "writer-source-volume-cleanup";
   }
   if (args[0] === "run") {
+    if (args.includes(POSTGRES_TLS_SETUP_CONTAINER)) {
+      return "postgres-tls-setup";
+    }
     if (args.includes(EXPECTED_RUST_IMAGE)) {
       if (args.includes(`container:${CONTAINER_NAME}`)) {
         return "writer-test";
@@ -146,6 +157,9 @@ function commandKind(args, options = {}) {
     return "logs";
   }
   if (args[0] === "rm") {
+    if (args.includes(POSTGRES_TLS_SETUP_CONTAINER)) {
+      return "postgres-tls-setup-cleanup";
+    }
     if (args.includes(WRITER_SOURCE_CONTAINER)) {
       return "writer-source-stage-cleanup";
     }
@@ -245,6 +259,7 @@ function assertRunsAllPostgresIntegrationTests(args) {
     new Set([
       "bioworld-event-store-postgres",
       "bioworld-decision-grpc-postgres",
+      "bioworld-decision-server",
     ]),
   );
 
@@ -292,7 +307,217 @@ test("pins the exact Rust 1.95 Bookworm integration image digest", () => {
   assert.equal(RUST_INTEGRATION_IMAGE, EXPECTED_RUST_IMAGE);
 });
 
-test("requires both PostgreSQL integration packages", () => {
+test("starts PostgreSQL with an ephemeral TLS identity and always removes its volume", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(runOptions(runCommand));
+
+  const volumeCreate = calls.find(
+    ({ args, options }) =>
+      commandKind(args, options) === "postgres-tls-volume-create",
+  );
+  assert.deepEqual(volumeCreate.args, [
+    "volume",
+    "create",
+    "--name",
+    POSTGRES_TLS_VOLUME,
+  ]);
+
+  const tlsSetup = calls.find(
+    ({ args, options }) => commandKind(args, options) === "postgres-tls-setup",
+  );
+  assert.ok(
+    tlsSetup.args.some((value) =>
+      value.includes(`source=${POSTGRES_TLS_VOLUME},target=/postgres-tls`),
+    ),
+  );
+  assert.ok(tlsSetup.args.includes("none"));
+  assert.ok(tlsSetup.args.includes("--pull=always"));
+  assert.ok(tlsSetup.args.includes(EXPECTED_IMAGE));
+  const setupScript = tlsSetup.args.at(-1);
+  assert.match(setupScript, /openssl req/);
+  assert.match(setupScript, /subjectAltName=IP:127\.0\.0\.1/);
+  assert.match(setupScript, /openssl x509 -req/);
+  assert.match(setupScript, /rm -f \/postgres-tls\/ca\.key/);
+  assert.ok(
+    setupScript.indexOf("chmod 600 /postgres-tls/server.key") <
+      setupScript.indexOf("chown postgres:postgres"),
+  );
+  assert.match(
+    setupScript,
+    /chown postgres:postgres \/postgres-tls\/server\.key \/postgres-tls\/server\.crt(?:\n|$)/,
+  );
+
+  const start = calls.find(
+    ({ args, options }) => commandKind(args, options) === "start",
+  );
+  assert.ok(
+    start.args.includes(
+      `type=volume,source=${POSTGRES_TLS_VOLUME},target=/postgres-tls,readonly`,
+    ),
+  );
+  assert.ok(start.args.includes("postgres"));
+  assert.ok(start.args.includes("ssl=on"));
+  assert.ok(start.args.includes("ssl_cert_file=/postgres-tls/server.crt"));
+  assert.ok(start.args.includes("ssl_key_file=/postgres-tls/server.key"));
+  assert.ok(
+    start.args.includes(
+      "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+    ),
+  );
+  assert.ok(!start.args.includes("sh"));
+
+  const setupCleanup = calls.find(
+    ({ args, options }) =>
+      commandKind(args, options) === "postgres-tls-setup-cleanup",
+  );
+  assert.deepEqual(setupCleanup.args, [
+    "rm",
+    "--force",
+    "--volumes",
+    POSTGRES_TLS_SETUP_CONTAINER,
+  ]);
+  assert.equal(setupCleanup.options.signal, undefined);
+
+  const volumeCleanup = calls.find(
+    ({ args, options }) =>
+      commandKind(args, options) === "postgres-tls-volume-cleanup",
+  );
+  assert.deepEqual(volumeCleanup.args, [
+    "volume",
+    "rm",
+    "--force",
+    POSTGRES_TLS_VOLUME,
+  ]);
+  assert.equal(volumeCleanup.options.signal, undefined);
+});
+
+test("stages and exercises the decision server before it is committed", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { writerIntegration: true }),
+  );
+
+  const sourceStage = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-source-stage",
+  );
+  const sourceCommand = sourceStage.args.at(-1);
+  assert.match(sourceCommand, /apps\/decision-server/);
+  for (const sourcePath of [
+    "apps/decision-server/Cargo.toml",
+    "apps/decision-server/src/config.rs",
+    "apps/decision-server/src/lib.rs",
+    "apps/decision-server/src/main.rs",
+    "apps/decision-server/src/runtime.rs",
+    "apps/decision-server/src/secure_file.rs",
+    "apps/decision-server/src/windows_acl.rs",
+    "apps/decision-server/tests/process.rs",
+    "apps/decision-server/tests/runtime_config.rs",
+    "apps/decision-server/tests/runtime_integration.rs",
+  ]) {
+    assert.ok(sourceCommand.includes(sourcePath));
+  }
+
+  for (const kind of ["writer-build", "writer-test"]) {
+    const integrationCall = calls.find(
+      ({ args, options }) => commandKind(args, options) === kind,
+    );
+    const cargoIndex = integrationCall.args.lastIndexOf("cargo");
+    const cargoArgs = integrationCall.args.slice(cargoIndex + 1);
+    assert.ok(cargoArgs.includes("bioworld-decision-server"));
+  }
+});
+
+test("passes the PostgreSQL CA path into the Rust test environment", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { writerIntegration: true }),
+  );
+
+  const runtime = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-test",
+  );
+  assert.ok(
+    runtime.args.includes(
+      `type=volume,source=${POSTGRES_TLS_VOLUME},target=/postgres-tls,readonly`,
+    ),
+  );
+  assert.ok(
+    runtime.args.includes(
+      "BIOWORLD_POSTGRES_TLS_CA_FILE=/postgres-tls/ca.crt",
+    ),
+  );
+  assert.equal(
+    runtime.options.env.BIOWORLD_POSTGRES_TLS_CA_FILE,
+    undefined,
+  );
+
+  for (const kind of [
+    "writer-source-stage",
+    "writer-fetch",
+    "writer-build",
+  ]) {
+    const call = calls.find(
+      ({ args, options }) => commandKind(args, options) === kind,
+    );
+    assert.ok(!call.args.some((value) => value.includes("/postgres-tls")));
+  }
+});
+
+test("runs Rust integration tests from a bounded writable scratch directory", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { writerIntegration: true }),
+  );
+
+  const runtime = calls.find(
+    ({ args, options }) => commandKind(args, options) === "writer-test",
+  );
+  assert.ok(
+    runtime.args.includes(
+      `type=volume,source=${WRITER_SOURCE_VOLUME},target=/source,readonly`,
+    ),
+  );
+  assert.ok(
+    runtime.args.includes(
+      "/workspace/apps/decision-server:rw,noexec,nosuid,nodev,size=1048576",
+    ),
+  );
+  assert.equal(runtime.args[runtime.args.indexOf("--workdir") + 1], "/workspace");
+  assert.ok(runtime.args.includes("sh"));
+  const copyScript = runtime.args[runtime.args.indexOf("-ceu") + 1];
+  assert.match(
+    copyScript,
+    /cp -R \/source\/apps\/decision-server\/\. \/workspace\/apps\/decision-server\//,
+  );
+  const cargoIndex = runtime.args.lastIndexOf("cargo");
+  assert.deepEqual(runtime.args.slice(cargoIndex + 1, cargoIndex + 4), [
+    "test",
+    "--manifest-path",
+    "/workspace/Cargo.toml",
+  ]);
+});
+
+test("requires every PostgreSQL integration package", () => {
   assert.throws(() =>
     assertRunsAllPostgresIntegrationTests([
       "cargo",
@@ -324,6 +549,8 @@ test("requires both PostgreSQL integration packages", () => {
       "bioworld-event-store-postgres",
       "--package",
       "bioworld-decision-grpc-postgres",
+      "--package",
+      "bioworld-decision-server",
       "--tests",
     ]),
   );
@@ -343,6 +570,8 @@ test("builds PostgreSQL integration tests without credentials and runs them only
   assert.deepEqual(
     calls.map(({ args, options }) => commandKind(args, options)),
     [
+      "postgres-tls-volume-create",
+      "postgres-tls-setup",
       "writer-image-pull",
       "writer-cargo-volume-create",
       "writer-target-volume-create",
@@ -371,6 +600,8 @@ test("builds PostgreSQL integration tests without credentials and runs them only
       "writer-fetch-cleanup",
       "writer-source-stage-cleanup",
       "cleanup",
+      "postgres-tls-setup-cleanup",
+      "postgres-tls-volume-cleanup",
       "writer-source-volume-cleanup",
       "writer-target-volume-cleanup",
       "writer-cargo-volume-cleanup",
@@ -397,7 +628,10 @@ test("builds PostgreSQL integration tests without credentials and runs them only
   const sourceCommand = sourceStage.args.at(-1);
   assert.match(sourceCommand, /git .*ls-files/);
   assert.match(sourceCommand, /Cargo\.toml Cargo\.lock rust-toolchain\.toml/);
-  assert.match(sourceCommand, /apps\/desktop\/src-tauri crates proto/);
+  assert.match(
+    sourceCommand,
+    /apps\/desktop\/src-tauri apps\/decision-server crates proto/,
+  );
   assert.match(sourceCommand, /tar --extract --no-same-owner/);
   assert.match(
     sourceCommand,
@@ -550,6 +784,8 @@ test("writer integration build failure cleans isolated containers and volumes", 
     { message: "PostgreSQL writer integration build failed." },
   );
   assert.deepEqual(kinds, [
+    "postgres-tls-volume-create",
+    "postgres-tls-setup",
     "writer-image-pull",
     "writer-cargo-volume-create",
     "writer-target-volume-create",
@@ -561,6 +797,8 @@ test("writer integration build failure cleans isolated containers and volumes", 
     "writer-fetch-cleanup",
     "writer-source-stage-cleanup",
     "cleanup",
+    "postgres-tls-setup-cleanup",
+    "postgres-tls-volume-cleanup",
     "writer-source-volume-cleanup",
     "writer-target-volume-cleanup",
     "writer-cargo-volume-cleanup",
@@ -593,7 +831,7 @@ test("writer integration runtime failure is redacted and fully cleaned", async (
   );
   assert.deepEqual(
     calls
-      .slice(-8)
+      .slice(-10)
       .map(({ args, options }) => commandKind(args, options)),
     [
       "writer-test-cleanup",
@@ -601,6 +839,8 @@ test("writer integration runtime failure is redacted and fully cleaned", async (
       "writer-fetch-cleanup",
       "writer-source-stage-cleanup",
       "cleanup",
+      "postgres-tls-setup-cleanup",
+      "postgres-tls-volume-cleanup",
       "writer-source-volume-cleanup",
       "writer-target-volume-cleanup",
       "writer-cargo-volume-cleanup",
@@ -617,13 +857,26 @@ test("writer integration runtime failure is redacted and fully cleaned", async (
   }
 });
 
-test("interrupts writer build and runtime with unsignaled full cleanup", async (t) => {
+test("interrupts integration setup and runtime with unsignaled full cleanup", async (t) => {
   for (const scenario of [
+    {
+      kind: "postgres-tls-setup",
+      cleanup: [
+        "cleanup",
+        "postgres-tls-setup-cleanup",
+        "postgres-tls-volume-cleanup",
+        "writer-source-volume-cleanup",
+        "writer-target-volume-cleanup",
+        "writer-cargo-volume-cleanup",
+      ],
+    },
     {
       kind: "writer-source-stage",
       cleanup: [
         "writer-source-stage-cleanup",
         "cleanup",
+        "postgres-tls-setup-cleanup",
+        "postgres-tls-volume-cleanup",
         "writer-source-volume-cleanup",
         "writer-target-volume-cleanup",
         "writer-cargo-volume-cleanup",
@@ -635,6 +888,8 @@ test("interrupts writer build and runtime with unsignaled full cleanup", async (
         "writer-fetch-cleanup",
         "writer-source-stage-cleanup",
         "cleanup",
+        "postgres-tls-setup-cleanup",
+        "postgres-tls-volume-cleanup",
         "writer-source-volume-cleanup",
         "writer-target-volume-cleanup",
         "writer-cargo-volume-cleanup",
@@ -647,6 +902,8 @@ test("interrupts writer build and runtime with unsignaled full cleanup", async (
         "writer-fetch-cleanup",
         "writer-source-stage-cleanup",
         "cleanup",
+        "postgres-tls-setup-cleanup",
+        "postgres-tls-volume-cleanup",
         "writer-source-volume-cleanup",
         "writer-target-volume-cleanup",
         "writer-cargo-volume-cleanup",
@@ -660,6 +917,8 @@ test("interrupts writer build and runtime with unsignaled full cleanup", async (
         "writer-fetch-cleanup",
         "writer-source-stage-cleanup",
         "cleanup",
+        "postgres-tls-setup-cleanup",
+        "postgres-tls-volume-cleanup",
         "writer-source-volume-cleanup",
         "writer-target-volume-cleanup",
         "writer-cargo-volume-cleanup",
@@ -725,8 +984,9 @@ test("interrupts writer build and runtime with unsignaled full cleanup", async (
   }
 });
 
-test("interrupts writer volume creation and removes every deterministic volume", async (t) => {
+test("interrupts volume creation and removes every deterministic volume", async (t) => {
   for (const interruptedKind of [
+    "postgres-tls-volume-create",
     "writer-cargo-volume-create",
     "writer-target-volume-create",
     "writer-source-volume-create",
@@ -773,6 +1033,10 @@ test("interrupts writer volume creation and removes every deterministic volume",
         const interruptedIndex = kinds.indexOf(interruptedKind);
         assert.deepEqual(kinds.slice(interruptedIndex + 1), [
           "cleanup",
+          ...(interruptedKind === "postgres-tls-volume-create"
+            ? []
+            : ["postgres-tls-setup-cleanup"]),
+          "postgres-tls-volume-cleanup",
           "writer-source-volume-cleanup",
           "writer-target-volume-cleanup",
           "writer-cargo-volume-cleanup",
@@ -1002,6 +1266,8 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.deepEqual(
     calls.map(({ args, options }) => commandKind(args, options)),
     [
+      "postgres-tls-volume-create",
+      "postgres-tls-setup",
       "start",
       "health",
       "health",
@@ -1020,10 +1286,15 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "reader-verify",
       "owner-verify",
       "cleanup",
+      "postgres-tls-setup-cleanup",
+      "postgres-tls-volume-cleanup",
     ],
   );
 
-  assert.deepEqual(calls[0].args, [
+  const startCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "start",
+  );
+  assert.deepEqual(startCall.args.slice(0, 15), [
     "run",
     "--detach",
     "--rm",
@@ -1036,21 +1307,39 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     "POSTGRES_PASSWORD",
     "--env",
     "POSTGRES_DB=bioworld_migrations",
-    EXPECTED_IMAGE,
+    "--env",
+    "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+    "--mount",
   ]);
-  assert.equal(calls[0].options.env.POSTGRES_PASSWORD, POSTGRES_PASSWORD);
-  assert.equal(calls[0].options.env.PGPASSWORD, undefined);
-  assert.equal(calls[0].options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
-  assert.equal(calls[0].options.env.BIOWORLD_WRITER_PASSWORD, undefined);
-  assert.equal(calls[0].options.env.BIOWORLD_READER_PASSWORD, undefined);
-  assert.ok(!calls[0].args.includes("--publish"));
-  assert.ok(!calls[0].args.includes("-p"));
+  assert.equal(
+    startCall.args[15],
+    `type=volume,source=${POSTGRES_TLS_VOLUME},target=/postgres-tls,readonly`,
+  );
+  assert.deepEqual(startCall.args.slice(16), [
+    EXPECTED_IMAGE,
+    "postgres",
+    "-c",
+    "ssl=on",
+    "-c",
+    "ssl_cert_file=/postgres-tls/server.crt",
+    "-c",
+    "ssl_key_file=/postgres-tls/server.key",
+    "-c",
+    "ssl_min_protocol_version=TLSv1.2",
+  ]);
+  assert.equal(startCall.options.env.POSTGRES_PASSWORD, POSTGRES_PASSWORD);
+  assert.equal(startCall.options.env.PGPASSWORD, undefined);
+  assert.equal(startCall.options.env.BIOWORLD_MIGRATOR_PASSWORD, undefined);
+  assert.equal(startCall.options.env.BIOWORLD_WRITER_PASSWORD, undefined);
+  assert.equal(startCall.options.env.BIOWORLD_READER_PASSWORD, undefined);
+  assert.ok(!startCall.args.includes("--publish"));
+  assert.ok(!startCall.args.includes("-p"));
   assert.ok(
-    !calls[0].args.some((argument) =>
+    !startCall.args.some((argument) =>
       argument.includes("POSTGRES_HOST_AUTH_METHOD"),
     ),
   );
-  assert.equal(calls[0].options.env.POSTGRES_HOST_AUTH_METHOD, undefined);
+  assert.equal(startCall.options.env.POSTGRES_HOST_AUTH_METHOD, undefined);
 
   const healthCalls = calls.filter(
     ({ args, options }) => commandKind(args, options) === "health",
@@ -1309,14 +1598,17 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   assert.equal(ownerVerificationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
   assert.equal(ownerVerificationCall.options.input, OWNER_VERIFICATION_SQL);
 
-  assert.deepEqual(calls.at(-1).args, [
+  const databaseCleanup = calls.find(
+    ({ args, options }) => commandKind(args, options) === "cleanup",
+  );
+  assert.deepEqual(databaseCleanup.args, [
     "rm",
     "--force",
     "--volumes",
     CONTAINER_NAME,
   ]);
 
-  for (const [index, { command, args, options }] of calls.entries()) {
+  for (const { command, args, options } of calls) {
     assert.equal(command, "docker");
     assert.notEqual(options.shell, true);
     assert.equal(options.encoding, "utf8");
@@ -1335,7 +1627,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     assert.ok(!String(options.input ?? "").includes(WRITER_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(READER_PASSWORD));
     assert.ok(!String(options.input ?? "").includes(SECRET));
-    if (index > 0) {
+    if (commandKind(args, options) !== "start") {
       assert.equal(options.env?.POSTGRES_PASSWORD, undefined);
       assert.equal(options.env?.POSTGRES_HOST_AUTH_METHOD, undefined);
     }
@@ -1355,6 +1647,8 @@ test("reassigns legacy-owned objects before applying the tenant migration", asyn
 
   const kinds = calls.map(({ args, options }) => commandKind(args, options));
   assert.deepEqual(kinds, [
+    "postgres-tls-volume-create",
+    "postgres-tls-setup",
     "start",
     "health",
     "readiness",
@@ -1371,6 +1665,8 @@ test("reassigns legacy-owned objects before applying the tenant migration", asyn
     "reader-verify",
     "owner-verify",
     "cleanup",
+    "postgres-tls-setup-cleanup",
+    "postgres-tls-volume-cleanup",
   ]);
 
   for (const kind of ["migration-0001", "fixture", "migration-0002"]) {
@@ -1416,6 +1712,8 @@ test("reassigns version three objects before applying the envelope migration", a
 
   const kinds = calls.map(({ args, options }) => commandKind(args, options));
   assert.deepEqual(kinds, [
+    "postgres-tls-volume-create",
+    "postgres-tls-setup",
     "start",
     "health",
     "readiness",
@@ -1432,6 +1730,8 @@ test("reassigns version three objects before applying the envelope migration", a
     "reader-verify",
     "owner-verify",
     "cleanup",
+    "postgres-tls-setup-cleanup",
+    "postgres-tls-volume-cleanup",
   ]);
 
   for (const kind of [
@@ -1558,7 +1858,11 @@ test("interrupts every privileged phase and performs unsignaled cleanup", async 
           commandKind(args, options),
         );
         const interruptedIndex = kinds.indexOf(scenario.kind);
-        assert.deepEqual(kinds.slice(interruptedIndex + 1), ["cleanup"]);
+        assert.deepEqual(kinds.slice(interruptedIndex + 1), [
+          "cleanup",
+          "postgres-tls-setup-cleanup",
+          "postgres-tls-volume-cleanup",
+        ]);
 
         const interruptedCall = calls[interruptedIndex];
         assert.equal(interruptedCall.options.signal.aborted, true);
@@ -1602,10 +1906,15 @@ test("readiness timeout captures bounded logs before cleanup", async () => {
 
   const kinds = calls.map(({ args, options }) => commandKind(args, options));
   assert.ok(kinds.filter((kind) => kind === "health").length <= 6);
-  assert.deepEqual(kinds.slice(-2), ["logs", "cleanup"]);
+  assert.deepEqual(kinds.slice(-4), [
+    "logs",
+    "cleanup",
+    "postgres-tls-setup-cleanup",
+    "postgres-tls-volume-cleanup",
+  ]);
   assert.ok(!kinds.includes("readiness"));
   assert.ok(!kinds.includes("migration-0001"));
-  const logsCall = calls.at(-2);
+  const logsCall = calls.at(-4);
   assert.deepEqual(logsCall.args, ["logs", "--tail", "200", CONTAINER_NAME]);
   assert.ok(logsCall.options.maxBuffer <= 64 * 1024);
 });
@@ -1628,7 +1937,13 @@ test("failed final readiness probe captures logs and never starts migrations", a
   assert.equal(error.message, "PostgreSQL migration container did not become ready.");
   assert.ok(!error.message.includes(SECRET));
   const kinds = calls.map(({ args, options }) => commandKind(args, options));
-  assert.deepEqual(kinds.slice(-3), ["readiness", "logs", "cleanup"]);
+  assert.deepEqual(kinds.slice(-5), [
+    "readiness",
+    "logs",
+    "cleanup",
+    "postgres-tls-setup-cleanup",
+    "postgres-tls-volume-cleanup",
+  ]);
   assert.ok(kinds.filter((kind) => kind === "readiness").length > 1);
   assert.ok(!kinds.includes("migration-0001"));
 });
@@ -1689,6 +2004,8 @@ test("redacts a secret crossing the retained output boundary", () => {
 
 test("command failures remain secret-safe and always clean up", async (t) => {
   const scenarios = [
+    ["postgres-tls-volume-create", "PostgreSQL TLS storage failed."],
+    ["postgres-tls-setup", "PostgreSQL TLS identity generation failed."],
     ["start", "PostgreSQL migration container could not start."],
     ["bootstrap", "PostgreSQL role bootstrap failed."],
     ["migration-0001", "PostgreSQL migrations failed."],
@@ -1733,7 +2050,7 @@ test("command failures remain secret-safe and always clean up", async (t) => {
       assert.ok(!error.message.includes(READER_PASSWORD));
       assert.equal(
         commandKind(calls.at(-1).args, calls.at(-1).options),
-        "cleanup",
+        "postgres-tls-volume-cleanup",
       );
     });
   }
@@ -1786,7 +2103,7 @@ test("unexpected verification output fails closed without exposing output", asyn
       assert.ok(!error.message.includes(READER_PASSWORD));
       assert.equal(
         commandKind(calls.at(-1).args, calls.at(-1).options),
-        "cleanup",
+        "postgres-tls-volume-cleanup",
       );
     });
   }
