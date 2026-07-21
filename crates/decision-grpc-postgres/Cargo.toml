@@ -9,10 +9,11 @@ rust-version.workspace = true
 bioworld-decision-grpc = { path = "../decision-grpc" }
 bioworld-decision-query = { path = "../decision-query" }
 bioworld-event-store-postgres = { path = "../event-store-postgres" }
+deadpool-postgres.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
 bioworld-contracts = { path = "../contracts" }
 bioworld-event-store-contracts = { path = "../event-store-contracts" }
 tonic.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
