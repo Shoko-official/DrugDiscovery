@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use bioworld_domain::{
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
-    Recommendation as DomainRecommendation,
+    MAX_DECISION_RATIONALE_ITEMS, Recommendation as DomainRecommendation,
 };
 use prost::Message;
 use thiserror::Error;
@@ -64,6 +64,9 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
     type Error = DecisionContractError;
 
     fn try_from(value: v2::DecisionRecord) -> Result<Self, Self::Error> {
+        if value.rationale.len() > MAX_DECISION_RATIONALE_ITEMS {
+            return Err(Self::Error::InvalidDomain(DomainError::TooManyRationales));
+        }
         if value.encoded_len() > MAX_DECISION_WIRE_BYTES {
             return Err(Self::Error::DecisionTooLarge);
         }

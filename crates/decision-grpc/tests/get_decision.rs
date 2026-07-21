@@ -162,8 +162,11 @@ fn rejects_oversized_executor_responses_with_a_fixed_status() {
     response.rationale = vec![sensitive.clone()];
     let (executor, calls, _) = executor(Ok(response));
 
-    let status = block_on_ready(get_decision(&executor, scope("trusted-tenant"), request()))
-        .expect_err("oversized executor response must fail");
+    let result = block_on_ready(get_decision(&executor, scope("trusted-tenant"), request()));
+    let status = match result {
+        Ok(_) => panic!("oversized executor response must fail"),
+        Err(status) => status,
+    };
 
     assert_public_status(
         &status,
@@ -172,6 +175,22 @@ fn rejects_oversized_executor_responses_with_a_fixed_status() {
     );
     assert!(!format!("{status:?} {status}").contains(&sensitive));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[allow(deprecated)]
+fn canonicalizes_valid_executor_responses() {
+    let mut response = record(1);
+    response.decision_id.make_ascii_uppercase();
+    response.evidence_snapshot_id.clear();
+    let (executor, _, _) = executor(Ok(response));
+
+    let response = block_on_ready(get_decision(&executor, scope("trusted-tenant"), request()))
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.decision_id, DECISION_ID);
+    assert_eq!(response.evidence_snapshot_id, "ES-GRPC-001");
 }
 
 #[test]

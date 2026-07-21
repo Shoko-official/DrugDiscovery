@@ -224,6 +224,107 @@ fn decision_event_migration_enforces_the_storage_contract() {
 }
 
 #[test]
+fn bounded_decision_envelope_migration_is_additive_and_validated() {
+    let statements = parse_migration("0004_bounded_decision_envelope.sql");
+    let operations = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::AlterTable(value) if value.name.to_string() == "public.scientific_event" => {
+                Some(value.operations.iter())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let checks = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AlterTableOperation::AddConstraint {
+                constraint: TableConstraint::Check(check),
+                not_valid: true,
+            } => check
+                .name
+                .as_ref()
+                .map(|name| (name.value.as_str(), check.expr.to_string())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(checks.len(), 7);
+
+    let tenant_check = checks
+        .get("scientific_event_tenant_id_bytes_check")
+        .expect("bounded tenant constraint is required");
+    assert!(tenant_check.contains("octet_length"));
+    assert!(tenant_check.contains("tenant_id"));
+    assert!(tenant_check.contains("128"));
+
+    for (constraint_name, column_name) in [
+        ("scientific_event_event_type_envelope_check", "event_type"),
+        (
+            "scientific_event_schema_version_envelope_check",
+            "schema_version",
+        ),
+        (
+            "scientific_event_aggregate_type_envelope_check",
+            "aggregate_type",
+        ),
+        (
+            "scientific_event_aggregate_id_envelope_check",
+            "aggregate_id",
+        ),
+    ] {
+        let identifier_check = checks
+            .get(constraint_name)
+            .expect("bounded event identifier constraint is required");
+        assert!(identifier_check.contains("char_length"));
+        assert!(identifier_check.contains("octet_length"));
+        assert!(identifier_check.contains(column_name));
+        assert!(identifier_check.contains("200"));
+        assert!(identifier_check.contains("800"));
+    }
+
+    let payload_check = checks
+        .get("scientific_event_payload_bytes_check")
+        .expect("bounded payload constraint is required");
+    assert!(payload_check.contains("octet_length"));
+    assert!(payload_check.contains("payload"));
+    assert!(payload_check.contains("524288"));
+
+    let signature_check = checks
+        .get("scientific_event_signature_bytes_check")
+        .expect("bounded signature constraint is required");
+    assert!(signature_check.contains("octet_length"));
+    assert!(signature_check.contains("signature"));
+    assert!(signature_check.contains("20480"));
+
+    let validated = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AlterTableOperation::ValidateConstraint { name } => Some(name.value.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validated,
+        [
+            "scientific_event_tenant_id_bytes_check",
+            "scientific_event_event_type_envelope_check",
+            "scientific_event_schema_version_envelope_check",
+            "scientific_event_aggregate_type_envelope_check",
+            "scientific_event_aggregate_id_envelope_check",
+            "scientific_event_payload_bytes_check",
+            "scientific_event_signature_bytes_check",
+        ]
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|statement| matches!(statement, Statement::Set(_) | Statement::AlterTable(_)))
+    );
+}
+
+#[test]
 fn tenant_boundary_migration_is_role_agnostic_and_fail_closed() {
     let sql = read_migration("0003_postgres_tenant_boundary.sql");
     let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");

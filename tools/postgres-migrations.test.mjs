@@ -76,6 +76,11 @@ const migrations = [
     isFile: true,
     sql: "ALTER TABLE public.scientific_event ENABLE ROW LEVEL SECURITY;",
   },
+  {
+    name: "0004_bounded_decision_envelope.sql",
+    isFile: true,
+    sql: "ALTER TABLE public.scientific_event VALIDATE CONSTRAINT bounded_envelope;",
+  },
 ];
 
 function result(status = 0, stdout = "", stderr = "") {
@@ -180,6 +185,9 @@ function commandKind(args, options = {}) {
   }
   if (input.includes(migrations[2].sql)) {
     return "migration-0003";
+  }
+  if (input.includes(migrations[3].sql)) {
+    return "migration-0004";
   }
   if (input.includes(WRITER_ACCESS_SQL)) {
     return "writer-access";
@@ -350,6 +358,7 @@ test("builds PostgreSQL integration tests without credentials and runs them only
       "fixture",
       "migration-0002",
       "migration-0003",
+      "migration-0004",
       "writer-access",
       "reader-access",
       "verify",
@@ -767,6 +776,7 @@ test("discovers regular migration files in strict contiguous version order", () 
     migrations[1],
     migrations[0],
     migrations[2],
+    migrations[3],
   ]);
 });
 
@@ -986,6 +996,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
       "fixture",
       "migration-0002",
       "migration-0003",
+      "migration-0004",
       "writer-access",
       "reader-access",
       "verify",
@@ -1122,6 +1133,7 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
     "fixture",
     "migration-0002",
     "migration-0003",
+    "migration-0004",
     "writer-access",
     "reader-access",
   ];
@@ -1177,10 +1189,14 @@ test("uses distinct bounded psql sessions in migration lifecycle order", async (
   );
   assert.match(
     transactionCalls[4].options.input,
-    /grant-writer-access\.sql/,
+    /0004_bounded_decision_envelope\.sql/,
   );
   assert.match(
     transactionCalls[5].options.input,
+    /grant-writer-access\.sql/,
+  );
+  assert.match(
+    transactionCalls[6].options.input,
     /grant-reader-access\.sql/,
   );
 
@@ -1331,6 +1347,7 @@ test("reassigns legacy-owned objects before applying the tenant migration", asyn
     "migration-0002",
     "bootstrap",
     "migration-0003",
+    "migration-0004",
     "writer-access",
     "reader-access",
     "verify",
@@ -1357,18 +1374,84 @@ test("reassigns legacy-owned objects before applying the tenant migration", asyn
     /ALTER TABLE public\.scientific_event OWNER TO bioworld_owner;/,
   );
 
-  const tenantMigrationCall = calls.find(
-    ({ args, options }) => commandKind(args, options) === "migration-0003",
+  for (const kind of ["migration-0003", "migration-0004"]) {
+    const migrationCall = calls.find(
+      ({ args, options }) => commandKind(args, options) === kind,
+    );
+    assert.equal(
+      migrationCall.args[migrationCall.args.indexOf("--username") + 1],
+      "bioworld_migrator",
+    );
+    assert.equal(migrationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+    assert.match(migrationCall.options.input, /SET LOCAL ROLE bioworld_owner;/);
+  }
+});
+
+test("reassigns version three objects before applying the envelope migration", async () => {
+  const calls = [];
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    return operationResult(commandKind(args, options));
+  };
+
+  await runPostgresMigrations(
+    runOptions(runCommand, undefined, { legacyUpgradeFromVersion: 3 }),
+  );
+
+  const kinds = calls.map(({ args, options }) => commandKind(args, options));
+  assert.deepEqual(kinds, [
+    "start",
+    "health",
+    "readiness",
+    "migration-0001",
+    "fixture",
+    "migration-0002",
+    "migration-0003",
+    "bootstrap",
+    "migration-0004",
+    "writer-access",
+    "reader-access",
+    "verify",
+    "tenant-verify",
+    "reader-verify",
+    "owner-verify",
+    "cleanup",
+  ]);
+
+  for (const kind of [
+    "migration-0001",
+    "fixture",
+    "migration-0002",
+    "migration-0003",
+  ]) {
+    const call = calls.find(
+      ({ args, options }) => commandKind(args, options) === kind,
+    );
+    assert.equal(call.args[call.args.indexOf("--username") + 1], "postgres");
+    assert.equal(call.options.env.PGPASSWORD, POSTGRES_PASSWORD);
+    assert.doesNotMatch(call.options.input, /SET LOCAL ROLE bioworld_owner;/);
+  }
+
+  const bootstrapCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "bootstrap",
+  );
+  assert.match(
+    bootstrapCall.options.input,
+    /ALTER TABLE public\.scientific_event OWNER TO bioworld_owner;/,
+  );
+
+  const envelopeMigrationCall = calls.find(
+    ({ args, options }) => commandKind(args, options) === "migration-0004",
   );
   assert.equal(
-    tenantMigrationCall.args[
-      tenantMigrationCall.args.indexOf("--username") + 1
+    envelopeMigrationCall.args[
+      envelopeMigrationCall.args.indexOf("--username") + 1
     ],
     "bioworld_migrator",
   );
-  assert.equal(tenantMigrationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
+  assert.equal(envelopeMigrationCall.options.env.PGPASSWORD, MIGRATOR_PASSWORD);
   assert.match(
-    tenantMigrationCall.options.input,
+    envelopeMigrationCall.options.input,
     /SET LOCAL ROLE bioworld_owner;/,
   );
 });
@@ -1377,6 +1460,7 @@ test("interrupts every privileged phase and performs unsignaled cleanup", async 
   for (const scenario of [
     { name: "bootstrap", kind: "bootstrap" },
     { name: "migration-0003", kind: "migration-0003" },
+    { name: "migration-0004", kind: "migration-0004" },
     { name: "writer-access", kind: "writer-access" },
     { name: "reader-access", kind: "reader-access" },
     { name: "verify", kind: "verify" },
@@ -1595,6 +1679,7 @@ test("command failures remain secret-safe and always clean up", async (t) => {
     ["fixture", "PostgreSQL migration fixture failed."],
     ["migration-0002", "PostgreSQL migrations failed."],
     ["migration-0003", "PostgreSQL migrations failed."],
+    ["migration-0004", "PostgreSQL migrations failed."],
     ["writer-access", "PostgreSQL writer access provisioning failed."],
     ["reader-access", "PostgreSQL reader access provisioning failed."],
     ["verify", "PostgreSQL migration verification failed."],

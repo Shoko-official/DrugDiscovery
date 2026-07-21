@@ -1,17 +1,29 @@
 use bioworld_contracts::{
-    DecisionContractError, VersionedDecisionRecord,
+    DecisionContractError, MAX_TENANT_ID_BYTES, VersionedDecisionRecord, tenant_id_is_valid,
     v2::{self, DecisionEvent, EvidenceSnapshotRef},
 };
 use chrono::{DateTime, Utc};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const DECISION_EVENT_TYPE: &str = "bioworld.v2.DecisionEvent";
 pub const DECISION_SCHEMA_VERSION: &str = "2";
 pub const DECISION_AGGREGATE_TYPE: &str = "bioworld.v2.DecisionRecord";
+pub const MAX_CANONICAL_DECISION_PAYLOAD_BYTES: usize = 262_144;
+pub const MAX_CANONICAL_DECISION_PAYLOAD_DEPTH: usize = 8;
+pub const MAX_CANONICAL_DECISION_PAYLOAD_NODES: usize = 128;
+pub const MAX_EVENT_SIGNATURE_JSON_BYTES: usize = 16_384;
+pub const MAX_EVENT_SIGNATURE_DEPTH: usize = 16;
+pub const MAX_EVENT_SIGNATURE_NODES: usize = 256;
+pub const MAX_STORED_EVENT_PAYLOAD_BYTES: usize = 524_288;
+pub const MAX_STORED_EVENT_SIGNATURE_BYTES: usize = 20_480;
+pub const MAX_STORED_EVENT_IDENTIFIER_CHARS: usize = 200;
+pub const MAX_STORED_EVENT_IDENTIFIER_BYTES: usize = 800;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionEventMetadata {
@@ -27,12 +39,13 @@ impl DecisionEventMetadata {
         signature: Value,
     ) -> Result<Self, EventProjectionError> {
         validate_tenant_id(&tenant_id)?;
-        validate_json_value(&signature)?;
         let signature = signature
             .as_object()
             .filter(|value| !value.is_empty())
-            .cloned()
             .ok_or(EventProjectionError::InvalidSignature)?;
+        validate_signature_object(signature)?;
+        validate_signature_size(signature)?;
+        let signature = signature.clone();
 
         Ok(Self {
             tenant_id,
@@ -63,10 +76,14 @@ pub enum EventProjectionError {
     MissingDecision,
     #[error("event_id must be a canonical UUID")]
     InvalidEventId,
-    #[error("tenant_id must be non-empty and have no surrounding whitespace")]
+    #[error("tenant_id must be non-empty, at most 128 bytes, and have no surrounding whitespace")]
     InvalidTenantId,
     #[error("signature must be a non-empty JSON object")]
     InvalidSignature,
+    #[error("signature exceeds the accepted JSON envelope")]
+    SignatureEnvelopeExceeded,
+    #[error("signature exceeds the accepted JSON structure")]
+    SignatureStructureExceeded,
     #[error("PostgreSQL text and jsonb values must not contain NUL bytes")]
     NulByteNotAllowed,
     #[error("decision contract is invalid: {0}")]
@@ -75,6 +92,10 @@ pub enum EventProjectionError {
     Canonicalization(#[source] serde_json::Error),
     #[error("stored payload is invalid: {0}")]
     InvalidPayload(#[source] serde_json::Error),
+    #[error("canonical decision payload exceeds the accepted JSON envelope")]
+    CanonicalPayloadEnvelopeExceeded,
+    #[error("canonical decision payload exceeds the accepted JSON structure")]
+    CanonicalPayloadStructureExceeded,
     #[error("stored event type does not match the decision event contract")]
     InvalidEventType,
     #[error("stored schema version does not match the decision event contract")]
@@ -155,8 +176,10 @@ pub fn reconstruct_decision_event(
 ) -> Result<DecisionEvent, EventProjectionError> {
     validate_row_metadata(row)?;
 
-    let payload: CanonicalDecisionPayload = serde_json::from_value(row.payload.clone())
-        .map_err(EventProjectionError::InvalidPayload)?;
+    validate_payload_json(&row.payload)?;
+    let payload_bytes = canonical_payload_bytes(&row.payload)?;
+    let payload: CanonicalDecisionPayload =
+        serde_json::from_slice(&payload_bytes).map_err(EventProjectionError::InvalidPayload)?;
     if canonical_uuid(&payload.decision_id).is_none() {
         return Err(DecisionContractError::InvalidDecisionId.into());
     }
@@ -169,7 +192,7 @@ pub fn reconstruct_decision_event(
         return Err(EventProjectionError::AggregateVersionMismatch);
     }
 
-    let (_, expected_hash) = canonical_payload(&payload)?;
+    let expected_hash = format!("{:x}", Sha256::digest(&payload_bytes));
     if row.payload_sha256 != expected_hash {
         return Err(EventProjectionError::PayloadHashMismatch);
     }
@@ -181,6 +204,32 @@ pub fn reconstruct_decision_event(
         event_id: row.event_id.to_string(),
         decision: Some(v2::DecisionRecord::from(&boundary)),
     })
+}
+
+pub fn parse_stored_decision_payload(input: &str) -> Result<Value, EventProjectionError> {
+    parse_bounded_json(
+        input,
+        MAX_STORED_EVENT_PAYLOAD_BYTES,
+        MAX_CANONICAL_DECISION_PAYLOAD_DEPTH,
+        MAX_CANONICAL_DECISION_PAYLOAD_NODES,
+        StoredJsonKind::Payload,
+    )
+}
+
+pub fn parse_stored_event_signature(
+    input: &str,
+) -> Result<Map<String, Value>, EventProjectionError> {
+    let value = parse_bounded_json(
+        input,
+        MAX_STORED_EVENT_SIGNATURE_BYTES,
+        MAX_EVENT_SIGNATURE_DEPTH,
+        MAX_EVENT_SIGNATURE_NODES,
+        StoredJsonKind::Signature,
+    )?;
+    match value {
+        Value::Object(value) if !value.is_empty() => Ok(value),
+        _ => Err(EventProjectionError::InvalidSignature),
+    }
 }
 
 impl CanonicalDecisionPayload {
@@ -267,13 +316,16 @@ fn validate_row_metadata(row: &ScientificEventRow) -> Result<(), EventProjection
     if row.signature.is_empty() {
         return Err(EventProjectionError::InvalidSignature);
     }
-    validate_json_object(&row.signature)?;
+    validate_signature_object(&row.signature)?;
+    validate_signature_size(&row.signature)?;
     Ok(())
 }
 
 fn validate_tenant_id(tenant_id: &str) -> Result<(), EventProjectionError> {
-    validate_text(tenant_id)?;
-    if tenant_id.is_empty() || tenant_id.trim() != tenant_id {
+    if tenant_id.len() <= MAX_TENANT_ID_BYTES && tenant_id.contains('\0') {
+        return Err(EventProjectionError::NulByteNotAllowed);
+    }
+    if !tenant_id_is_valid(tenant_id) {
         return Err(EventProjectionError::InvalidTenantId);
     }
     Ok(())
@@ -297,33 +349,371 @@ fn parse_aggregate_version(value: &str) -> Result<u64, EventProjectionError> {
 }
 
 fn canonical_payload<T: Serialize>(value: &T) -> Result<(Value, String), EventProjectionError> {
-    let bytes = serde_jcs::to_vec(value).map_err(EventProjectionError::Canonicalization)?;
+    let bytes = canonical_payload_bytes(value)?;
     let payload = serde_json::from_slice(&bytes).map_err(EventProjectionError::Canonicalization)?;
-    validate_json_value(&payload)?;
+    validate_payload_json(&payload)?;
     let payload_sha256 = format!("{:x}", Sha256::digest(&bytes));
     Ok((payload, payload_sha256))
 }
 
-fn validate_text(value: &str) -> Result<(), EventProjectionError> {
+fn canonical_payload_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, EventProjectionError> {
+    let bytes = serde_jcs::to_vec(value).map_err(EventProjectionError::Canonicalization)?;
+    if bytes.len() > MAX_CANONICAL_DECISION_PAYLOAD_BYTES {
+        return Err(EventProjectionError::CanonicalPayloadEnvelopeExceeded);
+    }
+    Ok(bytes)
+}
+
+fn validate_signature_size<T: Serialize>(value: &T) -> Result<(), EventProjectionError> {
+    let bytes = serde_jcs::to_vec(value).map_err(|_| EventProjectionError::InvalidSignature)?;
+    if bytes.len() > MAX_EVENT_SIGNATURE_JSON_BYTES {
+        return Err(EventProjectionError::SignatureEnvelopeExceeded);
+    }
+    Ok(())
+}
+
+fn validate_signature_object(value: &Map<String, Value>) -> Result<(), EventProjectionError> {
+    validate_json_object_envelope(
+        value,
+        MAX_EVENT_SIGNATURE_DEPTH,
+        MAX_EVENT_SIGNATURE_NODES,
+        MAX_EVENT_SIGNATURE_JSON_BYTES,
+    )
+    .map_err(|violation| match violation {
+        JsonEnvelopeViolation::Size => EventProjectionError::SignatureEnvelopeExceeded,
+        JsonEnvelopeViolation::Structure => EventProjectionError::SignatureStructureExceeded,
+        JsonEnvelopeViolation::NulByte => EventProjectionError::NulByteNotAllowed,
+    })
+}
+
+fn validate_payload_json(value: &Value) -> Result<(), EventProjectionError> {
+    validate_json_value_envelope(
+        value,
+        MAX_CANONICAL_DECISION_PAYLOAD_DEPTH,
+        MAX_CANONICAL_DECISION_PAYLOAD_NODES,
+        MAX_CANONICAL_DECISION_PAYLOAD_BYTES,
+    )
+    .map_err(|violation| match violation {
+        JsonEnvelopeViolation::Size => EventProjectionError::CanonicalPayloadEnvelopeExceeded,
+        JsonEnvelopeViolation::Structure => EventProjectionError::CanonicalPayloadStructureExceeded,
+        JsonEnvelopeViolation::NulByte => EventProjectionError::NulByteNotAllowed,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum JsonEnvelopeViolation {
+    Size,
+    Structure,
+    NulByte,
+}
+
+fn validate_json_value_envelope(
+    value: &Value,
+    max_depth: usize,
+    max_nodes: usize,
+    max_text_bytes: usize,
+) -> Result<(), JsonEnvelopeViolation> {
+    match value {
+        Value::Object(value) => {
+            validate_json_object_envelope(value, max_depth, max_nodes, max_text_bytes)
+        }
+        _ => validate_json_nodes(
+            std::iter::once((value, 1_usize)),
+            0,
+            0,
+            max_depth,
+            max_nodes,
+            max_text_bytes,
+        ),
+    }
+}
+
+fn validate_json_object_envelope(
+    value: &Map<String, Value>,
+    max_depth: usize,
+    max_nodes: usize,
+    max_text_bytes: usize,
+) -> Result<(), JsonEnvelopeViolation> {
+    if value.len() > max_nodes.saturating_sub(1) {
+        return Err(JsonEnvelopeViolation::Structure);
+    }
+    let mut text_bytes = 0_usize;
+    let mut pending = Vec::with_capacity(value.len().min(max_nodes));
+    for (key, value) in value {
+        add_json_text(key, &mut text_bytes, max_text_bytes)?;
+        pending.push((value, 2_usize));
+    }
+    validate_json_nodes(pending, 1, text_bytes, max_depth, max_nodes, max_text_bytes)
+}
+
+fn validate_json_nodes<'value>(
+    values: impl IntoIterator<Item = (&'value Value, usize)>,
+    initial_nodes: usize,
+    initial_text_bytes: usize,
+    max_depth: usize,
+    max_nodes: usize,
+    max_text_bytes: usize,
+) -> Result<(), JsonEnvelopeViolation> {
+    let mut pending: Vec<_> = values.into_iter().collect();
+    let mut nodes = initial_nodes;
+    let mut text_bytes = initial_text_bytes;
+    while let Some((current, depth)) = pending.pop() {
+        nodes = nodes
+            .checked_add(1)
+            .ok_or(JsonEnvelopeViolation::Structure)?;
+        if nodes > max_nodes || depth > max_depth {
+            return Err(JsonEnvelopeViolation::Structure);
+        }
+        match current {
+            Value::String(value) => add_json_text(value, &mut text_bytes, max_text_bytes)?,
+            Value::Array(values) => {
+                if values.len() > max_nodes.saturating_sub(nodes + pending.len()) {
+                    return Err(JsonEnvelopeViolation::Structure);
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                if values.len() > max_nodes.saturating_sub(nodes + pending.len()) {
+                    return Err(JsonEnvelopeViolation::Structure);
+                }
+                for (key, value) in values {
+                    add_json_text(key, &mut text_bytes, max_text_bytes)?;
+                    pending.push((value, depth + 1));
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn add_json_text(
+    value: &str,
+    text_bytes: &mut usize,
+    max_text_bytes: usize,
+) -> Result<(), JsonEnvelopeViolation> {
+    *text_bytes = text_bytes
+        .checked_add(value.len())
+        .ok_or(JsonEnvelopeViolation::Size)?;
+    if *text_bytes > max_text_bytes {
+        return Err(JsonEnvelopeViolation::Size);
+    }
     if value.contains('\0') {
+        return Err(JsonEnvelopeViolation::NulByte);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StoredJsonKind {
+    Payload,
+    Signature,
+}
+
+fn parse_bounded_json(
+    input: &str,
+    max_bytes: usize,
+    max_depth: usize,
+    max_nodes: usize,
+    kind: StoredJsonKind,
+) -> Result<Value, EventProjectionError> {
+    if input.len() > max_bytes {
+        return Err(kind.envelope_error());
+    }
+    if input.contains('\0') {
         return Err(EventProjectionError::NulByteNotAllowed);
     }
-    Ok(())
-}
 
-fn validate_json_object(value: &Map<String, Value>) -> Result<(), EventProjectionError> {
-    for (key, value) in value {
-        validate_text(key)?;
-        validate_json_value(value)?;
+    let mut budget = StoredJsonBudget {
+        max_depth,
+        max_nodes,
+        nodes: 0,
+        violation: None,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let result = BoundedValueSeed {
+        budget: &mut budget,
+        depth: 1,
     }
-    Ok(())
+    .deserialize(&mut deserializer);
+
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return Err(kind.parse_error(error, budget.violation)),
+    };
+    deserializer
+        .end()
+        .map_err(|error| kind.parse_error(error, budget.violation))?;
+    Ok(value)
 }
 
-fn validate_json_value(value: &Value) -> Result<(), EventProjectionError> {
-    match value {
-        Value::String(value) => validate_text(value),
-        Value::Array(values) => values.iter().try_for_each(validate_json_value),
-        Value::Object(value) => validate_json_object(value),
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+impl StoredJsonKind {
+    fn envelope_error(self) -> EventProjectionError {
+        match self {
+            Self::Payload => EventProjectionError::CanonicalPayloadEnvelopeExceeded,
+            Self::Signature => EventProjectionError::SignatureEnvelopeExceeded,
+        }
+    }
+
+    fn structure_error(self) -> EventProjectionError {
+        match self {
+            Self::Payload => EventProjectionError::CanonicalPayloadStructureExceeded,
+            Self::Signature => EventProjectionError::SignatureStructureExceeded,
+        }
+    }
+
+    fn parse_error(
+        self,
+        error: serde_json::Error,
+        violation: Option<StoredJsonViolation>,
+    ) -> EventProjectionError {
+        match violation {
+            Some(StoredJsonViolation::Structure) => self.structure_error(),
+            Some(StoredJsonViolation::NulByte) => EventProjectionError::NulByteNotAllowed,
+            None => match self {
+                Self::Payload => EventProjectionError::InvalidPayload(error),
+                Self::Signature => EventProjectionError::InvalidSignature,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StoredJsonViolation {
+    Structure,
+    NulByte,
+}
+
+struct StoredJsonBudget {
+    max_depth: usize,
+    max_nodes: usize,
+    nodes: usize,
+    violation: Option<StoredJsonViolation>,
+}
+
+impl StoredJsonBudget {
+    fn enter<E: de::Error>(&mut self, depth: usize) -> Result<(), E> {
+        self.nodes = self.nodes.saturating_add(1);
+        if depth > self.max_depth || self.nodes > self.max_nodes {
+            self.violation = Some(StoredJsonViolation::Structure);
+            return Err(E::custom("stored JSON exceeds accepted structure"));
+        }
+        Ok(())
+    }
+
+    fn reject_nul<E: de::Error>(&mut self, value: &str) -> Result<(), E> {
+        if value.contains('\0') {
+            self.violation = Some(StoredJsonViolation::NulByte);
+            return Err(E::custom("stored JSON contains a NUL byte"));
+        }
+        Ok(())
+    }
+}
+
+struct BoundedValueSeed<'budget> {
+    budget: &'budget mut StoredJsonBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.enter(self.depth)?;
+        deserializer.deserialize_any(BoundedValueVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct BoundedValueVisitor<'budget> {
+    budget: &'budget mut StoredJsonBudget,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value within the stored envelope")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.reject_nul(value)?;
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.reject_nul(&value)?;
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(BoundedValueSeed {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            self.budget.reject_nul(&key)?;
+            let value = object.next_value_seed(BoundedValueSeed {
+                budget: self.budget,
+                depth: self.depth + 1,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
     }
 }

@@ -4,7 +4,9 @@ use bioworld_contracts::{
     DecisionContractError, MAX_DECISION_WIRE_BYTES, VersionedDecisionRecord,
     v2::{DecisionRecord, EvidenceSnapshotRef, Recommendation},
 };
-use bioworld_domain::{DomainError, Recommendation as DomainRecommendation};
+use bioworld_domain::{
+    DomainError, MAX_DECISION_RATIONALE_ITEMS, Recommendation as DomainRecommendation,
+};
 use prost::Message;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -189,6 +191,14 @@ fn rejects_invalid_wire_records_with_specific_errors() {
         "blank rationale",
         blank_rationale,
         DecisionContractError::InvalidDomain(DomainError::MissingRationale),
+    ));
+
+    let mut excessive_rationales = complete_wire_record();
+    excessive_rationales.rationale = vec!["r".to_owned(); MAX_DECISION_RATIONALE_ITEMS + 1];
+    cases.push((
+        "excessive rationales",
+        excessive_rationales,
+        DecisionContractError::InvalidDomain(DomainError::TooManyRationales),
     ));
 
     let mut zero_version = complete_wire_record();

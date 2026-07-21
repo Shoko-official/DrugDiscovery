@@ -189,10 +189,10 @@ impl DecisionRecord {
 
 fn decision_identifier_is_valid(value: &str) -> bool {
     !value.is_empty()
-        && value.trim() == value
-        && !value.contains('\0')
         && value.len() <= MAX_DECISION_IDENTIFIER_BYTES
         && value.chars().count() <= MAX_DECISION_IDENTIFIER_CHARS
+        && value.trim() == value
+        && !value.contains('\0')
 }
 
 impl TryFrom<DecisionRecordData> for DecisionRecord {

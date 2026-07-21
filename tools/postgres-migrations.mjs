@@ -1249,7 +1249,18 @@ if (isMain) {
       readerPassword: randomBytes(32).toString("hex"),
       legacyUpgradeFromVersion: 2,
     });
-    console.log("PostgreSQL fresh install and legacy upgrade verified.");
+    await runPostgresMigrations({
+      ...inputs,
+      nonce: randomBytes(12).toString("hex"),
+      postgresPassword: randomBytes(32).toString("hex"),
+      migratorPassword: randomBytes(32).toString("hex"),
+      writerPassword: randomBytes(32).toString("hex"),
+      readerPassword: randomBytes(32).toString("hex"),
+      legacyUpgradeFromVersion: 3,
+    });
+    console.log(
+      "PostgreSQL fresh install and version 2 and 3 upgrades verified.",
+    );
   } catch (error) {
     console.error(
       error instanceof Error

@@ -9,10 +9,13 @@ use std::{
     time::Duration,
 };
 
-use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, ProposeDecisionRequest,
-    Recommendation, WatchDecisionRequest,
-    decision_service_server::DecisionService as GeneratedDecisionService,
+use bioworld_contracts::{
+    MAX_DECISION_WIRE_BYTES,
+    v2::{
+        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, ProposeDecisionRequest,
+        Recommendation, WatchDecisionRequest,
+        decision_service_server::DecisionService as GeneratedDecisionService,
+    },
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
@@ -21,10 +24,16 @@ use bioworld_decision_grpc::{
     TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_query::{GetDecisionQuery, GetDecisionRequestExecutionError};
+use http_body_util::{BodyExt, Full};
+use prost::Message;
 use tokio::sync::Notify;
-use tonic::{Code, Request, Status};
+use tonic::{
+    Code, Request, Status,
+    codegen::{Bytes, Service, http},
+};
 
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
+const SENSITIVE_RESPONSE_MARKER: &str = "sensitive-oversized-response";
 
 #[test]
 fn rejects_unsafe_service_configuration_with_a_fixed_error() {
@@ -290,6 +299,17 @@ fn record() -> DecisionRecord {
     }
 }
 
+#[allow(deprecated)]
+fn oversized_record() -> DecisionRecord {
+    let mut record = record();
+    record.rationale = vec![format!(
+        "{SENSITIVE_RESPONSE_MARKER}{}",
+        "x".repeat(MAX_DECISION_WIRE_BYTES)
+    )];
+    assert!(record.encoded_len() > MAX_DECISION_WIRE_BYTES);
+    record
+}
+
 fn assert_public_status(status: &Status, code: Code, message: &str) {
     assert_eq!(status.code(), code);
     assert_eq!(status.message(), message);
@@ -301,6 +321,138 @@ fn request(decision_id: &str) -> Request<GetDecisionRequest> {
     Request::new(GetDecisionRequest {
         decision_id: decision_id.to_owned(),
     })
+}
+
+fn request_with_encoded_len(target: usize) -> GetDecisionRequest {
+    let mut request = GetDecisionRequest::default();
+    let mut decision_id_bytes = target;
+
+    for _ in 0..4 {
+        request.decision_id = "x".repeat(decision_id_bytes);
+        match request.encoded_len().cmp(&target) {
+            std::cmp::Ordering::Equal => return request,
+            std::cmp::Ordering::Less => decision_id_bytes += target - request.encoded_len(),
+            std::cmp::Ordering::Greater => decision_id_bytes -= request.encoded_len() - target,
+        }
+    }
+
+    panic!("could not construct target wire size");
+}
+
+fn framed_get_decision_request(message: &GetDecisionRequest) -> http::Request<Full<Bytes>> {
+    let encoded = message.encode_to_vec();
+    let message_len = u32::try_from(encoded.len()).unwrap();
+    let mut framed = Vec::with_capacity(encoded.len() + 5);
+    framed.push(0);
+    framed.extend_from_slice(&message_len.to_be_bytes());
+    framed.extend_from_slice(&encoded);
+
+    http::Request::builder()
+        .method("POST")
+        .uri("/bioworld.v2.DecisionService/GetDecision")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from(framed)))
+        .unwrap()
+}
+
+async fn response_grpc_status(response: http::Response<tonic::body::Body>) -> String {
+    let header_status = response.headers().get("grpc-status").cloned();
+    let collected = response.into_body().collect().await.unwrap();
+    header_status
+        .or_else(|| {
+            collected
+                .trailers()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .cloned()
+        })
+        .expect("gRPC response must contain a status")
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn generated_server_rejects_wire_size_plus_one_before_authentication() {
+    let auth_calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        CountingAuthenticator {
+            calls: Arc::clone(&auth_calls),
+            tenant_id: "trusted-tenant",
+        },
+        RecordingExecutor {
+            observed: Arc::clone(&observed),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(1)).unwrap(),
+    );
+    let mut server = service.into_server();
+    let exact = request_with_encoded_len(MAX_DECISION_WIRE_BYTES);
+    let oversized = request_with_encoded_len(MAX_DECISION_WIRE_BYTES + 1);
+
+    let exact_response = Service::call(&mut server, framed_get_decision_request(&exact))
+        .await
+        .unwrap();
+    assert_eq!(response_grpc_status(exact_response).await, "3");
+    assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    assert!(observed.lock().unwrap().is_empty());
+
+    let oversized_response = Service::call(&mut server, framed_get_decision_request(&oversized))
+        .await
+        .unwrap();
+    assert_eq!(response_grpc_status(oversized_response).await, "11");
+    assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    assert!(observed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn generated_server_rejects_oversized_response_before_emission() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        StaticAuthenticator,
+        RecordingExecutor {
+            observed: Arc::clone(&observed),
+            response: oversized_record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(1)).unwrap(),
+    );
+    let mut server = service.into_server();
+    let request = GetDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    };
+
+    let response = Service::call(&mut server, framed_get_decision_request(&request))
+        .await
+        .unwrap();
+    let headers = response.headers().clone();
+    let collected = response.into_body().collect().await.unwrap();
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    let body = collected.to_bytes();
+    let grpc_status = headers
+        .get("grpc-status")
+        .or_else(|| trailers.get("grpc-status"))
+        .expect("gRPC response must contain a status");
+    let grpc_message = headers
+        .get("grpc-message")
+        .or_else(|| trailers.get("grpc-message"))
+        .map_or("", |value| value.to_str().unwrap());
+
+    assert_eq!(grpc_status, "14");
+    assert_eq!(grpc_message, "decision%20service%20is%20unavailable");
+    assert!(body.is_empty());
+    for value in headers.values().chain(trailers.values()) {
+        assert!(
+            !value
+                .as_bytes()
+                .windows(SENSITIVE_RESPONSE_MARKER.len())
+                .any(|window| window == SENSITIVE_RESPONSE_MARKER.as_bytes())
+        );
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![("trusted-tenant".to_owned(), DECISION_ID.to_owned())]
+    );
 }
 
 #[tokio::test]
