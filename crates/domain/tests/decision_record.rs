@@ -1,7 +1,33 @@
-use bioworld_domain::{DecisionRecord, EvidenceSnapshotRef, Recommendation};
+use bioworld_domain::{
+    DecisionRecord, DomainError, EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES, Recommendation,
+};
 use uuid::Uuid;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn bounds_cou_identifiers_in_bytes() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "c".repeat(MAX_DECISION_IDENTIFIER_BYTES),
+        Recommendation::Abstain,
+        evidence.clone(),
+        vec!["Bounded rationale.".to_owned()],
+    );
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "c".repeat(MAX_DECISION_IDENTIFIER_BYTES + 1),
+        Recommendation::Abstain,
+        evidence,
+        vec!["Bounded rationale.".to_owned()],
+    );
+
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::InvalidCouId));
+}
 
 #[test]
 fn constructs_valid_decision_record() {

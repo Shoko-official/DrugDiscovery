@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub const MAX_DECISION_IDENTIFIER_BYTES: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Recommendation {
@@ -48,6 +50,8 @@ struct DecisionRecordData {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
+    #[error("context of use identifier is invalid")]
+    InvalidCouId,
     #[error("a qualified decision requires at least one rationale")]
     MissingRationale,
     #[error("evidence digest must be a lowercase sha256")]
@@ -130,6 +134,9 @@ impl DecisionRecord {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self.cou_id.len() > MAX_DECISION_IDENTIFIER_BYTES {
+            return Err(DomainError::InvalidCouId);
+        }
         if self
             .rationale
             .iter()
