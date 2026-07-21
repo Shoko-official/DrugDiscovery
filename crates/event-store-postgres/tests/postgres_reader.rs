@@ -1,10 +1,18 @@
-use bioworld_contracts::v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation};
+use std::future::Future;
+
+use bioworld_contracts::{
+    VersionedDecisionRecord,
+    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation},
+};
+use bioworld_decision_query::{
+    GetDecision, GetDecisionError, GetDecisionQuery, LatestDecisionSource,
+};
 use bioworld_event_store_contracts::{
     DecisionEventMetadata, ScientificEventRow, project_decision_event,
 };
 use bioworld_event_store_postgres::{
-    AppendDecisionEventError, PostgresDecisionEventReader, PostgresDecisionEventWriter,
-    ReadDecisionEventError,
+    AppendDecisionEventError, InvalidDecisionSourceScope, PostgresDecisionEventReader,
+    PostgresDecisionEventWriter, PostgresLatestDecisionSource, ReadDecisionEventError,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -63,6 +71,253 @@ fn decision_event_at_version(
             }),
         }),
     }
+}
+
+#[tokio::test]
+async fn scoped_source_returns_the_exact_latest_decision_at_maximum_version() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-adapter-hit";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa101")
+        .expect("fixed decision identifier must parse");
+    let older = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba101",
+        &decision_id.to_string(),
+        1,
+    );
+    let latest = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba102",
+        &decision_id.to_string(),
+        u64::MAX,
+    );
+    let expected = VersionedDecisionRecord::try_from(
+        latest
+            .decision
+            .clone()
+            .expect("fixed event must contain a decision"),
+    )
+    .expect("fixed decision must satisfy the contract");
+
+    append(&mut writer, older, tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+    append(&mut writer, latest, tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let actual = {
+        let reader = PostgresDecisionEventReader::new(&mut reader);
+        let source = PostgresLatestDecisionSource::try_new(reader, tenant_id)
+            .expect("fixed tenant scope must be valid");
+        let mut get_decision = GetDecision::new(source);
+        get_decision
+            .execute(GetDecisionQuery::new(decision_id))
+            .await
+            .expect("scoped source must read the latest decision")
+            .expect("latest decision must exist")
+    };
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.aggregate_version().get(), u64::MAX);
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn rejects_invalid_source_scopes_at_construction_without_database_access() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+
+    for invalid_scope in ["", " tenant-adapter", "tenant-adapter ", "tenant\0adapter"] {
+        let error = match PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut reader),
+            invalid_scope,
+        ) {
+            Ok(_) => panic!("invalid tenant scope must be rejected"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:?} {error}");
+
+        assert_eq!(error, InvalidDecisionSourceScope);
+        assert_eq!(format!("{error:?}"), "InvalidDecisionSourceScope");
+        assert_eq!(error.to_string(), "decision source scope is invalid");
+        if !invalid_scope.is_empty() {
+            assert!(!rendered.contains(invalid_scope));
+        }
+        assert!(tenant_context_is_absent(&reader).await);
+    }
+
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn scoped_source_makes_cross_tenant_and_absent_decisions_indistinguishable() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let visible_tenant = "tenant-adapter-visible";
+    let hidden_tenant = "tenant-adapter-hidden";
+    let hidden_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa201")
+        .expect("fixed hidden decision identifier must parse");
+    let absent_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa202")
+        .expect("fixed absent decision identifier must parse");
+    let hidden = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba201",
+        &hidden_decision_id.to_string(),
+        1,
+    );
+
+    append(&mut writer, hidden, hidden_tenant).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let cross_tenant = {
+        let source = PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut reader),
+            visible_tenant,
+        )
+        .expect("fixed tenant scope must be valid");
+        GetDecision::new(source)
+            .execute(GetDecisionQuery::new(hidden_decision_id))
+            .await
+            .expect("cross-tenant decision must appear absent")
+    };
+    assert!(tenant_context_is_absent(&reader).await);
+
+    let absent = {
+        let source = PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut reader),
+            visible_tenant,
+        )
+        .expect("fixed tenant scope must be valid");
+        GetDecision::new(source)
+            .execute(GetDecisionQuery::new(absent_decision_id))
+            .await
+            .expect("absent decision lookup must succeed")
+    };
+
+    assert_eq!(cross_tenant, None);
+    assert_eq!(cross_tenant, absent);
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn scoped_source_rejects_a_corrupt_latest_decision_without_fallback() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-adapter-corrupt";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa301")
+        .expect("fixed decision identifier must parse");
+    let valid_older = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba301",
+        &decision_id.to_string(),
+        1,
+    );
+    let corrupt_latest = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba302",
+        &decision_id.to_string(),
+        2,
+    );
+
+    append(&mut writer, valid_older, tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+    insert_corrupt_event(&mut writer, corrupt_latest, tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let error = {
+        let source = PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut reader),
+            tenant_id,
+        )
+        .expect("fixed tenant scope must be valid");
+        GetDecision::new(source)
+            .execute(GetDecisionQuery::new(decision_id))
+            .await
+            .expect_err("corrupt latest decision must not fall back")
+    };
+    let rendered = format!("{error:?} {error}");
+
+    assert_eq!(error, GetDecisionError::StoredStateRejected);
+    assert_eq!(format!("{error:?}"), "StoredStateRejected");
+    assert_eq!(error.to_string(), "stored decision state was rejected");
+    assert!(!rendered.contains(tenant_id));
+    assert!(!rendered.contains(&decision_id.to_string()));
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn scoped_source_maps_writer_identity_rejection_to_source_unavailable() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let tenant_id = "tenant-adapter-wrong-reader";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa401")
+        .expect("fixed decision identifier must parse");
+
+    let error = {
+        let source = PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut writer),
+            tenant_id,
+        )
+        .expect("fixed tenant scope must be valid");
+        GetDecision::new(source)
+            .execute(GetDecisionQuery::new(decision_id))
+            .await
+            .expect_err("writer identity must not read through the scoped source")
+    };
+    let rendered = format!("{error:?} {error}");
+
+    assert_eq!(error, GetDecisionError::SourceUnavailable);
+    assert_eq!(format!("{error:?}"), "SourceUnavailable");
+    assert_eq!(error.to_string(), "decision source is unavailable");
+    assert!(!rendered.contains(tenant_id));
+    assert!(!rendered.contains(&decision_id.to_string()));
+    assert!(tenant_context_is_absent(&writer).await);
+    writer_task.abort();
+}
+
+#[tokio::test]
+async fn scoped_source_future_is_send_and_borrows_the_source_mutably() {
+    fn assert_source<T: LatestDecisionSource + Send>() {}
+    fn assert_future_is_send<T: Future + Send>(future: T) -> T {
+        future
+    }
+
+    assert_source::<PostgresLatestDecisionSource<'_, '_>>();
+
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fa501")
+        .expect("fixed decision identifier must parse");
+
+    {
+        let mut source = PostgresLatestDecisionSource::try_new(
+            PostgresDecisionEventReader::new(&mut reader),
+            "tenant-adapter-future",
+        )
+        .expect("fixed tenant scope must be valid");
+        let future = assert_future_is_send(source.read_latest(GetDecisionQuery::new(decision_id)));
+
+        assert_eq!(future.await, Ok(None));
+    }
+
+    assert!(tenant_context_is_absent(&reader).await);
+    reader_task.abort();
 }
 
 #[tokio::test]

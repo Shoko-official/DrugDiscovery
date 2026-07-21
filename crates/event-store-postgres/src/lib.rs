@@ -2,7 +2,10 @@
 
 mod reader;
 
-pub use reader::{PostgresDecisionEventReader, ReadDecisionEventError};
+pub use reader::{
+    InvalidDecisionSourceScope, PostgresDecisionEventReader, PostgresLatestDecisionSource,
+    ReadDecisionEventError,
+};
 
 use bioworld_contracts::v2::DecisionEvent;
 use bioworld_event_store_contracts::{

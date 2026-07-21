@@ -1,4 +1,7 @@
-use bioworld_contracts::v2::DecisionEvent;
+use bioworld_contracts::v2::{DecisionEvent, DecisionRecord};
+use bioworld_decision_query::{
+    GetDecisionQuery, LatestDecisionFuture, LatestDecisionSource, LatestDecisionSourceError,
+};
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, ScientificEventRow, reconstruct_decision_event,
 };
@@ -47,6 +50,42 @@ pub enum ReadDecisionEventError {
 
 pub struct PostgresDecisionEventReader<'client> {
     client: &'client mut Client,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("decision source scope is invalid")]
+pub struct InvalidDecisionSourceScope;
+
+pub struct PostgresLatestDecisionSource<'client, 'tenant> {
+    reader: PostgresDecisionEventReader<'client>,
+    tenant_id: &'tenant str,
+}
+
+impl<'client, 'tenant> PostgresLatestDecisionSource<'client, 'tenant> {
+    pub fn try_new(
+        reader: PostgresDecisionEventReader<'client>,
+        tenant_id: &'tenant str,
+    ) -> Result<Self, InvalidDecisionSourceScope> {
+        if !tenant_id_is_valid(tenant_id) {
+            return Err(InvalidDecisionSourceScope);
+        }
+
+        Ok(Self { reader, tenant_id })
+    }
+}
+
+impl LatestDecisionSource for PostgresLatestDecisionSource<'_, '_> {
+    fn read_latest(&mut self, query: GetDecisionQuery) -> LatestDecisionFuture<'_> {
+        Box::pin(async move {
+            let event = self
+                .reader
+                .get_latest(self.tenant_id, query.decision_id())
+                .await
+                .map_err(map_read_error)?;
+
+            decision_from_event(event)
+        })
+    }
 }
 
 impl<'client> PostgresDecisionEventReader<'client> {
@@ -223,6 +262,37 @@ fn tenant_id_is_valid(tenant_id: &str) -> bool {
     !tenant_id.is_empty() && tenant_id.trim() == tenant_id && !tenant_id.contains('\0')
 }
 
+fn map_read_error(error: ReadDecisionEventError) -> LatestDecisionSourceError {
+    match error {
+        ReadDecisionEventError::StoredEventRejected => {
+            LatestDecisionSourceError::StoredStateRejected
+        }
+        ReadDecisionEventError::InvalidTenantId
+        | ReadDecisionEventError::ReaderIdentityRejected
+        | ReadDecisionEventError::TenantContextRejected
+        | ReadDecisionEventError::ReadOnlyTransactionRejected
+        | ReadDecisionEventError::AccessDenied
+        | ReadDecisionEventError::RetryableTransaction
+        | ReadDecisionEventError::ConnectionUnavailable
+        | ReadDecisionEventError::DatabaseRejected
+        | ReadDecisionEventError::TransactionCleanupFailed => {
+            LatestDecisionSourceError::Unavailable
+        }
+    }
+}
+
+fn decision_from_event(
+    event: Option<DecisionEvent>,
+) -> Result<Option<DecisionRecord>, LatestDecisionSourceError> {
+    match event {
+        Some(event) => event
+            .decision
+            .map(Some)
+            .ok_or(LatestDecisionSourceError::StoredStateRejected),
+        None => Ok(None),
+    }
+}
+
 fn parse_aggregate_version(value: &str) -> Option<u64> {
     value
         .parse::<u64>()
@@ -264,9 +334,12 @@ fn map_append_error(error: AppendDecisionEventError) -> ReadDecisionEventError {
 
 #[cfg(test)]
 mod tests {
+    use bioworld_contracts::v2::DecisionEvent;
+    use bioworld_decision_query::LatestDecisionSourceError;
+
     use super::{
-        READER_ROLE, ReadDecisionEventError, map_append_error, parse_aggregate_version,
-        tenant_id_is_valid,
+        READER_ROLE, ReadDecisionEventError, decision_from_event, map_append_error, map_read_error,
+        parse_aggregate_version, tenant_id_is_valid,
     };
     use crate::{AppendDecisionEventError, RoleAttributes, role_identity_is_valid};
 
@@ -367,5 +440,68 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(map_append_error(input), expected);
         }
+    }
+
+    #[test]
+    fn maps_every_reader_error_to_a_fixed_source_category() {
+        let cases = [
+            (
+                ReadDecisionEventError::InvalidTenantId,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::ReaderIdentityRejected,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::TenantContextRejected,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::ReadOnlyTransactionRejected,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::StoredEventRejected,
+                LatestDecisionSourceError::StoredStateRejected,
+            ),
+            (
+                ReadDecisionEventError::AccessDenied,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::RetryableTransaction,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::ConnectionUnavailable,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::DatabaseRejected,
+                LatestDecisionSourceError::Unavailable,
+            ),
+            (
+                ReadDecisionEventError::TransactionCleanupFailed,
+                LatestDecisionSourceError::Unavailable,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(map_read_error(input), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_an_event_without_a_decision() {
+        let event = DecisionEvent {
+            event_id: "01910d47-6f80-7a31-8c29-1d5c4f6ba501".to_owned(),
+            decision: None,
+        };
+
+        assert_eq!(
+            decision_from_event(Some(event)),
+            Err(LatestDecisionSourceError::StoredStateRejected)
+        );
     }
 }
