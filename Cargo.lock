@@ -141,6 +141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bioworld-decision-grpc"
+version = "0.1.0"
+dependencies = [
+ "bioworld-contracts",
+ "bioworld-decision-query",
+ "tonic",
+]
+
+[[package]]
 name = "bioworld-decision-query"
 version = "0.1.0"
 dependencies = [
