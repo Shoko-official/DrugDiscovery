@@ -15,7 +15,7 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation,
+    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus, Recommendation,
     decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
@@ -549,6 +549,7 @@ fn record(
             id: evidence_id.to_owned(),
             sha256: evidence_sha256.to_owned(),
         }),
+        ood_status: Some(OodStatus::Unknown as i32),
     }
 }
 

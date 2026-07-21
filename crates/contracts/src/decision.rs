@@ -2,7 +2,8 @@ use std::num::NonZeroU64;
 
 use bioworld_domain::{
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
-    MAX_DECISION_RATIONALE_ITEMS, Recommendation as DomainRecommendation,
+    MAX_DECISION_RATIONALE_ITEMS, OodStatus as DomainOodStatus,
+    Recommendation as DomainRecommendation,
 };
 use prost::Message;
 use thiserror::Error;
@@ -55,6 +56,10 @@ pub enum DecisionContractError {
     UnspecifiedRecommendation,
     #[error("recommendation value {0} is unknown")]
     UnknownRecommendation(i32),
+    #[error("ood_status must not be unspecified")]
+    UnspecifiedOodStatus,
+    #[error("ood_status value {0} is unknown")]
+    UnknownOodStatus(i32),
     #[error(transparent)]
     InvalidDomain(#[from] DomainError),
 }
@@ -87,11 +92,17 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
         let aggregate_version =
             NonZeroU64::new(value.aggregate_version).ok_or(Self::Error::InvalidAggregateVersion)?;
         let recommendation = recommendation_from_wire(value.recommendation)?;
+        let ood_status = value
+            .ood_status
+            .map(ood_status_from_wire)
+            .transpose()?
+            .unwrap_or(DomainOodStatus::Unknown);
         let evidence = EvidenceSnapshotRef::try_new(evidence.id, evidence.sha256)?;
         let decision = DomainDecisionRecord::try_new(
             decision_id,
             value.cou_id,
             recommendation,
+            ood_status,
             evidence,
             value.rationale,
         )?;
@@ -117,6 +128,7 @@ impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
                 id: evidence.id().to_owned(),
                 sha256: evidence.sha256().to_owned(),
             }),
+            ood_status: Some(ood_status_to_wire(decision.ood_status()) as i32),
         }
     }
 }
@@ -141,5 +153,26 @@ fn recommendation_to_wire(value: &DomainRecommendation) -> v2::Recommendation {
         DomainRecommendation::Abstain => v2::Recommendation::Abstain,
         DomainRecommendation::Defer => v2::Recommendation::Defer,
         DomainRecommendation::StopProgram => v2::Recommendation::StopProgram,
+    }
+}
+
+fn ood_status_from_wire(value: i32) -> Result<DomainOodStatus, DecisionContractError> {
+    match v2::OodStatus::try_from(value)
+        .map_err(|_| DecisionContractError::UnknownOodStatus(value))?
+    {
+        v2::OodStatus::Unspecified => Err(DecisionContractError::UnspecifiedOodStatus),
+        v2::OodStatus::InDomain => Ok(DomainOodStatus::InDomain),
+        v2::OodStatus::Borderline => Ok(DomainOodStatus::Borderline),
+        v2::OodStatus::OutOfDomain => Ok(DomainOodStatus::OutOfDomain),
+        v2::OodStatus::Unknown => Ok(DomainOodStatus::Unknown),
+    }
+}
+
+fn ood_status_to_wire(value: &DomainOodStatus) -> v2::OodStatus {
+    match value {
+        DomainOodStatus::InDomain => v2::OodStatus::InDomain,
+        DomainOodStatus::Borderline => v2::OodStatus::Borderline,
+        DomainOodStatus::OutOfDomain => v2::OodStatus::OutOfDomain,
+        DomainOodStatus::Unknown => v2::OodStatus::Unknown,
     }
 }

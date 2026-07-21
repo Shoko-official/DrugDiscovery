@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
-use bioworld_contracts::v2::{DecisionRecord, Recommendation};
+use bioworld_contracts::v2::{DecisionRecord, OodStatus, Recommendation};
 use bioworld_desktop_core::{
     CurrentDecisionSource, DecisionProvenance, DecisionReadFuture, DecisionRuntime,
     DecisionRuntimeError, SourcedDecision,
@@ -54,6 +54,7 @@ fn record() -> DecisionRecord {
         rationale: vec!["Core source boundary.".to_owned()],
         aggregate_version: 1,
         evidence: None,
+        ood_status: Some(OodStatus::Unknown as i32),
     }
 }
 

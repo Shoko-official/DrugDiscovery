@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodStatus,
   Recommendation,
 } from "@bioworld/contracts";
 import type { DecisionReviewState } from "./DecisionReview";
@@ -21,10 +22,11 @@ const decision = create(DecisionRecordSchema, {
   rationale: ["Evidence coverage is incomplete."],
   aggregateVersion: 1n,
   evidence,
+  oodStatus: OodStatus.UNKNOWN,
 });
 
 export const decisionPreviewFixture = {
   kind: "ready",
   source: "preview_fixture",
-  decision: toDecisionSummary(decision, "unknown"),
+  decision: toDecisionSummary(decision),
 } as const satisfies DecisionReviewState;

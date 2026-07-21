@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file bioworld/v2/decision.proto.
  */
 export const file_bioworld_v2_decision: GenFile = /*@__PURE__*/
-  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAki7gEKDkRlY2lzaW9uUmVjb3JkEhMKC2RlY2lzaW9uX2lkGAEgASgJEg4KBmNvdV9pZBgCIAEoCRIgChRldmlkZW5jZV9zbmFwc2hvdF9pZBgDIAEoCUICGAESMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkSGQoRYWdncmVnYXRlX3ZlcnNpb24YBiABKAQSMgoIZXZpZGVuY2UYByABKAsyIC5iaW93b3JsZC52Mi5FdmlkZW5jZVNuYXBzaG90UmVmIlAKDURlY2lzaW9uRXZlbnQSLQoIZGVjaXNpb24YASABKAsyGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBIQCghldmVudF9pZBgCIAEoCSq+AQoOUmVjb21tZW5kYXRpb24SHgoaUkVDT01NRU5EQVRJT05fVU5TUEVDSUZJRUQQABIaChZSRUNPTU1FTkRBVElPTl9QUk9NT1RFEAESGQoVUkVDT01NRU5EQVRJT05fUkVKRUNUEAISGgoWUkVDT01NRU5EQVRJT05fQUJTVEFJThADEhgKFFJFQ09NTUVOREFUSU9OX0RFRkVSEAQSHwobUkVDT01NRU5EQVRJT05fU1RPUF9QUk9HUkFNEAUyhQIKD0RlY2lzaW9uU2VydmljZRJLCgtHZXREZWNpc2lvbhIfLmJpb3dvcmxkLnYyLkdldERlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElMKD1Byb3Bvc2VEZWNpc2lvbhIjLmJpb3dvcmxkLnYyLlByb3Bvc2VEZWNpc2lvblJlcXVlc3QaGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBJQCg1XYXRjaERlY2lzaW9uEiEuYmlvd29ybGQudjIuV2F0Y2hEZWNpc2lvblJlcXVlc3QaGi5iaW93b3JsZC52Mi5EZWNpc2lvbkV2ZW50MAFiBnByb3RvMw");
+  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAkirgIKDkRlY2lzaW9uUmVjb3JkEhMKC2RlY2lzaW9uX2lkGAEgASgJEg4KBmNvdV9pZBgCIAEoCRIgChRldmlkZW5jZV9zbmFwc2hvdF9pZBgDIAEoCUICGAESMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkSGQoRYWdncmVnYXRlX3ZlcnNpb24YBiABKAQSMgoIZXZpZGVuY2UYByABKAsyIC5iaW93b3JsZC52Mi5FdmlkZW5jZVNuYXBzaG90UmVmEi8KCm9vZF9zdGF0dXMYCCABKA4yFi5iaW93b3JsZC52Mi5Pb2RTdGF0dXNIAIgBAUINCgtfb29kX3N0YXR1cyJQCg1EZWNpc2lvbkV2ZW50Ei0KCGRlY2lzaW9uGAEgASgLMhsuYmlvd29ybGQudjIuRGVjaXNpb25SZWNvcmQSEAoIZXZlbnRfaWQYAiABKAkqvgEKDlJlY29tbWVuZGF0aW9uEh4KGlJFQ09NTUVOREFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWUkVDT01NRU5EQVRJT05fUFJPTU9URRABEhkKFVJFQ09NTUVOREFUSU9OX1JFSkVDVBACEhoKFlJFQ09NTUVOREFUSU9OX0FCU1RBSU4QAxIYChRSRUNPTU1FTkRBVElPTl9ERUZFUhAEEh8KG1JFQ09NTUVOREFUSU9OX1NUT1BfUFJPR1JBTRAFKpIBCglPb2RTdGF0dXMSGgoWT09EX1NUQVRVU19VTlNQRUNJRklFRBAAEhgKFE9PRF9TVEFUVVNfSU5fRE9NQUlOEAESGQoVT09EX1NUQVRVU19CT1JERVJMSU5FEAISHAoYT09EX1NUQVRVU19PVVRfT0ZfRE9NQUlOEAMSFgoST09EX1NUQVRVU19VTktOT1dOEAQyhQIKD0RlY2lzaW9uU2VydmljZRJLCgtHZXREZWNpc2lvbhIfLmJpb3dvcmxkLnYyLkdldERlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElMKD1Byb3Bvc2VEZWNpc2lvbhIjLmJpb3dvcmxkLnYyLlByb3Bvc2VEZWNpc2lvblJlcXVlc3QaGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBJQCg1XYXRjaERlY2lzaW9uEiEuYmlvd29ybGQudjIuV2F0Y2hEZWNpc2lvblJlcXVlc3QaGi5iaW93b3JsZC52Mi5EZWNpc2lvbkV2ZW50MAFiBnByb3RvMw");
 
 /**
  * @generated from message bioworld.v2.GetDecisionRequest
@@ -144,6 +144,11 @@ export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
    * @generated from field: bioworld.v2.EvidenceSnapshotRef evidence = 7;
    */
   evidence?: EvidenceSnapshotRef | undefined;
+
+  /**
+   * @generated from field: optional bioworld.v2.OodStatus ood_status = 8;
+   */
+  oodStatus?: OodStatus | undefined;
 };
 
 /**
@@ -215,6 +220,42 @@ export enum Recommendation {
  */
 export const RecommendationSchema: GenEnum<Recommendation> = /*@__PURE__*/
   enumDesc(file_bioworld_v2_decision, 0);
+
+/**
+ * @generated from enum bioworld.v2.OodStatus
+ */
+export enum OodStatus {
+  /**
+   * @generated from enum value: OOD_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: OOD_STATUS_IN_DOMAIN = 1;
+   */
+  IN_DOMAIN = 1,
+
+  /**
+   * @generated from enum value: OOD_STATUS_BORDERLINE = 2;
+   */
+  BORDERLINE = 2,
+
+  /**
+   * @generated from enum value: OOD_STATUS_OUT_OF_DOMAIN = 3;
+   */
+  OUT_OF_DOMAIN = 3,
+
+  /**
+   * @generated from enum value: OOD_STATUS_UNKNOWN = 4;
+   */
+  UNKNOWN = 4,
+}
+
+/**
+ * Describes the enum bioworld.v2.OodStatus.
+ */
+export const OodStatusSchema: GenEnum<OodStatus> = /*@__PURE__*/
+  enumDesc(file_bioworld_v2_decision, 1);
 
 /**
  * @generated from service bioworld.v2.DecisionService

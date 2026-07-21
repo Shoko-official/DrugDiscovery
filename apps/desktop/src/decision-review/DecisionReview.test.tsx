@@ -99,6 +99,29 @@ describe("DecisionReview", () => {
     expect(markup).not.toContain("Review remains blocked");
   });
 
+  it.each([
+    ["in_domain", "In domain"],
+    ["borderline", "Borderline"],
+    ["out_of_domain", "Out of domain"],
+    ["unknown", "Unknown"],
+  ] as const)(
+    "renders domain assessment %s as %s",
+    (domainAssessment, label) => {
+      const markup = renderToStaticMarkup(
+        <DecisionReview
+          state={{
+            kind: "ready",
+            source: "preview_fixture",
+            decision: { ...tracedDecision, domainAssessment },
+          }}
+        />,
+      );
+
+      expect(markup).toContain("Domain assessment");
+      expect(markup).toContain(`>${label}</dd>`);
+    },
+  );
+
   it("renders rationale in source order and an honest evidence reference", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview

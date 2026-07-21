@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
+  OodStatus,
   Recommendation,
 } from "@bioworld/contracts";
 import { describe, expect, it } from "vitest";
@@ -28,6 +29,7 @@ function completeRecord(recommendation = Recommendation.ABSTAIN) {
     rationale: ["Evidence coverage is incomplete."],
     aggregateVersion: 7n,
     evidence,
+    oodStatus: OodStatus.UNKNOWN,
   });
 }
 
@@ -38,7 +40,7 @@ function expectAdapterError(
   let thrown: unknown;
 
   try {
-    toDecisionSummary(record, "unknown");
+    toDecisionSummary(record);
   } catch (error) {
     thrown = error;
   }
@@ -51,7 +53,6 @@ describe("toDecisionSummary", () => {
   it("maps a complete generated record including stop_program", () => {
     const summary = toDecisionSummary(
       completeRecord(Recommendation.STOP_PROGRAM),
-      "unknown",
     );
 
     expect(summary).toEqual({
@@ -75,9 +76,38 @@ describe("toDecisionSummary", () => {
     [Recommendation.DEFER, "defer"],
     [Recommendation.STOP_PROGRAM, "stop_program"],
   ] as const)("maps recommendation %s", (wire, expected) => {
-    const summary = toDecisionSummary(completeRecord(wire), "unknown");
+    const summary = toDecisionSummary(completeRecord(wire));
 
     expect(summary.recommendation).toBe(expected);
+  });
+
+  it.each([
+    [OodStatus.IN_DOMAIN, "in_domain"],
+    [OodStatus.BORDERLINE, "borderline"],
+    [OodStatus.OUT_OF_DOMAIN, "out_of_domain"],
+    [OodStatus.UNKNOWN, "unknown"],
+  ] as const)("maps OOD status %s", (oodStatus, expected) => {
+    const record = completeRecord();
+    record.oodStatus = oodStatus;
+
+    expect(toDecisionSummary(record).domainAssessment).toBe(expected);
+  });
+
+  it("maps an absent historical OOD status to unknown", () => {
+    const record = completeRecord();
+    record.oodStatus = undefined;
+
+    expect(toDecisionSummary(record).domainAssessment).toBe("unknown");
+  });
+
+  it.each([
+    [OodStatus.UNSPECIFIED, "unspecified_ood_status"],
+    [99 as OodStatus, "unknown_ood_status"],
+  ] as const)("rejects OOD status %s", (oodStatus, code) => {
+    const record = completeRecord();
+    record.oodStatus = oodStatus;
+
+    expectAdapterError(record, code);
   });
 
   it.each([
@@ -91,7 +121,7 @@ describe("toDecisionSummary", () => {
     const record = completeRecord();
     record.evidence = undefined;
 
-    const summary = toDecisionSummary(record, "unknown");
+    const summary = toDecisionSummary(record);
 
     expect(summary.evidence).toEqual({ id: "ES-001", sha256: null });
   });
@@ -100,7 +130,7 @@ describe("toDecisionSummary", () => {
     const record = completeRecord();
     record.evidenceSnapshotId = "";
 
-    const summary = toDecisionSummary(record, "unknown");
+    const summary = toDecisionSummary(record);
 
     expect(summary.evidence).toEqual({ id: "ES-001", sha256: validSha256 });
   });
@@ -166,7 +196,7 @@ describe("toDecisionSummary", () => {
     const record = completeRecord();
     record.aggregateVersion = 18_446_744_073_709_551_615n;
 
-    const summary = toDecisionSummary(record, "unknown");
+    const summary = toDecisionSummary(record);
 
     expect(summary.aggregateVersion).toBe("18446744073709551615");
   });
@@ -182,7 +212,7 @@ describe("toDecisionSummary", () => {
     const record = completeRecord();
     record.rationale = ["  First reason.  ", "   ", "Second reason.", "\t"];
 
-    const summary = toDecisionSummary(record, "unknown");
+    const summary = toDecisionSummary(record);
 
     expect(summary.rationale).toEqual([
       "  First reason.  ",

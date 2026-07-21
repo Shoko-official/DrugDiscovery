@@ -1,11 +1,48 @@
 use bioworld_domain::{
     DecisionRecord, DomainError, EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES,
     MAX_DECISION_IDENTIFIER_CHARS, MAX_DECISION_RATIONALE_ITEM_BYTES, MAX_DECISION_RATIONALE_ITEMS,
-    MAX_DECISION_RATIONALE_TOTAL_BYTES, Recommendation,
+    MAX_DECISION_RATIONALE_TOTAL_BYTES, OodStatus, Recommendation,
 };
 use uuid::Uuid;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn constructs_decision_with_explicit_ood_status() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let record = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        evidence,
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(record.ood_status(), &OodStatus::Borderline);
+}
+
+#[test]
+fn historical_decision_json_without_ood_status_maps_to_unknown() {
+    let historical = serde_json::json!({
+        "id": Uuid::now_v7(),
+        "cou_id": "COU-001",
+        "recommendation": "abstain",
+        "evidence": {
+            "id": "ES-001",
+            "sha256": VALID_SHA256
+        },
+        "rationale": ["Evidence coverage is incomplete."]
+    });
+
+    let record: DecisionRecord = serde_json::from_value(historical).unwrap();
+    let current = serde_json::to_value(&record).unwrap();
+
+    assert_eq!(record.ood_status(), &OodStatus::Unknown);
+    assert_eq!(current["ood_status"], "unknown");
+}
 
 #[test]
 fn bounds_cou_identifiers() {
@@ -17,6 +54,7 @@ fn bounds_cou_identifiers() {
         Uuid::now_v7(),
         exact_id.clone(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         vec!["Bounded rationale.".to_owned()],
     );
@@ -24,6 +62,7 @@ fn bounds_cou_identifiers() {
         Uuid::now_v7(),
         format!("{exact_id}x"),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         vec!["Bounded rationale.".to_owned()],
     );
@@ -42,6 +81,7 @@ fn rejects_identifier_character_count_plus_one() {
         Uuid::now_v7(),
         "c".repeat(MAX_DECISION_IDENTIFIER_CHARS),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         vec!["Bounded rationale.".to_owned()],
     );
@@ -49,6 +89,7 @@ fn rejects_identifier_character_count_plus_one() {
         Uuid::now_v7(),
         "c".repeat(MAX_DECISION_IDENTIFIER_CHARS + 1),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         vec!["Bounded rationale.".to_owned()],
     );
@@ -78,6 +119,7 @@ fn rejects_noncanonical_decision_identifiers() {
                 Uuid::now_v7(),
                 identifier.to_owned(),
                 Recommendation::Abstain,
+                OodStatus::Unknown,
                 evidence,
                 vec!["Bounded rationale.".to_owned()],
             ),
@@ -100,6 +142,7 @@ fn bounds_rationale_item_count() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         rationale.clone(),
     );
@@ -107,6 +150,7 @@ fn bounds_rationale_item_count() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         [rationale, vec!["r".to_owned()]].concat(),
     );
@@ -124,6 +168,7 @@ fn bounds_each_rationale_in_bytes() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         vec!["r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES)],
     );
@@ -131,6 +176,7 @@ fn bounds_each_rationale_in_bytes() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         vec!["r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES + 1)],
     );
@@ -148,6 +194,7 @@ fn rejects_nul_in_rationales() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         vec!["invalid\0rationale".to_owned()],
     );
@@ -166,6 +213,7 @@ fn bounds_total_rationale_bytes() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         rationale.clone(),
     );
@@ -173,6 +221,7 @@ fn bounds_total_rationale_bytes() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         [rationale, vec!["r".to_owned()]].concat(),
     );
@@ -192,6 +241,7 @@ fn counts_blank_rationales_without_normalizing_them() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         rationale.clone(),
     )
@@ -200,6 +250,7 @@ fn counts_blank_rationales_without_normalizing_them() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         [rationale.clone(), vec![" ".to_owned()]].concat(),
     );
@@ -217,6 +268,7 @@ fn constructs_valid_decision_record() {
         decision_id,
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence.clone(),
         vec!["Evidence coverage is incomplete.".to_owned()],
     )
@@ -225,6 +277,7 @@ fn constructs_valid_decision_record() {
     assert_eq!(record.id(), decision_id);
     assert_eq!(record.cou_id(), "COU-001");
     assert_eq!(record.recommendation(), &Recommendation::Abstain);
+    assert_eq!(record.ood_status(), &OodStatus::Unknown);
     assert_eq!(record.evidence(), &evidence);
     assert_eq!(record.rationale(), ["Evidence coverage is incomplete."]);
     assert_eq!(record.validate(), Ok(()));
@@ -257,6 +310,7 @@ fn rejects_decision_without_rationale() {
             Uuid::now_v7(),
             "COU-001".to_owned(),
             Recommendation::Abstain,
+            OodStatus::Unknown,
             evidence,
             Vec::new(),
         ),
@@ -274,6 +328,7 @@ fn rejects_decision_with_only_blank_rationale() {
             Uuid::now_v7(),
             "COU-001".to_owned(),
             Recommendation::Abstain,
+            OodStatus::Unknown,
             evidence,
             vec!["  ".to_owned(), "\t".to_owned()],
         ),
@@ -290,6 +345,7 @@ fn accepts_decision_with_at_least_one_nonblank_rationale() {
         Uuid::now_v7(),
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Unknown,
         evidence,
         vec!["  ".to_owned(), "Evidence is incomplete.".to_owned()],
     );
@@ -372,6 +428,7 @@ fn decision_json_round_trip_preserves_wire_shape() {
         decision_id,
         "COU-001".to_owned(),
         Recommendation::Abstain,
+        OodStatus::Borderline,
         evidence,
         vec!["Evidence coverage is incomplete.".to_owned()],
     )
@@ -380,6 +437,7 @@ fn decision_json_round_trip_preserves_wire_shape() {
         "id": "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
         "cou_id": "COU-001",
         "recommendation": "abstain",
+        "ood_status": "borderline",
         "evidence": {
             "id": "ES-001",
             "sha256": VALID_SHA256

@@ -1,4 +1,5 @@
 import {
+  OodStatus,
   Recommendation as WireRecommendation,
   type DecisionRecord,
 } from "@bioworld/contracts";
@@ -17,7 +18,9 @@ export type DecisionRecordAdapterErrorCode =
   | "missing_evidence"
   | "missing_evidence_id"
   | "missing_rationale"
+  | "unspecified_ood_status"
   | "unspecified_recommendation"
+  | "unknown_ood_status"
   | "unknown_recommendation";
 
 export class DecisionRecordAdapterError extends Error {
@@ -107,9 +110,34 @@ function toRecommendation(value: WireRecommendation): Recommendation {
   }
 }
 
+function toDomainAssessment(
+  value: OodStatus | undefined,
+): DomainAssessment {
+  switch (value) {
+    case undefined:
+    case OodStatus.UNKNOWN:
+      return "unknown";
+    case OodStatus.IN_DOMAIN:
+      return "in_domain";
+    case OodStatus.BORDERLINE:
+      return "borderline";
+    case OodStatus.OUT_OF_DOMAIN:
+      return "out_of_domain";
+    case OodStatus.UNSPECIFIED:
+      throw new DecisionRecordAdapterError(
+        "unspecified_ood_status",
+        "Decision OOD status is unspecified",
+      );
+    default:
+      throw new DecisionRecordAdapterError(
+        "unknown_ood_status",
+        `Unknown decision OOD status: ${value}`,
+      );
+  }
+}
+
 export function toDecisionSummary(
   record: DecisionRecord,
-  domainAssessment: DomainAssessment,
 ): DecisionSummary {
   if (!uuid.test(record.decisionId)) {
     throw new DecisionRecordAdapterError(
@@ -134,6 +162,7 @@ export function toDecisionSummary(
     );
   }
   const recommendation = toRecommendation(record.recommendation);
+  const domainAssessment = toDomainAssessment(record.oodStatus);
   validateEvidenceDigest(evidence);
   const rationale = record.rationale.filter(
     (entry) => entry.trim().length > 0,

@@ -1,6 +1,6 @@
 use bioworld_contracts::{
     DecisionContractError, MAX_TENANT_ID_BYTES,
-    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, Recommendation},
+    v2::{DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodStatus, Recommendation},
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
@@ -37,6 +37,7 @@ fn complete_event() -> DecisionEvent {
                 id: "ES-001".to_owned(),
                 sha256: VALID_SHA256.to_owned(),
             }),
+            ood_status: Some(OodStatus::Unknown as i32),
         }),
     }
 }
@@ -280,9 +281,10 @@ fn projects_canonical_payload_and_round_trips_without_loss() {
             "Primary threshold was not met."
         ]),
     );
+    assert_eq!(row.payload["ood_status"], json!("unknown"));
     assert_eq!(
         row.payload_sha256,
-        "4b133dc1df588e8e5149d1011d53c43c2284ada02597a7d28978a7b1f9cb94f9"
+        "46bf4726814bddfc9d1005766bf2b68fd11932b41306ac85d8676ab23ac995e1"
     );
     assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
 }
@@ -740,6 +742,7 @@ fn canonical_hash_is_independent_of_json_object_key_order() {
                 "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "id":"ES-001"
             },
+            "ood_status":"unknown",
             "cou_id":"COU-001",
             "decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
             "aggregate_version":"18446744073709551615"
@@ -787,5 +790,73 @@ fn round_trips_every_supported_recommendation() {
 
         let row = project_decision_event(event.clone(), metadata()).unwrap();
         assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
+    }
+}
+
+#[test]
+fn round_trips_every_supported_ood_status() {
+    for (ood_status, canonical_ood_status) in [
+        (OodStatus::InDomain, "in_domain"),
+        (OodStatus::Borderline, "borderline"),
+        (OodStatus::OutOfDomain, "out_of_domain"),
+        (OodStatus::Unknown, "unknown"),
+    ] {
+        let mut event = complete_event();
+        event.decision.as_mut().unwrap().ood_status = Some(ood_status as i32);
+
+        let row = project_decision_event(event.clone(), metadata()).unwrap();
+        let canonical_payload =
+            String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap();
+        let expected_payload = format!(
+            r#"{{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"ood_status":"{canonical_ood_status}","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}}"#
+        );
+
+        assert_eq!(canonical_payload, expected_payload);
+        assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
+    }
+}
+
+#[test]
+fn historical_payload_without_ood_status_reconstructs_as_unknown_without_rehashing() {
+    const HISTORICAL_PAYLOAD_SHA256: &str =
+        "4b133dc1df588e8e5149d1011d53c43c2284ada02597a7d28978a7b1f9cb94f9";
+
+    let mut row = projected_row();
+    row.payload.as_object_mut().unwrap().remove("ood_status");
+    let historical_bytes = serde_jcs::to_vec(&row.payload).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&historical_bytes)),
+        HISTORICAL_PAYLOAD_SHA256
+    );
+    row.payload_sha256 = HISTORICAL_PAYLOAD_SHA256.to_owned();
+
+    let reconstructed = reconstruct_decision_event(&row).unwrap();
+
+    assert_eq!(
+        reconstructed.decision.unwrap().ood_status,
+        Some(OodStatus::Unknown as i32)
+    );
+    assert_eq!(row.payload_sha256, HISTORICAL_PAYLOAD_SHA256);
+}
+
+#[test]
+fn rejects_explicit_invalid_ood_status_before_persistence() {
+    for (invalid, expected) in [
+        (
+            Some(OodStatus::Unspecified as i32),
+            DecisionContractError::UnspecifiedOodStatus,
+        ),
+        (
+            Some(i32::MAX),
+            DecisionContractError::UnknownOodStatus(i32::MAX),
+        ),
+    ] {
+        let mut event = complete_event();
+        event.decision.as_mut().unwrap().ood_status = invalid;
+
+        match project_decision_event(event, metadata()).unwrap_err() {
+            EventProjectionError::InvalidDecision(actual) => assert_eq!(actual, expected),
+            other => panic!("unexpected projection error: {other:?}"),
+        }
     }
 }

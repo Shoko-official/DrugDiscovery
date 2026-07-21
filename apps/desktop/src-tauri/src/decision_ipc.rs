@@ -146,17 +146,26 @@ mod tests {
     }
 
     #[test]
-    fn injected_valid_record_round_trips_through_protobuf_payload() {
-        let input = bundled_decision_record();
-        let expected = VersionedDecisionRecord::try_from(input.clone()).unwrap();
-        let runtime = runtime_with(Ok(Some(sourced(input))));
+    fn every_ood_status_round_trips_exactly_through_protobuf_payload() {
+        for status in [
+            v2::OodStatus::InDomain,
+            v2::OodStatus::Borderline,
+            v2::OodStatus::OutOfDomain,
+            v2::OodStatus::Unknown,
+        ] {
+            let mut input = bundled_decision_record();
+            input.ood_status = Some(status as i32);
+            let expected = VersionedDecisionRecord::try_from(input.clone()).unwrap();
+            let runtime = runtime_with(Ok(Some(sourced(input))));
 
-        let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
-            .unwrap()
-            .unwrap();
-        let decoded = v2::DecisionRecord::decode(payload.protobuf.as_slice()).unwrap();
+            let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
+                .unwrap()
+                .unwrap();
+            let decoded = v2::DecisionRecord::decode(payload.protobuf.as_slice()).unwrap();
 
-        assert_eq!(decoded, v2::DecisionRecord::from(&expected));
+            assert_eq!(decoded, v2::DecisionRecord::from(&expected));
+            assert_eq!(decoded.ood_status, Some(status as i32));
+        }
     }
 
     #[test]

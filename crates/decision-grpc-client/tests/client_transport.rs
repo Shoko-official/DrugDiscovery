@@ -12,7 +12,7 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES,
     v2::{
-        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus,
         ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
         decision_service_server::{DecisionService, DecisionServiceServer},
     },
@@ -128,6 +128,11 @@ struct RecordingExecutor {
     observed: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+struct SequencedRecordingExecutor {
+    observed: Arc<Mutex<Vec<(String, String)>>>,
+    responses: Mutex<VecDeque<DecisionRecord>>,
+}
+
 struct WrongIdentityExecutor;
 
 impl TenantScopedGetDecisionExecutor for WrongIdentityExecutor {
@@ -206,6 +211,29 @@ impl TenantScopedGetDecisionExecutor for RecordingExecutor {
     }
 }
 
+impl TenantScopedGetDecisionExecutor for SequencedRecordingExecutor {
+    fn execute_get_decision(
+        &self,
+        scope: TenantScope,
+        query: GetDecisionQuery,
+    ) -> TenantScopedGetDecisionFuture<'_> {
+        self.observed
+            .lock()
+            .expect("observations lock poisoned")
+            .push((
+                scope.tenant_id().to_owned(),
+                query.decision_id().to_string(),
+            ));
+        let response = self
+            .responses
+            .lock()
+            .expect("responses lock poisoned")
+            .pop_front()
+            .expect("test response sequence exhausted");
+        Box::pin(async move { Ok(response) })
+    }
+}
+
 #[allow(deprecated)]
 fn decision_record() -> DecisionRecord {
     DecisionRecord {
@@ -219,6 +247,7 @@ fn decision_record() -> DecisionRecord {
             id: "ES-CLIENT-001".to_owned(),
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
+        ood_status: Some(OodStatus::OutOfDomain as i32),
     }
 }
 
@@ -457,15 +486,30 @@ async fn guarded<T>(future: impl Future<Output = T>) -> T {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_the_exact_decision_over_explicit_trusted_tls() {
+    let statuses = [
+        OodStatus::InDomain,
+        OodStatus::Borderline,
+        OodStatus::OutOfDomain,
+        OodStatus::Unknown,
+    ];
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let auth_calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let responses = statuses
+        .iter()
+        .map(|status| {
+            let mut response = decision_record();
+            response.ood_status = Some(*status as i32);
+            response
+        })
+        .collect();
     let server = start_server(
         ExactAuthenticator {
             calls: Arc::clone(&auth_calls),
         },
-        RecordingExecutor {
+        SequencedRecordingExecutor {
             observed: Arc::clone(&observed),
+            responses: Mutex::new(responses),
         },
     )
     .await;
@@ -479,17 +523,24 @@ async fn reads_the_exact_decision_over_explicit_trusted_tls() {
     .await
     .expect("trusted TLS client must connect");
 
-    let actual = guarded(client.get_decision(DECISION_ID)).await;
-    let actual = actual.expect("authenticated decision read must succeed");
-    assert_eq!(DecisionRecord::from(&actual), decision_record());
-    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    for expected_status in statuses {
+        let actual = guarded(client.get_decision(DECISION_ID)).await;
+        let actual = actual.expect("authenticated decision read must succeed");
+        let actual = DecisionRecord::from(&actual);
+        let mut expected = decision_record();
+        expected.ood_status = Some(expected_status as i32);
+
+        assert_eq!(actual.ood_status, Some(expected_status as i32));
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(provider_calls.load(Ordering::SeqCst), statuses.len());
+    assert_eq!(auth_calls.load(Ordering::SeqCst), statuses.len());
     assert_eq!(
         observed
             .lock()
             .expect("observations lock poisoned")
             .as_slice(),
-        &[("tenant-a".to_owned(), DECISION_ID.to_owned())],
+        vec![("tenant-a".to_owned(), DECISION_ID.to_owned()); statuses.len()],
     );
 
     server.stop().await;
