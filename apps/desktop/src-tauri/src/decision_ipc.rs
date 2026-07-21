@@ -92,7 +92,7 @@ mod tests {
     use super::read_current_decision_from;
     use crate::decision_runtime::{
         CurrentDecisionSource, DecisionProvenance, DecisionReadFuture, DecisionRuntime,
-        DecisionRuntimeError, SourcedDecision, bundled_decision_record,
+        DecisionRuntimeError, SourcedDecision, bundled_decision_record, bundled_runtime,
     };
 
     #[derive(Clone)]
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn bundled_runtime_returns_stable_sourced_decision() {
-        let runtime = DecisionRuntime::bundled();
+        let runtime = bundled_runtime();
         let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
             .unwrap()
             .unwrap();
@@ -216,7 +216,7 @@ mod tests {
         fn assert_runtime<T: Clone + Send + Sync>() {}
         assert_runtime::<DecisionRuntime>();
 
-        let runtime = DecisionRuntime::bundled();
+        let runtime = bundled_runtime();
         let cloned = runtime.clone();
         let payload = tauri::async_runtime::block_on(read_current_decision_from(&cloned))
             .unwrap()

@@ -1,61 +1,13 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use bioworld_contracts::v2;
+#[cfg(test)]
+pub(crate) use bioworld_desktop_core::DecisionRuntimeError;
+pub(crate) use bioworld_desktop_core::{
+    CurrentDecisionSource, DecisionProvenance, DecisionReadFuture, DecisionRuntime, SourcedDecision,
+};
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecisionProvenance {
-    BundledSample,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SourcedDecision {
-    record: v2::DecisionRecord,
-    provenance: DecisionProvenance,
-}
-
-impl SourcedDecision {
-    pub(crate) fn new(record: v2::DecisionRecord, provenance: DecisionProvenance) -> Self {
-        Self { record, provenance }
-    }
-
-    pub(crate) fn into_parts(self) -> (v2::DecisionRecord, DecisionProvenance) {
-        (self.record, self.provenance)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DecisionRuntimeError;
-
-pub(crate) type DecisionReadFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<Option<SourcedDecision>, DecisionRuntimeError>> + Send + 'a>,
->;
-
-pub(crate) trait CurrentDecisionSource: Send + Sync {
-    fn read_current_decision(&self) -> DecisionReadFuture<'_>;
-}
-
-#[derive(Clone)]
-pub(crate) struct DecisionRuntime {
-    source: Arc<dyn CurrentDecisionSource>,
-}
-
-impl DecisionRuntime {
-    pub(crate) fn from_source(source: Arc<dyn CurrentDecisionSource>) -> Self {
-        Self { source }
-    }
-
-    pub(crate) fn bundled() -> Self {
-        Self::from_source(Arc::new(BundledDecisionSource))
-    }
-
-    pub(crate) async fn read_current_decision(
-        &self,
-    ) -> Result<Option<SourcedDecision>, DecisionRuntimeError> {
-        self.source.read_current_decision().await
-    }
-}
 
 struct BundledDecisionSource;
 
@@ -68,6 +20,10 @@ impl CurrentDecisionSource for BundledDecisionSource {
             )))
         })
     }
+}
+
+pub(crate) fn bundled_runtime() -> DecisionRuntime {
+    DecisionRuntime::from_source(Arc::new(BundledDecisionSource))
 }
 
 #[allow(deprecated)]
