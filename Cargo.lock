@@ -150,6 +150,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bioworld-decision-grpc-postgres"
+version = "0.1.0"
+dependencies = [
+ "bioworld-contracts",
+ "bioworld-decision-grpc",
+ "bioworld-decision-query",
+ "bioworld-event-store-contracts",
+ "bioworld-event-store-postgres",
+ "tokio",
+ "tokio-postgres",
+ "tonic",
+]
+
+[[package]]
 name = "bioworld-decision-query"
 version = "0.1.0"
 dependencies = [

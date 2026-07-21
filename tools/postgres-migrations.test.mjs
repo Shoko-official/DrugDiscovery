@@ -226,21 +226,19 @@ function assertRunsAllPostgresIntegrationTests(args) {
   assert.notEqual(cargoIndex, -1);
   const cargoArgs = args.slice(cargoIndex + 1);
   assert.equal(cargoArgs[0], "test");
-  const packageIndex = ["-p", "--package"]
-    .map((flag) => cargoArgs.lastIndexOf(flag))
-    .find((index) => index >= 0);
-  assert.notEqual(packageIndex, undefined);
-  assert.equal(
-    cargoArgs[packageIndex + 1],
-    "bioworld-event-store-postgres",
-  );
-
-  const namedTests = [];
+  const packages = [];
   for (let index = 0; index < cargoArgs.length; index += 1) {
-    if (cargoArgs[index] === "--test") {
-      namedTests.push(cargoArgs[index + 1]);
+    if (["-p", "--package"].includes(cargoArgs[index])) {
+      packages.push(cargoArgs[index + 1]);
     }
   }
+  assert.deepEqual(
+    new Set(packages),
+    new Set([
+      "bioworld-event-store-postgres",
+      "bioworld-decision-grpc-postgres",
+    ]),
+  );
 
   const runsAllPackageTargets =
     !cargoArgs.includes("--test") &&
@@ -248,13 +246,10 @@ function assertRunsAllPostgresIntegrationTests(args) {
       ["--lib", "--bins", "--examples", "--doc"].includes(argument),
     );
   const runsAllIntegrationTargets = cargoArgs.includes("--tests");
-  const runsBothNamedTargets =
-    namedTests.includes("postgres_writer") &&
-    namedTests.includes("postgres_reader");
 
   assert.ok(
-    runsAllPackageTargets || runsAllIntegrationTargets || runsBothNamedTargets,
-    "cargo test command must cover postgres_writer and postgres_reader",
+    runsAllPackageTargets || runsAllIntegrationTargets,
+    "cargo test command must cover every PostgreSQL integration target",
   );
 }
 
@@ -289,14 +284,28 @@ test("pins the exact Rust 1.95 Bookworm integration image digest", () => {
   assert.equal(RUST_INTEGRATION_IMAGE, EXPECTED_RUST_IMAGE);
 });
 
-test("requires the exact event store package for PostgreSQL integration tests", () => {
+test("requires both PostgreSQL integration packages", () => {
   assert.throws(() =>
     assertRunsAllPostgresIntegrationTests([
       "cargo",
       "test",
       "--package",
-      "different-package",
+      "bioworld-event-store-postgres",
       "--tests",
+    ]),
+  );
+  assert.throws(() =>
+    assertRunsAllPostgresIntegrationTests([
+      "cargo",
+      "test",
+      "--package",
+      "bioworld-event-store-postgres",
+      "--package",
+      "bioworld-decision-grpc-postgres",
+      "--test",
+      "postgres_writer",
+      "--test",
+      "postgres_reader",
     ]),
   );
   assert.doesNotThrow(() =>
@@ -305,6 +314,8 @@ test("requires the exact event store package for PostgreSQL integration tests", 
       "test",
       "--package",
       "bioworld-event-store-postgres",
+      "--package",
+      "bioworld-decision-grpc-postgres",
       "--tests",
     ]),
   );
