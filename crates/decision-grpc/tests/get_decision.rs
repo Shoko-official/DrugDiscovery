@@ -9,8 +9,9 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
-use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation,
+use bioworld_contracts::{
+    MAX_DECISION_WIRE_BYTES, MAX_TENANT_ID_BYTES,
+    v2::{DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, Recommendation},
 };
 use bioworld_decision_grpc::{
     InvalidTenantScope, TenantScope, TenantScopedGetDecisionExecutor,
@@ -155,6 +156,25 @@ fn rejects_invalid_request_before_executor_access() {
 }
 
 #[test]
+fn rejects_oversized_executor_responses_with_a_fixed_status() {
+    let sensitive = "x".repeat(MAX_DECISION_WIRE_BYTES + 1);
+    let mut response = record(1);
+    response.rationale = vec![sensitive.clone()];
+    let (executor, calls, _) = executor(Ok(response));
+
+    let status = block_on_ready(get_decision(&executor, scope("trusted-tenant"), request()))
+        .expect_err("oversized executor response must fail");
+
+    assert_public_status(
+        &status,
+        Code::Unavailable,
+        "decision service is unavailable",
+    );
+    assert!(!format!("{status:?} {status}").contains(&sensitive));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn keeps_the_same_query_distinct_across_scopes() {
     let (executor, calls, observed) = executor(Ok(record(7)));
 
@@ -186,6 +206,21 @@ fn rejects_invalid_trusted_scopes_without_reflection() {
         assert_eq!(error.to_string(), "tenant scope is invalid");
         assert_error(error);
     }
+}
+
+#[test]
+fn bounds_trusted_tenant_scopes() {
+    let exact = "t".repeat(MAX_TENANT_ID_BYTES);
+    let oversized = "t".repeat(MAX_TENANT_ID_BYTES + 1);
+
+    assert_eq!(
+        TenantScope::try_from_trusted_tenant_id(exact)
+            .unwrap()
+            .tenant_id()
+            .len(),
+        MAX_TENANT_ID_BYTES,
+    );
+    assert!(TenantScope::try_from_trusted_tenant_id(oversized).is_err());
 }
 
 #[test]

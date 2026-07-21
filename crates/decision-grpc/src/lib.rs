@@ -2,7 +2,10 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
-use bioworld_contracts::v2::{DecisionRecord, GetDecisionRequest};
+use bioworld_contracts::{
+    VersionedDecisionRecord, tenant_id_is_valid,
+    v2::{DecisionRecord, GetDecisionRequest},
+};
 use bioworld_decision_query::{
     GetDecisionQuery, GetDecisionRequestError, GetDecisionRequestExecutionError,
 };
@@ -20,7 +23,7 @@ pub struct TenantScope(Box<str>);
 
 impl TenantScope {
     pub fn try_from_trusted_tenant_id(tenant_id: String) -> Result<Self, InvalidTenantScope> {
-        if tenant_id.is_empty() || tenant_id.trim() != tenant_id || tenant_id.contains('\0') {
+        if !tenant_id_is_valid(&tenant_id) {
             return Err(InvalidTenantScope);
         }
 
@@ -70,11 +73,14 @@ where
         }
     };
 
-    executor
+    let decision = executor
         .execute_get_decision(scope, query)
         .await
-        .map(Response::new)
-        .map_err(map_status)
+        .map_err(map_status)?;
+    let boundary = VersionedDecisionRecord::try_from(decision)
+        .map_err(|_| Status::unavailable("decision service is unavailable"))?;
+
+    Ok(Response::new(DecisionRecord::from(&boundary)))
 }
 
 fn map_status(error: GetDecisionRequestExecutionError) -> Status {

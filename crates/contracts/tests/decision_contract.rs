@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use bioworld_contracts::{
-    DecisionContractError, VersionedDecisionRecord,
+    DecisionContractError, MAX_DECISION_WIRE_BYTES, VersionedDecisionRecord,
     v2::{DecisionRecord, EvidenceSnapshotRef, Recommendation},
 };
 use bioworld_domain::{DomainError, Recommendation as DomainRecommendation};
@@ -23,6 +23,41 @@ fn complete_wire_record() -> DecisionRecord {
             sha256: VALID_SHA256.to_owned(),
         }),
     }
+}
+
+fn record_with_encoded_len(target: usize) -> DecisionRecord {
+    let mut record = complete_wire_record();
+    let mut rationale_bytes = target;
+
+    for _ in 0..4 {
+        record.rationale = vec!["r".repeat(rationale_bytes)];
+        match record.encoded_len().cmp(&target) {
+            std::cmp::Ordering::Equal => return record,
+            std::cmp::Ordering::Less => rationale_bytes += target - record.encoded_len(),
+            std::cmp::Ordering::Greater => rationale_bytes -= record.encoded_len() - target,
+        }
+    }
+
+    panic!("could not construct target wire size");
+}
+
+#[test]
+fn bounds_decision_wire_records_before_conversion() {
+    let exact = record_with_encoded_len(MAX_DECISION_WIRE_BYTES);
+    let oversized = record_with_encoded_len(MAX_DECISION_WIRE_BYTES + 1);
+
+    assert_eq!(exact.encoded_len(), MAX_DECISION_WIRE_BYTES);
+    assert_eq!(oversized.encoded_len(), MAX_DECISION_WIRE_BYTES + 1);
+    assert_eq!(
+        VersionedDecisionRecord::try_from(exact),
+        Err(DecisionContractError::InvalidDomain(
+            DomainError::RationaleTooLarge,
+        )),
+    );
+    assert_eq!(
+        VersionedDecisionRecord::try_from(oversized),
+        Err(DecisionContractError::DecisionTooLarge),
+    );
 }
 
 #[test]

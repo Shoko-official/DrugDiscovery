@@ -1,25 +1,53 @@
 use bioworld_domain::{
-    DecisionRecord, DomainError, EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES, Recommendation,
+    DecisionRecord, DomainError, EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES,
+    MAX_DECISION_IDENTIFIER_CHARS, MAX_DECISION_RATIONALE_ITEM_BYTES, MAX_DECISION_RATIONALE_ITEMS,
+    MAX_DECISION_RATIONALE_TOTAL_BYTES, Recommendation,
 };
 use uuid::Uuid;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[test]
-fn bounds_cou_identifiers_in_bytes() {
+fn bounds_cou_identifiers() {
     let evidence =
         EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let exact_id = "\u{10000}".repeat(MAX_DECISION_IDENTIFIER_CHARS);
 
     let exact = DecisionRecord::try_new(
         Uuid::now_v7(),
-        "c".repeat(MAX_DECISION_IDENTIFIER_BYTES),
+        exact_id.clone(),
         Recommendation::Abstain,
         evidence.clone(),
         vec!["Bounded rationale.".to_owned()],
     );
     let oversized = DecisionRecord::try_new(
         Uuid::now_v7(),
-        "c".repeat(MAX_DECISION_IDENTIFIER_BYTES + 1),
+        format!("{exact_id}x"),
+        Recommendation::Abstain,
+        evidence,
+        vec!["Bounded rationale.".to_owned()],
+    );
+
+    assert_eq!(exact_id.len(), MAX_DECISION_IDENTIFIER_BYTES);
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::InvalidCouId));
+}
+
+#[test]
+fn rejects_identifier_character_count_plus_one() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "c".repeat(MAX_DECISION_IDENTIFIER_CHARS),
+        Recommendation::Abstain,
+        evidence.clone(),
+        vec!["Bounded rationale.".to_owned()],
+    );
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "c".repeat(MAX_DECISION_IDENTIFIER_CHARS + 1),
         Recommendation::Abstain,
         evidence,
         vec!["Bounded rationale.".to_owned()],
@@ -27,6 +55,157 @@ fn bounds_cou_identifiers_in_bytes() {
 
     assert!(exact.is_ok());
     assert_eq!(oversized, Err(DomainError::InvalidCouId));
+}
+
+#[test]
+fn bounds_evidence_identifiers_in_bytes() {
+    let exact_id = "\u{10000}".repeat(MAX_DECISION_IDENTIFIER_CHARS);
+    let exact = EvidenceSnapshotRef::try_new(exact_id.clone(), VALID_SHA256.to_owned());
+    let oversized = EvidenceSnapshotRef::try_new(format!("{exact_id}x"), VALID_SHA256.to_owned());
+
+    assert_eq!(exact_id.len(), MAX_DECISION_IDENTIFIER_BYTES);
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::InvalidEvidenceId));
+}
+
+#[test]
+fn rejects_noncanonical_decision_identifiers() {
+    for identifier in ["", " ", " leading", "trailing ", "nul\0byte"] {
+        let evidence =
+            EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+        assert_eq!(
+            DecisionRecord::try_new(
+                Uuid::now_v7(),
+                identifier.to_owned(),
+                Recommendation::Abstain,
+                evidence,
+                vec!["Bounded rationale.".to_owned()],
+            ),
+            Err(DomainError::InvalidCouId),
+        );
+        assert_eq!(
+            EvidenceSnapshotRef::try_new(identifier.to_owned(), VALID_SHA256.to_owned()),
+            Err(DomainError::InvalidEvidenceId),
+        );
+    }
+}
+
+#[test]
+fn bounds_rationale_item_count() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let rationale = vec!["r".to_owned(); MAX_DECISION_RATIONALE_ITEMS];
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence.clone(),
+        rationale.clone(),
+    );
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        [rationale, vec!["r".to_owned()]].concat(),
+    );
+
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::TooManyRationales));
+}
+
+#[test]
+fn bounds_each_rationale_in_bytes() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence.clone(),
+        vec!["r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES)],
+    );
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        vec!["r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES + 1)],
+    );
+
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::RationaleTooLarge));
+}
+
+#[test]
+fn rejects_nul_in_rationales() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+
+    let result = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        vec!["invalid\0rationale".to_owned()],
+    );
+
+    assert_eq!(result, Err(DomainError::InvalidRationale));
+}
+
+#[test]
+fn bounds_total_rationale_bytes() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let item_count = MAX_DECISION_RATIONALE_TOTAL_BYTES / MAX_DECISION_RATIONALE_ITEM_BYTES;
+    let rationale = vec!["r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES); item_count];
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence.clone(),
+        rationale.clone(),
+    );
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        [rationale, vec!["r".to_owned()]].concat(),
+    );
+
+    assert!(exact.is_ok());
+    assert_eq!(oversized, Err(DomainError::RationaleBudgetExceeded));
+}
+
+#[test]
+fn counts_blank_rationales_without_normalizing_them() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let mut rationale = vec![" ".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES); 8];
+    rationale[0] = "r".repeat(MAX_DECISION_RATIONALE_ITEM_BYTES);
+
+    let exact = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence.clone(),
+        rationale.clone(),
+    )
+    .unwrap();
+    let oversized = DecisionRecord::try_new(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        evidence,
+        [rationale.clone(), vec![" ".to_owned()]].concat(),
+    );
+
+    assert_eq!(exact.rationale(), rationale);
+    assert_eq!(oversized, Err(DomainError::RationaleBudgetExceeded));
 }
 
 #[test]
@@ -159,6 +338,28 @@ fn rejects_decision_json_without_rationale() {
         error
             .to_string()
             .contains("a qualified decision requires at least one rationale")
+    );
+}
+
+#[test]
+fn decision_json_enforces_size_bounds() {
+    let json = serde_json::json!({
+        "id": Uuid::now_v7(),
+        "cou_id": "c".repeat(MAX_DECISION_IDENTIFIER_CHARS + 1),
+        "recommendation": "abstain",
+        "evidence": {
+            "id": "ES-001",
+            "sha256": VALID_SHA256
+        },
+        "rationale": ["Evidence coverage is incomplete."]
+    });
+
+    let error = serde_json::from_value::<DecisionRecord>(json).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("context of use identifier is invalid")
     );
 }
 
