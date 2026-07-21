@@ -15,8 +15,12 @@ use tonic::{Extensions, Request, Response, Status, metadata::MetadataMap};
 
 use crate::{TenantScope, TenantScopedGetDecisionExecutor, get_decision};
 
-const MAX_IN_FLIGHT_REQUESTS: usize = 4_096;
-const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Hard ceiling for admitted decision RPCs across one service instance.
+pub const MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS: usize = 4_096;
+/// Hard ceiling for one authenticated decision RPC.
+pub const MAX_DECISION_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Stable public message for an expired decision RPC.
+pub const DECISION_GRPC_REQUEST_DEADLINE_MESSAGE: &str = "decision request deadline exceeded";
 
 pub struct TenantAuthenticationContext<'request> {
     metadata: &'request MetadataMap,
@@ -127,9 +131,9 @@ impl DecisionGrpcServiceConfig {
     ) -> Result<Self, InvalidDecisionGrpcServiceConfig> {
         let max_in_flight =
             NonZeroUsize::new(max_in_flight).ok_or(InvalidDecisionGrpcServiceConfig)?;
-        if max_in_flight.get() > MAX_IN_FLIGHT_REQUESTS
+        if max_in_flight.get() > MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS
             || request_timeout.is_zero()
-            || request_timeout > MAX_REQUEST_TIMEOUT
+            || request_timeout > MAX_DECISION_GRPC_REQUEST_TIMEOUT
         {
             return Err(InvalidDecisionGrpcServiceConfig);
         }
@@ -174,6 +178,11 @@ impl<A, E> DecisionGrpcService<A, E> {
             .max_decoding_message_size(MAX_DECISION_WIRE_BYTES)
             .max_encoding_message_size(MAX_DECISION_WIRE_BYTES)
     }
+
+    /// Returns the fixed request deadline enforced by this service instance.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
 }
 
 #[tonic::async_trait]
@@ -204,7 +213,7 @@ where
             get_decision(&self.executor, scope, request).await
         })
         .await
-        .map_err(|_| Status::deadline_exceeded("decision request deadline exceeded"))?
+        .map_err(|_| Status::deadline_exceeded(DECISION_GRPC_REQUEST_DEADLINE_MESSAGE))?
     }
 
     async fn propose_decision(

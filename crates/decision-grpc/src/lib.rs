@@ -14,9 +14,10 @@ use tonic::{Request, Response, Status};
 mod service;
 
 pub use service::{
-    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig, TenantAuthenticationContext,
-    TenantAuthenticator,
+    AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,
+    DecisionGrpcService, DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig,
+    MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS, MAX_DECISION_GRPC_REQUEST_TIMEOUT,
+    TenantAuthenticationContext, TenantAuthenticator,
 };
 
 pub struct TenantScope(Box<str>);
