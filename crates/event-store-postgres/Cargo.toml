@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 bioworld-contracts = { path = "../contracts" }
+bioworld-decision-query = { path = "../decision-query" }
 bioworld-event-store-contracts = { path = "../event-store-contracts" }
 serde_json.workspace = true
 thiserror.workspace = true

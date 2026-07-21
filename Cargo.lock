@@ -203,6 +203,7 @@ name = "bioworld-event-store-postgres"
 version = "0.1.0"
 dependencies = [
  "bioworld-contracts",
+ "bioworld-decision-query",
  "bioworld-event-store-contracts",
  "chrono",
  "serde_json",
