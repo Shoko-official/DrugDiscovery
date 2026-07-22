@@ -58,6 +58,7 @@ fn record() -> DecisionRecord {
         ood_detector: None,
         prediction_interval: None,
         prediction_positions: Vec::new(),
+        decision_criterion: None,
     }
 }
 

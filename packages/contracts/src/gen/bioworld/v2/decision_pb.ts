@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file bioworld/v2/decision.proto.
  */
 export const file_bioworld_v2_decision: GenFile = /*@__PURE__*/
-  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAkiPwoOT29kRGV0ZWN0b3JSZWYSEwoLZGV0ZWN0b3JfaWQYASABKAkSGAoQZGV0ZWN0b3JfdmVyc2lvbhgCIAEoCSLKAgoaRGVjaXNpb25QcmVkaWN0aW9uSW50ZXJ2YWwSDgoGdGFyZ2V0GAEgASgJEgwKBHVuaXQYAiABKAkSFQoNbG93ZXJfZGVjaW1hbBgDIAEoCRIVCg11cHBlcl9kZWNpbWFsGAQgASgJEiAKGG5vbWluYWxfY292ZXJhZ2VfZGVjaW1hbBgFIAEoCRIaChJpbnRlcnZhbF9tZXRob2RfaWQYBiABKAkSHwoXaW50ZXJ2YWxfbWV0aG9kX3ZlcnNpb24YByABKAkSHQoVY2FsaWJyYXRpb25fbWV0aG9kX2lkGAggASgJEiIKGmNhbGlicmF0aW9uX21ldGhvZF92ZXJzaW9uGAkgASgJEj4KFGNhbGlicmF0aW9uX2V2aWRlbmNlGAogASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiLeAQoaRGVjaXNpb25QcmVkaWN0aW9uUG9zaXRpb24SEQoJc291cmNlX2lkGAEgASgJEhYKDnNvdXJjZV92ZXJzaW9uGAIgASgJEhsKE2RlcGVuZGVuY3lfZ3JvdXBfaWQYAyABKAkSOQoIaW50ZXJ2YWwYBCABKAsyJy5iaW93b3JsZC52Mi5EZWNpc2lvblByZWRpY3Rpb25JbnRlcnZhbBI9ChNwcmVkaWN0aW9uX2V2aWRlbmNlGAUgASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiLuAwoORGVjaXNpb25SZWNvcmQSEwoLZGVjaXNpb25faWQYASABKAkSDgoGY291X2lkGAIgASgJEiAKFGV2aWRlbmNlX3NuYXBzaG90X2lkGAMgASgJQgIYARIzCg5yZWNvbW1lbmRhdGlvbhgEIAEoDjIbLmJpb3dvcmxkLnYyLlJlY29tbWVuZGF0aW9uEhEKCXJhdGlvbmFsZRgFIAMoCRIZChFhZ2dyZWdhdGVfdmVyc2lvbhgGIAEoBBIyCghldmlkZW5jZRgHIAEoCzIgLmJpb3dvcmxkLnYyLkV2aWRlbmNlU25hcHNob3RSZWYSLwoKb29kX3N0YXR1cxgIIAEoDjIWLmJpb3dvcmxkLnYyLk9vZFN0YXR1c0gAiAEBEjEKDG9vZF9kZXRlY3RvchgJIAEoCzIbLmJpb3dvcmxkLnYyLk9vZERldGVjdG9yUmVmEkQKE3ByZWRpY3Rpb25faW50ZXJ2YWwYCiABKAsyJy5iaW93b3JsZC52Mi5EZWNpc2lvblByZWRpY3Rpb25JbnRlcnZhbBJFChRwcmVkaWN0aW9uX3Bvc2l0aW9ucxgLIAMoCzInLmJpb3dvcmxkLnYyLkRlY2lzaW9uUHJlZGljdGlvblBvc2l0aW9uQg0KC19vb2Rfc3RhdHVzIlAKDURlY2lzaW9uRXZlbnQSLQoIZGVjaXNpb24YASABKAsyGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBIQCghldmVudF9pZBgCIAEoCSq+AQoOUmVjb21tZW5kYXRpb24SHgoaUkVDT01NRU5EQVRJT05fVU5TUEVDSUZJRUQQABIaChZSRUNPTU1FTkRBVElPTl9QUk9NT1RFEAESGQoVUkVDT01NRU5EQVRJT05fUkVKRUNUEAISGgoWUkVDT01NRU5EQVRJT05fQUJTVEFJThADEhgKFFJFQ09NTUVOREFUSU9OX0RFRkVSEAQSHwobUkVDT01NRU5EQVRJT05fU1RPUF9QUk9HUkFNEAUqkgEKCU9vZFN0YXR1cxIaChZPT0RfU1RBVFVTX1VOU1BFQ0lGSUVEEAASGAoUT09EX1NUQVRVU19JTl9ET01BSU4QARIZChVPT0RfU1RBVFVTX0JPUkRFUkxJTkUQAhIcChhPT0RfU1RBVFVTX09VVF9PRl9ET01BSU4QAxIWChJPT0RfU1RBVFVTX1VOS05PV04QBDKFAgoPRGVjaXNpb25TZXJ2aWNlEksKC0dldERlY2lzaW9uEh8uYmlvd29ybGQudjIuR2V0RGVjaXNpb25SZXF1ZXN0GhsuYmlvd29ybGQudjIuRGVjaXNpb25SZWNvcmQSUwoPUHJvcG9zZURlY2lzaW9uEiMuYmlvd29ybGQudjIuUHJvcG9zZURlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElAKDVdhdGNoRGVjaXNpb24SIS5iaW93b3JsZC52Mi5XYXRjaERlY2lzaW9uUmVxdWVzdBoaLmJpb3dvcmxkLnYyLkRlY2lzaW9uRXZlbnQwAWIGcHJvdG8z");
+  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAkiPwoOT29kRGV0ZWN0b3JSZWYSEwoLZGV0ZWN0b3JfaWQYASABKAkSGAoQZGV0ZWN0b3JfdmVyc2lvbhgCIAEoCSLKAgoaRGVjaXNpb25QcmVkaWN0aW9uSW50ZXJ2YWwSDgoGdGFyZ2V0GAEgASgJEgwKBHVuaXQYAiABKAkSFQoNbG93ZXJfZGVjaW1hbBgDIAEoCRIVCg11cHBlcl9kZWNpbWFsGAQgASgJEiAKGG5vbWluYWxfY292ZXJhZ2VfZGVjaW1hbBgFIAEoCRIaChJpbnRlcnZhbF9tZXRob2RfaWQYBiABKAkSHwoXaW50ZXJ2YWxfbWV0aG9kX3ZlcnNpb24YByABKAkSHQoVY2FsaWJyYXRpb25fbWV0aG9kX2lkGAggASgJEiIKGmNhbGlicmF0aW9uX21ldGhvZF92ZXJzaW9uGAkgASgJEj4KFGNhbGlicmF0aW9uX2V2aWRlbmNlGAogASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiLeAQoaRGVjaXNpb25QcmVkaWN0aW9uUG9zaXRpb24SEQoJc291cmNlX2lkGAEgASgJEhYKDnNvdXJjZV92ZXJzaW9uGAIgASgJEhsKE2RlcGVuZGVuY3lfZ3JvdXBfaWQYAyABKAkSOQoIaW50ZXJ2YWwYBCABKAsyJy5iaW93b3JsZC52Mi5EZWNpc2lvblByZWRpY3Rpb25JbnRlcnZhbBI9ChNwcmVkaWN0aW9uX2V2aWRlbmNlGAUgASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiLbAQoRRGVjaXNpb25Dcml0ZXJpb24SFAoMY3JpdGVyaW9uX2lkGAEgASgJEhkKEWNyaXRlcmlvbl92ZXJzaW9uGAIgASgJEjwKCmNvbXBhcmF0b3IYAyABKA4yKC5iaW93b3JsZC52Mi5EZWNpc2lvbkNyaXRlcmlvbkNvbXBhcmF0b3ISGQoRdGhyZXNob2xkX2RlY2ltYWwYBCABKAkSPAoSY3JpdGVyaW9uX2V2aWRlbmNlGAUgASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiKqBAoORGVjaXNpb25SZWNvcmQSEwoLZGVjaXNpb25faWQYASABKAkSDgoGY291X2lkGAIgASgJEiAKFGV2aWRlbmNlX3NuYXBzaG90X2lkGAMgASgJQgIYARIzCg5yZWNvbW1lbmRhdGlvbhgEIAEoDjIbLmJpb3dvcmxkLnYyLlJlY29tbWVuZGF0aW9uEhEKCXJhdGlvbmFsZRgFIAMoCRIZChFhZ2dyZWdhdGVfdmVyc2lvbhgGIAEoBBIyCghldmlkZW5jZRgHIAEoCzIgLmJpb3dvcmxkLnYyLkV2aWRlbmNlU25hcHNob3RSZWYSLwoKb29kX3N0YXR1cxgIIAEoDjIWLmJpb3dvcmxkLnYyLk9vZFN0YXR1c0gAiAEBEjEKDG9vZF9kZXRlY3RvchgJIAEoCzIbLmJpb3dvcmxkLnYyLk9vZERldGVjdG9yUmVmEkQKE3ByZWRpY3Rpb25faW50ZXJ2YWwYCiABKAsyJy5iaW93b3JsZC52Mi5EZWNpc2lvblByZWRpY3Rpb25JbnRlcnZhbBJFChRwcmVkaWN0aW9uX3Bvc2l0aW9ucxgLIAMoCzInLmJpb3dvcmxkLnYyLkRlY2lzaW9uUHJlZGljdGlvblBvc2l0aW9uEjoKEmRlY2lzaW9uX2NyaXRlcmlvbhgMIAEoCzIeLmJpb3dvcmxkLnYyLkRlY2lzaW9uQ3JpdGVyaW9uQg0KC19vb2Rfc3RhdHVzIlAKDURlY2lzaW9uRXZlbnQSLQoIZGVjaXNpb24YASABKAsyGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBIQCghldmVudF9pZBgCIAEoCSq+AQoOUmVjb21tZW5kYXRpb24SHgoaUkVDT01NRU5EQVRJT05fVU5TUEVDSUZJRUQQABIaChZSRUNPTU1FTkRBVElPTl9QUk9NT1RFEAESGQoVUkVDT01NRU5EQVRJT05fUkVKRUNUEAISGgoWUkVDT01NRU5EQVRJT05fQUJTVEFJThADEhgKFFJFQ09NTUVOREFUSU9OX0RFRkVSEAQSHwobUkVDT01NRU5EQVRJT05fU1RPUF9QUk9HUkFNEAUqkgEKCU9vZFN0YXR1cxIaChZPT0RfU1RBVFVTX1VOU1BFQ0lGSUVEEAASGAoUT09EX1NUQVRVU19JTl9ET01BSU4QARIZChVPT0RfU1RBVFVTX0JPUkRFUkxJTkUQAhIcChhPT0RfU1RBVFVTX09VVF9PRl9ET01BSU4QAxIWChJPT0RfU1RBVFVTX1VOS05PV04QBCqYAgobRGVjaXNpb25Dcml0ZXJpb25Db21wYXJhdG9yEi0KKURFQ0lTSU9OX0NSSVRFUklPTl9DT01QQVJBVE9SX1VOU1BFQ0lGSUVEEAASKwonREVDSVNJT05fQ1JJVEVSSU9OX0NPTVBBUkFUT1JfTEVTU19USEFOEAESNAowREVDSVNJT05fQ1JJVEVSSU9OX0NPTVBBUkFUT1JfTEVTU19USEFOX09SX0VRVUFMEAISLgoqREVDSVNJT05fQ1JJVEVSSU9OX0NPTVBBUkFUT1JfR1JFQVRFUl9USEFOEAMSNwozREVDSVNJT05fQ1JJVEVSSU9OX0NPTVBBUkFUT1JfR1JFQVRFUl9USEFOX09SX0VRVUFMEAQyhQIKD0RlY2lzaW9uU2VydmljZRJLCgtHZXREZWNpc2lvbhIfLmJpb3dvcmxkLnYyLkdldERlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElMKD1Byb3Bvc2VEZWNpc2lvbhIjLmJpb3dvcmxkLnYyLlByb3Bvc2VEZWNpc2lvblJlcXVlc3QaGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBJQCg1XYXRjaERlY2lzaW9uEiEuYmlvd29ybGQudjIuV2F0Y2hEZWNpc2lvblJlcXVlc3QaGi5iaW93b3JsZC52Mi5EZWNpc2lvbkV2ZW50MAFiBnByb3RvMw");
 
 /**
  * @generated from message bioworld.v2.GetDecisionRequest
@@ -227,6 +227,46 @@ export const DecisionPredictionPositionSchema: GenMessage<DecisionPredictionPosi
   messageDesc(file_bioworld_v2_decision, 6);
 
 /**
+ * @generated from message bioworld.v2.DecisionCriterion
+ */
+export type DecisionCriterion = Message<"bioworld.v2.DecisionCriterion"> & {
+  /**
+   * The comparator relates the named prediction target to threshold_decimal.
+   * Target and unit are inherited from DecisionRecord.prediction_interval.
+   *
+   * @generated from field: string criterion_id = 1;
+   */
+  criterionId: string;
+
+  /**
+   * @generated from field: string criterion_version = 2;
+   */
+  criterionVersion: string;
+
+  /**
+   * @generated from field: bioworld.v2.DecisionCriterionComparator comparator = 3;
+   */
+  comparator: DecisionCriterionComparator;
+
+  /**
+   * @generated from field: string threshold_decimal = 4;
+   */
+  thresholdDecimal: string;
+
+  /**
+   * @generated from field: bioworld.v2.EvidenceSnapshotRef criterion_evidence = 5;
+   */
+  criterionEvidence?: EvidenceSnapshotRef | undefined;
+};
+
+/**
+ * Describes the message bioworld.v2.DecisionCriterion.
+ * Use `create(DecisionCriterionSchema)` to create a new message.
+ */
+export const DecisionCriterionSchema: GenMessage<DecisionCriterion> = /*@__PURE__*/
+  messageDesc(file_bioworld_v2_decision, 7);
+
+/**
  * @generated from message bioworld.v2.DecisionRecord
  */
 export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
@@ -285,6 +325,11 @@ export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
    * @generated from field: repeated bioworld.v2.DecisionPredictionPosition prediction_positions = 11;
    */
   predictionPositions: DecisionPredictionPosition[];
+
+  /**
+   * @generated from field: bioworld.v2.DecisionCriterion decision_criterion = 12;
+   */
+  decisionCriterion?: DecisionCriterion | undefined;
 };
 
 /**
@@ -292,7 +337,7 @@ export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
  * Use `create(DecisionRecordSchema)` to create a new message.
  */
 export const DecisionRecordSchema: GenMessage<DecisionRecord> = /*@__PURE__*/
-  messageDesc(file_bioworld_v2_decision, 7);
+  messageDesc(file_bioworld_v2_decision, 8);
 
 /**
  * @generated from message bioworld.v2.DecisionEvent
@@ -314,7 +359,7 @@ export type DecisionEvent = Message<"bioworld.v2.DecisionEvent"> & {
  * Use `create(DecisionEventSchema)` to create a new message.
  */
 export const DecisionEventSchema: GenMessage<DecisionEvent> = /*@__PURE__*/
-  messageDesc(file_bioworld_v2_decision, 8);
+  messageDesc(file_bioworld_v2_decision, 9);
 
 /**
  * @generated from enum bioworld.v2.Recommendation
@@ -392,6 +437,42 @@ export enum OodStatus {
  */
 export const OodStatusSchema: GenEnum<OodStatus> = /*@__PURE__*/
   enumDesc(file_bioworld_v2_decision, 1);
+
+/**
+ * @generated from enum bioworld.v2.DecisionCriterionComparator
+ */
+export enum DecisionCriterionComparator {
+  /**
+   * @generated from enum value: DECISION_CRITERION_COMPARATOR_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DECISION_CRITERION_COMPARATOR_LESS_THAN = 1;
+   */
+  LESS_THAN = 1,
+
+  /**
+   * @generated from enum value: DECISION_CRITERION_COMPARATOR_LESS_THAN_OR_EQUAL = 2;
+   */
+  LESS_THAN_OR_EQUAL = 2,
+
+  /**
+   * @generated from enum value: DECISION_CRITERION_COMPARATOR_GREATER_THAN = 3;
+   */
+  GREATER_THAN = 3,
+
+  /**
+   * @generated from enum value: DECISION_CRITERION_COMPARATOR_GREATER_THAN_OR_EQUAL = 4;
+   */
+  GREATER_THAN_OR_EQUAL = 4,
+}
+
+/**
+ * Describes the enum bioworld.v2.DecisionCriterionComparator.
+ */
+export const DecisionCriterionComparatorSchema: GenEnum<DecisionCriterionComparator> = /*@__PURE__*/
+  enumDesc(file_bioworld_v2_decision, 2);
 
 /**
  * @generated from service bioworld.v2.DecisionService

@@ -1,10 +1,13 @@
 import {
+  DecisionCriterionComparator as WireDecisionCriterionComparator,
   OodStatus,
   Recommendation as WireRecommendation,
   type DecisionRecord,
 } from "@bioworld/contracts";
 import type {
   DecisionSummary,
+  DecisionCriterionComparator,
+  DecisionCriterionMetadata,
   DomainAssessment,
   PredictionIntervalMetadata,
   PredictionPositionMetadata,
@@ -27,6 +30,12 @@ export type DecisionRecordAdapterErrorCode =
   | "missing_prediction_position_evidence"
   | "invalid_prediction_position_evidence"
   | "incomparable_prediction_positions"
+  | "invalid_decision_criterion"
+  | "incomparable_decision_criterion"
+  | "missing_decision_criterion_evidence"
+  | "invalid_decision_criterion_evidence"
+  | "unspecified_decision_criterion_comparator"
+  | "unknown_decision_criterion_comparator"
   | "missing_rationale"
   | "unspecified_ood_status"
   | "unspecified_recommendation"
@@ -49,6 +58,8 @@ const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const canonicalDecimal =
   /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$/;
+const unicodeWhiteSpaceAtBoundary =
+  /^(?:\p{White_Space})|(?:\p{White_Space})$/u;
 const maxDecisionIdentifierChars = 200;
 const maxDecisionIdentifierBytes = 800;
 const maxPredictionIntervalIdentifierBytes = 200;
@@ -109,7 +120,7 @@ function boundedOpaqueValueIsValid(value: string): boolean {
     value.length > 0 &&
     utf8Encoder.encode(value).byteLength <=
       maxPredictionIntervalIdentifierBytes &&
-    value.trim() === value &&
+    !unicodeWhiteSpaceAtBoundary.test(value) &&
     !value.includes("\0")
   );
 }
@@ -119,7 +130,7 @@ function decisionIdentifierIsValid(value: string): boolean {
     value.length > 0 &&
     [...value].length <= maxDecisionIdentifierChars &&
     utf8Encoder.encode(value).byteLength <= maxDecisionIdentifierBytes &&
-    value.trim() === value &&
+    !unicodeWhiteSpaceAtBoundary.test(value) &&
     !value.includes("\0")
   );
 }
@@ -244,6 +255,88 @@ function resolvePredictionInterval(
   record: DecisionRecord,
 ): PredictionIntervalMetadata | null {
   return resolvePredictionIntervalValue(record.predictionInterval);
+}
+
+function toDecisionCriterionComparator(
+  value: WireDecisionCriterionComparator,
+): DecisionCriterionComparator {
+  switch (value) {
+    case WireDecisionCriterionComparator.LESS_THAN:
+      return "less_than";
+    case WireDecisionCriterionComparator.LESS_THAN_OR_EQUAL:
+      return "less_than_or_equal";
+    case WireDecisionCriterionComparator.GREATER_THAN:
+      return "greater_than";
+    case WireDecisionCriterionComparator.GREATER_THAN_OR_EQUAL:
+      return "greater_than_or_equal";
+    case WireDecisionCriterionComparator.UNSPECIFIED:
+      throw new DecisionRecordAdapterError(
+        "unspecified_decision_criterion_comparator",
+        "Decision criterion comparator is unspecified",
+      );
+    default:
+      throw new DecisionRecordAdapterError(
+        "unknown_decision_criterion_comparator",
+        "Decision criterion comparator is unknown",
+      );
+  }
+}
+
+function resolveDecisionCriterion(
+  record: DecisionRecord,
+  decisionInterval: PredictionIntervalMetadata | null,
+): DecisionCriterionMetadata | null {
+  const criterion = record.decisionCriterion;
+  if (!criterion) {
+    return null;
+  }
+  if (!decisionInterval) {
+    throw new DecisionRecordAdapterError(
+      "incomparable_decision_criterion",
+      "Decision criterion requires a prediction interval",
+    );
+  }
+  if (
+    !boundedOpaqueValueIsValid(criterion.criterionId) ||
+    !boundedOpaqueValueIsValid(criterion.criterionVersion) ||
+    !canonicalDecimalIsValid(criterion.thresholdDecimal)
+  ) {
+    throw new DecisionRecordAdapterError(
+      "invalid_decision_criterion",
+      "Decision criterion metadata is invalid",
+    );
+  }
+
+  const comparator = toDecisionCriterionComparator(criterion.comparator);
+  const criterionEvidence = criterion.criterionEvidence;
+  if (!criterionEvidence) {
+    throw new DecisionRecordAdapterError(
+      "missing_decision_criterion_evidence",
+      "Decision criterion evidence is required",
+    );
+  }
+  if (
+    !decisionIdentifierIsValid(criterionEvidence.id) ||
+    !lowercaseSha256.test(criterionEvidence.sha256)
+  ) {
+    throw new DecisionRecordAdapterError(
+      "invalid_decision_criterion_evidence",
+      "Decision criterion evidence is invalid",
+    );
+  }
+
+  return {
+    criterionId: criterion.criterionId,
+    criterionVersion: criterion.criterionVersion,
+    comparator,
+    thresholdDecimal: criterion.thresholdDecimal,
+    target: decisionInterval.target,
+    unit: decisionInterval.unit,
+    criterionEvidence: {
+      id: criterionEvidence.id,
+      sha256: criterionEvidence.sha256,
+    },
+  };
 }
 
 function resolvePredictionPositions(
@@ -431,6 +524,10 @@ export function toDecisionSummary(
       }
     : null;
   const predictionInterval = resolvePredictionInterval(record);
+  const decisionCriterion = resolveDecisionCriterion(
+    record,
+    predictionInterval,
+  );
   const predictionPositions = resolvePredictionPositions(
     record,
     predictionInterval,
@@ -454,6 +551,7 @@ export function toDecisionSummary(
     domainAssessment,
     oodDetector,
     predictionInterval,
+    decisionCriterion,
     ...(predictionPositions.length > 0 ? { predictionPositions } : {}),
     rationale,
     evidence: {

@@ -3,8 +3,9 @@ use std::future::Future;
 use bioworld_contracts::{
     VersionedDecisionRecord,
     v2::{
-        DecisionEvent, DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
-        EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
+        DecisionCriterion, DecisionCriterionComparator, DecisionEvent, DecisionPredictionInterval,
+        DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
+        Recommendation,
     },
 };
 use bioworld_decision_query::{
@@ -155,6 +156,17 @@ fn decision_event_at_version_with_ood_status(
             }),
             prediction_interval: Some(prediction_interval("0.25", "1.5")),
             prediction_positions: prediction_positions(),
+            decision_criterion: Some(DecisionCriterion {
+                criterion_id: "reader_policy".to_owned(),
+                criterion_version: "2026.07".to_owned(),
+                comparator: DecisionCriterionComparator::LessThanOrEqual as i32,
+                threshold_decimal: "0.75".to_owned(),
+                criterion_evidence: Some(EvidenceSnapshotRef {
+                    id: "ES-M11-CRITERION".to_owned(),
+                    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                }),
+            }),
         }),
     }
 }

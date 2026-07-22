@@ -43,6 +43,15 @@ message DecisionPredictionPosition {
   DecisionPredictionInterval interval = 4;
   EvidenceSnapshotRef prediction_evidence = 5;
 }
+message DecisionCriterion {
+  // The comparator relates the named prediction target to threshold_decimal.
+  // Target and unit are inherited from DecisionRecord.prediction_interval.
+  string criterion_id = 1;
+  string criterion_version = 2;
+  DecisionCriterionComparator comparator = 3;
+  string threshold_decimal = 4;
+  EvidenceSnapshotRef criterion_evidence = 5;
+}
 message DecisionRecord {
   string decision_id = 1;
   string cou_id = 2;
@@ -55,6 +64,7 @@ message DecisionRecord {
   OodDetectorRef ood_detector = 9;
   DecisionPredictionInterval prediction_interval = 10;
   repeated DecisionPredictionPosition prediction_positions = 11;
+  DecisionCriterion decision_criterion = 12;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {
@@ -71,4 +81,11 @@ enum OodStatus {
   OOD_STATUS_BORDERLINE = 2;
   OOD_STATUS_OUT_OF_DOMAIN = 3;
   OOD_STATUS_UNKNOWN = 4;
+}
+enum DecisionCriterionComparator {
+  DECISION_CRITERION_COMPARATOR_UNSPECIFIED = 0;
+  DECISION_CRITERION_COMPARATOR_LESS_THAN = 1;
+  DECISION_CRITERION_COMPARATOR_LESS_THAN_OR_EQUAL = 2;
+  DECISION_CRITERION_COMPARATOR_GREATER_THAN = 3;
+  DECISION_CRITERION_COMPARATOR_GREATER_THAN_OR_EQUAL = 4;
 }

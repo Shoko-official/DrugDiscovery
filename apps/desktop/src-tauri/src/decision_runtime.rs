@@ -100,5 +100,15 @@ pub(crate) fn bundled_decision_record() -> v2::DecisionRecord {
         }),
         prediction_interval: Some(prediction_interval("0.25", "1.5")),
         prediction_positions: prediction_positions(),
+        decision_criterion: Some(v2::DecisionCriterion {
+            criterion_id: "potency_policy".to_owned(),
+            criterion_version: "2026.07".to_owned(),
+            comparator: v2::DecisionCriterionComparator::LessThanOrEqual as i32,
+            threshold_decimal: "0.75".to_owned(),
+            criterion_evidence: Some(v2::EvidenceSnapshotRef {
+                id: "ES-CRITERION-001".to_owned(),
+                sha256: VALID_SHA256.to_owned(),
+            }),
+        }),
     }
 }

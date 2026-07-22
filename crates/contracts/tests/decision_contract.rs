@@ -3,13 +3,18 @@ use std::num::NonZeroU64;
 use bioworld_contracts::{
     DecisionContractError, MAX_DECISION_WIRE_BYTES, VersionedDecisionRecord,
     v2::{
-        DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
-        EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
+        DecisionCriterion, DecisionCriterionComparator, DecisionPredictionInterval,
+        DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
+        Recommendation,
     },
 };
 use bioworld_domain::{
-    DomainError, MAX_DECISION_RATIONALE_ITEMS, MAX_OOD_DETECTOR_VERSION_BYTES,
-    OodStatus as DomainOodStatus, Recommendation as DomainRecommendation,
+    DomainError, MAX_DECISION_CRITERION_DECIMAL_BYTES, MAX_DECISION_CRITERION_IDENTIFIER_BYTES,
+    MAX_DECISION_IDENTIFIER_BYTES, MAX_DECISION_PREDICTION_POSITIONS, MAX_DECISION_RATIONALE_ITEMS,
+    MAX_DECISION_RATIONALE_TOTAL_BYTES, MAX_OOD_DETECTOR_ID_BYTES, MAX_OOD_DETECTOR_VERSION_BYTES,
+    MAX_PREDICTION_INTERVAL_DECIMAL_BYTES, MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES,
+    MAX_PREDICTION_POSITION_IDENTIFIER_BYTES, OodStatus as DomainOodStatus,
+    Recommendation as DomainRecommendation,
 };
 use prost::Message;
 
@@ -31,6 +36,8 @@ const FROZEN_M33_PREDICTION_INTERVAL_FIELD: &[u8] = &[
     53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98,
     99, 100, 101, 102, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102,
 ];
+const FROZEN_M34_PREDICTION_POSITIONS_FIELD: &[u8] = b"\x5a\xa5\x02\x0a\x07\x6d\x6f\x64\x65\x6c\x2d\x7a\x12\x07\x32\x30\x32\x36\x2e\x30\x37\x1a\x13\x73\x68\x61\x72\x65\x64\x2d\x74\x72\x61\x69\x6e\x69\x6e\x67\x2d\x73\x65\x74\x22\xac\x01\x0a\x10\x62\x69\x6e\x64\x69\x6e\x67\x5f\x61\x66\x66\x69\x6e\x69\x74\x79\x12\x02\x6e\x4d\x1a\x04\x30\x2e\x32\x35\x22\x03\x31\x2e\x35\x2a\x04\x30\x2e\x39\x35\x32\x0f\x73\x70\x6c\x69\x74\x5f\x63\x6f\x6e\x66\x6f\x72\x6d\x61\x6c\x3a\x03\x31\x2e\x30\x42\x14\x68\x65\x6c\x64\x5f\x6f\x75\x74\x5f\x63\x61\x6c\x69\x62\x72\x61\x74\x69\x6f\x6e\x4a\x07\x32\x30\x32\x36\x2e\x30\x37\x52\x4e\x0a\x0a\x45\x53\x2d\x43\x41\x4c\x2d\x30\x30\x31\x12\x40\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x2a\x4d\x0a\x09\x45\x53\x2d\x50\x52\x45\x44\x2d\x5a\x12\x40\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x5a\xa3\x02\x0a\x07\x6d\x6f\x64\x65\x6c\x2d\x61\x12\x07\x32\x30\x32\x36\x2e\x30\x36\x1a\x11\x69\x6e\x64\x65\x70\x65\x6e\x64\x65\x6e\x74\x2d\x61\x73\x73\x61\x79\x22\xac\x01\x0a\x10\x62\x69\x6e\x64\x69\x6e\x67\x5f\x61\x66\x66\x69\x6e\x69\x74\x79\x12\x02\x6e\x4d\x1a\x04\x30\x2e\x32\x35\x22\x03\x31\x2e\x35\x2a\x04\x30\x2e\x39\x35\x32\x0f\x73\x70\x6c\x69\x74\x5f\x63\x6f\x6e\x66\x6f\x72\x6d\x61\x6c\x3a\x03\x31\x2e\x30\x42\x14\x68\x65\x6c\x64\x5f\x6f\x75\x74\x5f\x63\x61\x6c\x69\x62\x72\x61\x74\x69\x6f\x6e\x4a\x07\x32\x30\x32\x36\x2e\x30\x37\x52\x4e\x0a\x0a\x45\x53\x2d\x43\x41\x4c\x2d\x30\x30\x31\x12\x40\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x2a\x4d\x0a\x09\x45\x53\x2d\x50\x52\x45\x44\x2d\x41\x12\x40\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x61\x62\x63\x64\x65\x66";
+const FROZEN_M35_DECISION_CRITERION_FIELD: &[u8] = b"\x62\x77\x0a\x0epotency_policy\x12\x072026.07\x18\x02\x22\x040.75\x2a\x54\x0a\x10ES-CRITERION-001\x12\x400123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[allow(deprecated)]
 fn complete_wire_record() -> DecisionRecord {
@@ -52,6 +59,7 @@ fn complete_wire_record() -> DecisionRecord {
         }),
         prediction_interval: None,
         prediction_positions: Vec::new(),
+        decision_criterion: None,
     }
 }
 
@@ -101,6 +109,19 @@ fn complete_wire_record_with_positions() -> DecisionRecord {
     record
 }
 
+fn complete_decision_criterion(comparator: DecisionCriterionComparator) -> DecisionCriterion {
+    DecisionCriterion {
+        criterion_id: "potency_policy".to_owned(),
+        criterion_version: "2026.07".to_owned(),
+        comparator: comparator as i32,
+        threshold_decimal: "0.75".to_owned(),
+        criterion_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CRITERION-001".to_owned(),
+            sha256: VALID_SHA256.to_owned(),
+        }),
+    }
+}
+
 fn record_with_encoded_len(target: usize) -> DecisionRecord {
     let mut record = complete_wire_record();
     let mut rationale_bytes = target;
@@ -134,6 +155,75 @@ fn bounds_decision_wire_records_before_conversion() {
         VersionedDecisionRecord::try_from(oversized),
         Err(DecisionContractError::DecisionTooLarge),
     );
+}
+
+#[test]
+#[allow(deprecated)]
+fn maximum_valid_decision_criterion_record_fits_the_wire_envelope() {
+    let decision_identifier = "\u{10000}".repeat(MAX_DECISION_IDENTIFIER_BYTES / 4);
+    let evidence = || EvidenceSnapshotRef {
+        id: decision_identifier.clone(),
+        sha256: VALID_SHA256.to_owned(),
+    };
+    let nominal_coverage = format!(
+        "0.{}1",
+        "0".repeat(MAX_PREDICTION_INTERVAL_DECIMAL_BYTES - 3)
+    );
+    let interval = || DecisionPredictionInterval {
+        target: "t".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        unit: "u".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        lower_decimal: "1".repeat(MAX_PREDICTION_INTERVAL_DECIMAL_BYTES),
+        upper_decimal: "2".repeat(MAX_PREDICTION_INTERVAL_DECIMAL_BYTES),
+        nominal_coverage_decimal: nominal_coverage.clone(),
+        interval_method_id: "i".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        interval_method_version: "v".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        calibration_method_id: "c".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        calibration_method_version: "m".repeat(MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES),
+        calibration_evidence: Some(evidence()),
+    };
+
+    let mut record = complete_wire_record();
+    record.cou_id = decision_identifier.clone();
+    record.evidence_snapshot_id = decision_identifier.clone();
+    record.aggregate_version = u64::MAX;
+    record.evidence = Some(evidence());
+    record.ood_detector = Some(OodDetectorRef {
+        detector_id: "d".repeat(MAX_OOD_DETECTOR_ID_BYTES),
+        detector_version: "v".repeat(MAX_OOD_DETECTOR_VERSION_BYTES),
+    });
+    record.prediction_interval = Some(interval());
+    record.prediction_positions = (0..MAX_DECISION_PREDICTION_POSITIONS)
+        .map(|index| DecisionPredictionPosition {
+            source_id: format!(
+                "{index}{}",
+                "s".repeat(MAX_PREDICTION_POSITION_IDENTIFIER_BYTES - 1)
+            ),
+            source_version: "v".repeat(MAX_PREDICTION_POSITION_IDENTIFIER_BYTES),
+            dependency_group_id: "g".repeat(MAX_PREDICTION_POSITION_IDENTIFIER_BYTES),
+            interval: Some(interval()),
+            prediction_evidence: Some(evidence()),
+        })
+        .collect();
+    record.decision_criterion = Some(DecisionCriterion {
+        criterion_id: "i".repeat(MAX_DECISION_CRITERION_IDENTIFIER_BYTES),
+        criterion_version: "v".repeat(MAX_DECISION_CRITERION_IDENTIFIER_BYTES),
+        comparator: DecisionCriterionComparator::GreaterThanOrEqual as i32,
+        threshold_decimal: "9".repeat(MAX_DECISION_CRITERION_DECIMAL_BYTES),
+        criterion_evidence: Some(evidence()),
+    });
+    record.rationale =
+        vec![
+            "r".repeat(MAX_DECISION_RATIONALE_TOTAL_BYTES / MAX_DECISION_RATIONALE_ITEMS);
+            MAX_DECISION_RATIONALE_ITEMS
+        ];
+
+    let encoded_len = record.encoded_len();
+    assert!(
+        encoded_len <= MAX_DECISION_WIRE_BYTES,
+        "maximum valid record uses {encoded_len} wire bytes"
+    );
+    let boundary = VersionedDecisionRecord::try_from(record.clone()).unwrap();
+    assert_eq!(DecisionRecord::from(&boundary), record);
 }
 
 #[test]
@@ -237,6 +327,150 @@ fn prediction_positions_round_trip_without_data_loss() {
     assert_eq!(positions[0].prediction_evidence().id(), "ES-PRED-Z");
     assert_eq!(positions[1].source_id(), "model-a");
     assert_eq!(DecisionRecord::from(&boundary), expected);
+}
+
+#[test]
+fn decision_criterion_round_trips_without_data_loss() {
+    let mut expected = complete_wire_record_with_positions();
+    expected.decision_criterion = Some(complete_decision_criterion(
+        DecisionCriterionComparator::LessThanOrEqual,
+    ));
+
+    let boundary = VersionedDecisionRecord::try_from(expected.clone()).unwrap();
+    let criterion = boundary.decision().decision_criterion().unwrap();
+
+    assert_eq!(criterion.criterion_id(), "potency_policy");
+    assert_eq!(criterion.criterion_version(), "2026.07");
+    assert_eq!(criterion.threshold_decimal(), "0.75");
+    assert_eq!(criterion.criterion_evidence().id(), "ES-CRITERION-001");
+    assert_eq!(DecisionRecord::from(&boundary), expected);
+}
+
+#[test]
+fn every_decision_criterion_comparator_round_trips_exactly() {
+    for comparator in [
+        DecisionCriterionComparator::LessThan,
+        DecisionCriterionComparator::LessThanOrEqual,
+        DecisionCriterionComparator::GreaterThan,
+        DecisionCriterionComparator::GreaterThanOrEqual,
+    ] {
+        let mut expected = complete_wire_record_with_positions();
+        expected.decision_criterion = Some(complete_decision_criterion(comparator));
+
+        let boundary = VersionedDecisionRecord::try_from(expected.clone()).unwrap();
+
+        assert_eq!(DecisionRecord::from(&boundary), expected);
+    }
+}
+
+#[test]
+fn rejects_incomplete_or_invalid_decision_criteria_from_wire() {
+    let mut missing_evidence = complete_wire_record_with_positions();
+    missing_evidence.decision_criterion = Some(complete_decision_criterion(
+        DecisionCriterionComparator::LessThanOrEqual,
+    ));
+    missing_evidence
+        .decision_criterion
+        .as_mut()
+        .unwrap()
+        .criterion_evidence = None;
+    assert_eq!(
+        VersionedDecisionRecord::try_from(missing_evidence),
+        Err(DecisionContractError::MissingDecisionCriterionEvidence)
+    );
+
+    for (name, mutate, expected) in [
+        (
+            "identifier",
+            (|criterion: &mut DecisionCriterion| criterion.criterion_id = " policy".to_owned())
+                as fn(&mut DecisionCriterion),
+            DomainError::InvalidDecisionCriterionId,
+        ),
+        (
+            "version",
+            |criterion: &mut DecisionCriterion| criterion.criterion_version.clear(),
+            DomainError::InvalidDecisionCriterionVersion,
+        ),
+        (
+            "threshold",
+            |criterion: &mut DecisionCriterion| criterion.threshold_decimal = "0.750".to_owned(),
+            DomainError::InvalidDecisionCriterionThresholdDecimal,
+        ),
+        (
+            "evidence",
+            |criterion: &mut DecisionCriterion| {
+                criterion.criterion_evidence.as_mut().unwrap().sha256 = "invalid".to_owned();
+            },
+            DomainError::InvalidEvidenceDigest,
+        ),
+    ] {
+        let mut wire = complete_wire_record_with_positions();
+        wire.decision_criterion = Some(complete_decision_criterion(
+            DecisionCriterionComparator::LessThanOrEqual,
+        ));
+        mutate(wire.decision_criterion.as_mut().unwrap());
+
+        assert_eq!(
+            VersionedDecisionRecord::try_from(wire),
+            Err(DecisionContractError::InvalidDomain(expected)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn rejects_unspecified_and_unknown_decision_criterion_comparators() {
+    let mut unspecified = complete_wire_record_with_positions();
+    unspecified.decision_criterion = Some(complete_decision_criterion(
+        DecisionCriterionComparator::Unspecified,
+    ));
+    let mut unknown = complete_wire_record_with_positions();
+    unknown.decision_criterion = Some(complete_decision_criterion(
+        DecisionCriterionComparator::LessThan,
+    ));
+    unknown.decision_criterion.as_mut().unwrap().comparator = 99;
+
+    assert_eq!(
+        VersionedDecisionRecord::try_from(unspecified),
+        Err(DecisionContractError::UnspecifiedDecisionCriterionComparator)
+    );
+    assert_eq!(
+        VersionedDecisionRecord::try_from(unknown),
+        Err(DecisionContractError::UnknownDecisionCriterionComparator(
+            99
+        ))
+    );
+}
+
+#[test]
+fn rejects_decision_criterion_without_prediction_interval() {
+    let mut wire = complete_wire_record();
+    wire.decision_criterion = Some(complete_decision_criterion(
+        DecisionCriterionComparator::LessThan,
+    ));
+
+    assert_eq!(
+        VersionedDecisionRecord::try_from(wire),
+        Err(DecisionContractError::InvalidDomain(
+            DomainError::MissingPredictionIntervalForCriterion
+        ))
+    );
+}
+
+#[test]
+fn decision_criterion_contract_errors_have_fixed_text() {
+    assert_eq!(
+        DecisionContractError::MissingDecisionCriterionEvidence.to_string(),
+        "decision criterion evidence is required"
+    );
+    assert_eq!(
+        DecisionContractError::UnspecifiedDecisionCriterionComparator.to_string(),
+        "decision criterion comparator must not be unspecified"
+    );
+    assert_eq!(
+        DecisionContractError::UnknownDecisionCriterionComparator(99).to_string(),
+        "decision criterion comparator value 99 is unknown"
+    );
 }
 
 #[test]
@@ -776,6 +1010,52 @@ fn preserves_frozen_m33_interval_wire_without_position_backfill() {
     assert!(boundary.decision().prediction_positions().is_empty());
     assert!(emitted.prediction_interval.is_some());
     assert!(emitted.prediction_positions.is_empty());
+    assert_eq!(emitted.encode_to_vec(), frozen);
+}
+
+#[test]
+fn preserves_frozen_m34_position_wire_without_criterion_backfill() {
+    let frozen = [
+        FROZEN_WIRE_WITH_OOD_PROVENANCE_WITHOUT_INTERVAL,
+        FROZEN_M33_PREDICTION_INTERVAL_FIELD,
+        FROZEN_M34_PREDICTION_POSITIONS_FIELD,
+    ]
+    .concat();
+    let historical = DecisionRecord::decode(frozen.as_slice()).unwrap();
+
+    assert_eq!(historical.decision_criterion, None);
+    assert_eq!(historical.encode_to_vec(), frozen);
+
+    let boundary = VersionedDecisionRecord::try_from(historical).unwrap();
+    let emitted = DecisionRecord::from(&boundary);
+
+    assert!(boundary.decision().decision_criterion().is_none());
+    assert_eq!(emitted.decision_criterion, None);
+    assert_eq!(emitted.encode_to_vec(), frozen);
+}
+
+#[test]
+fn preserves_frozen_m35_wire_with_decision_criterion() {
+    let frozen = [
+        FROZEN_WIRE_WITH_OOD_PROVENANCE_WITHOUT_INTERVAL,
+        FROZEN_M33_PREDICTION_INTERVAL_FIELD,
+        FROZEN_M34_PREDICTION_POSITIONS_FIELD,
+        FROZEN_M35_DECISION_CRITERION_FIELD,
+    ]
+    .concat();
+    let current = DecisionRecord::decode(frozen.as_slice()).unwrap();
+
+    assert_eq!(
+        current.decision_criterion,
+        Some(complete_decision_criterion(
+            DecisionCriterionComparator::LessThanOrEqual,
+        )),
+    );
+    assert_eq!(current.encode_to_vec(), frozen);
+
+    let boundary = VersionedDecisionRecord::try_from(current).unwrap();
+    let emitted = DecisionRecord::from(&boundary);
+
     assert_eq!(emitted.encode_to_vec(), frozen);
 }
 

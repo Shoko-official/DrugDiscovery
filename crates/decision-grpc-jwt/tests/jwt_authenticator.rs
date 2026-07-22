@@ -15,8 +15,9 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef,
-    GetDecisionRequest, OodDetectorRef, OodStatus, Recommendation,
+    DecisionCriterion, DecisionCriterionComparator, DecisionPredictionInterval,
+    DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+    OodDetectorRef, OodStatus, Recommendation,
     decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
@@ -340,6 +341,17 @@ fn record() -> DecisionRecord {
         }),
         prediction_interval: Some(prediction_interval("0.25", "1.5")),
         prediction_positions: prediction_positions(),
+        decision_criterion: Some(DecisionCriterion {
+            criterion_id: "jwt_policy".to_owned(),
+            criterion_version: "2026.07".to_owned(),
+            comparator: DecisionCriterionComparator::LessThanOrEqual as i32,
+            threshold_decimal: "0.75".to_owned(),
+            criterion_evidence: Some(EvidenceSnapshotRef {
+                id: "ES-JWT-CRITERION".to_owned(),
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
+            }),
+        }),
     }
 }
 

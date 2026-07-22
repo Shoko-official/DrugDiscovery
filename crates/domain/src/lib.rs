@@ -16,6 +16,8 @@ pub const MAX_PREDICTION_INTERVAL_DECIMAL_BYTES: usize = 64;
 pub const MAX_PREDICTION_POSITION_IDENTIFIER_BYTES: usize = 200;
 pub const MIN_DECISION_PREDICTION_POSITIONS: usize = 2;
 pub const MAX_DECISION_PREDICTION_POSITIONS: usize = 3;
+pub const MAX_DECISION_CRITERION_IDENTIFIER_BYTES: usize = 200;
+pub const MAX_DECISION_CRITERION_DECIMAL_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +91,34 @@ pub struct EvidenceSnapshotRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionCriterionComparator {
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "DecisionCriterionData")]
+pub struct DecisionCriterion {
+    criterion_id: String,
+    criterion_version: String,
+    comparator: DecisionCriterionComparator,
+    threshold_decimal: String,
+    criterion_evidence: EvidenceSnapshotRef,
+}
+
+#[derive(Deserialize)]
+struct DecisionCriterionData {
+    criterion_id: String,
+    criterion_version: String,
+    comparator: DecisionCriterionComparator,
+    threshold_decimal: String,
+    criterion_evidence: EvidenceSnapshotRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "DecisionPredictionIntervalData")]
 pub struct DecisionPredictionInterval {
     target: String,
@@ -153,6 +183,8 @@ pub struct DecisionRecord {
     ood_detector: Option<OodDetectorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prediction_interval: Option<DecisionPredictionInterval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_criterion: Option<DecisionCriterion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prediction_positions: Vec<DecisionPredictionPosition>,
     evidence: EvidenceSnapshotRef,
@@ -170,6 +202,8 @@ struct DecisionRecordData {
     ood_detector: Option<OodDetectorRef>,
     #[serde(default)]
     prediction_interval: Option<DecisionPredictionInterval>,
+    #[serde(default)]
+    decision_criterion: Option<DecisionCriterion>,
     #[serde(default)]
     prediction_positions: Vec<DecisionPredictionPosition>,
     evidence: EvidenceSnapshotRef,
@@ -226,6 +260,14 @@ pub enum DomainError {
     IncomparablePredictionPositionUnit,
     #[error("prediction position nominal coverage does not match the decision interval")]
     IncomparablePredictionPositionNominalCoverage,
+    #[error("decision criterion identifier is invalid")]
+    InvalidDecisionCriterionId,
+    #[error("decision criterion version is invalid")]
+    InvalidDecisionCriterionVersion,
+    #[error("decision criterion threshold is invalid")]
+    InvalidDecisionCriterionThresholdDecimal,
+    #[error("a decision criterion requires a prediction interval")]
+    MissingPredictionIntervalForCriterion,
     #[error("a qualified decision requires at least one rationale")]
     MissingRationale,
     #[error("a decision has too many rationales")]
@@ -268,6 +310,71 @@ impl EvidenceSnapshotRef {
             return Err(DomainError::InvalidEvidenceDigest);
         }
         Ok(())
+    }
+}
+
+impl DecisionCriterion {
+    pub fn try_new(
+        criterion_id: String,
+        criterion_version: String,
+        comparator: DecisionCriterionComparator,
+        threshold_decimal: String,
+        criterion_evidence: EvidenceSnapshotRef,
+    ) -> Result<Self, DomainError> {
+        if !bounded_opaque_value_is_valid(&criterion_id, MAX_DECISION_CRITERION_IDENTIFIER_BYTES) {
+            return Err(DomainError::InvalidDecisionCriterionId);
+        }
+        if !bounded_opaque_value_is_valid(
+            &criterion_version,
+            MAX_DECISION_CRITERION_IDENTIFIER_BYTES,
+        ) {
+            return Err(DomainError::InvalidDecisionCriterionVersion);
+        }
+        if !canonical_decimal_is_valid(&threshold_decimal, MAX_DECISION_CRITERION_DECIMAL_BYTES) {
+            return Err(DomainError::InvalidDecisionCriterionThresholdDecimal);
+        }
+
+        Ok(Self {
+            criterion_id,
+            criterion_version,
+            comparator,
+            threshold_decimal,
+            criterion_evidence,
+        })
+    }
+
+    pub fn criterion_id(&self) -> &str {
+        &self.criterion_id
+    }
+
+    pub fn criterion_version(&self) -> &str {
+        &self.criterion_version
+    }
+
+    pub fn comparator(&self) -> &DecisionCriterionComparator {
+        &self.comparator
+    }
+
+    pub fn threshold_decimal(&self) -> &str {
+        &self.threshold_decimal
+    }
+
+    pub fn criterion_evidence(&self) -> &EvidenceSnapshotRef {
+        &self.criterion_evidence
+    }
+}
+
+impl TryFrom<DecisionCriterionData> for DecisionCriterion {
+    type Error = DomainError;
+
+    fn try_from(value: DecisionCriterionData) -> Result<Self, Self::Error> {
+        Self::try_new(
+            value.criterion_id,
+            value.criterion_version,
+            value.comparator,
+            value.threshold_decimal,
+            value.criterion_evidence,
+        )
     }
 }
 
@@ -315,14 +422,16 @@ impl DecisionPredictionInterval {
         ) {
             return Err(DomainError::InvalidPredictionIntervalCalibrationMethodVersion);
         }
-        if !canonical_decimal_is_valid(&lower_decimal) {
+        if !canonical_decimal_is_valid(&lower_decimal, MAX_PREDICTION_INTERVAL_DECIMAL_BYTES) {
             return Err(DomainError::InvalidPredictionIntervalLowerDecimal);
         }
-        if !canonical_decimal_is_valid(&upper_decimal) {
+        if !canonical_decimal_is_valid(&upper_decimal, MAX_PREDICTION_INTERVAL_DECIMAL_BYTES) {
             return Err(DomainError::InvalidPredictionIntervalUpperDecimal);
         }
-        if !canonical_decimal_is_valid(&nominal_coverage_decimal)
-            || !compare_canonical_decimals(&nominal_coverage_decimal, "0").is_gt()
+        if !canonical_decimal_is_valid(
+            &nominal_coverage_decimal,
+            MAX_PREDICTION_INTERVAL_DECIMAL_BYTES,
+        ) || !compare_canonical_decimals(&nominal_coverage_decimal, "0").is_gt()
             || !compare_canonical_decimals(&nominal_coverage_decimal, "1").is_lt()
         {
             return Err(DomainError::InvalidPredictionIntervalNominalCoverageDecimal);
@@ -555,6 +664,33 @@ impl DecisionRecord {
         evidence: EvidenceSnapshotRef,
         rationale: Vec<String>,
     ) -> Result<Self, DomainError> {
+        Self::try_new_with_decision_criterion(
+            id,
+            cou_id,
+            recommendation,
+            ood_status,
+            ood_detector,
+            prediction_interval,
+            prediction_positions,
+            None,
+            evidence,
+            rationale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_decision_criterion(
+        id: Uuid,
+        cou_id: String,
+        recommendation: Recommendation,
+        ood_status: OodStatus,
+        ood_detector: Option<OodDetectorRef>,
+        prediction_interval: Option<DecisionPredictionInterval>,
+        prediction_positions: Vec<DecisionPredictionPosition>,
+        decision_criterion: Option<DecisionCriterion>,
+        evidence: EvidenceSnapshotRef,
+        rationale: Vec<String>,
+    ) -> Result<Self, DomainError> {
         let decision = Self {
             id,
             cou_id,
@@ -562,6 +698,7 @@ impl DecisionRecord {
             ood_status,
             ood_detector,
             prediction_interval,
+            decision_criterion,
             prediction_positions,
             evidence,
             rationale,
@@ -598,6 +735,10 @@ impl DecisionRecord {
         &self.prediction_positions
     }
 
+    pub fn decision_criterion(&self) -> Option<&DecisionCriterion> {
+        self.decision_criterion.as_ref()
+    }
+
     pub fn evidence(&self) -> &EvidenceSnapshotRef {
         &self.evidence
     }
@@ -620,6 +761,9 @@ impl DecisionRecord {
         }
         if !self.prediction_positions.is_empty() && self.prediction_interval.is_none() {
             return Err(DomainError::MissingPredictionIntervalForPositions);
+        }
+        if self.decision_criterion.is_some() && self.prediction_interval.is_none() {
+            return Err(DomainError::MissingPredictionIntervalForCriterion);
         }
         if let Some(decision_interval) = self.prediction_interval.as_ref() {
             for position in &self.prediction_positions {
@@ -694,8 +838,8 @@ fn bounded_opaque_value_is_valid(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && value.trim() == value && !value.contains('\0')
 }
 
-fn canonical_decimal_is_valid(value: &str) -> bool {
-    if value.is_empty() || value.len() > MAX_PREDICTION_INTERVAL_DECIMAL_BYTES {
+fn canonical_decimal_is_valid(value: &str, max_bytes: usize) -> bool {
+    if value.is_empty() || value.len() > max_bytes {
         return false;
     }
 
@@ -776,7 +920,7 @@ impl TryFrom<DecisionRecordData> for DecisionRecord {
     type Error = DomainError;
 
     fn try_from(value: DecisionRecordData) -> Result<Self, Self::Error> {
-        Self::try_new_with_prediction_positions(
+        Self::try_new_with_decision_criterion(
             value.id,
             value.cou_id,
             value.recommendation,
@@ -784,6 +928,7 @@ impl TryFrom<DecisionRecordData> for DecisionRecord {
             value.ood_detector,
             value.prediction_interval,
             value.prediction_positions,
+            value.decision_criterion,
             value.evidence,
             value.rationale,
         )

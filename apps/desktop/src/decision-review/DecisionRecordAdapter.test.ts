@@ -1,5 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  DecisionCriterionComparator,
+  DecisionCriterionSchema,
   DecisionPredictionIntervalSchema,
   DecisionPredictionPositionSchema,
   DecisionRecordSchema,
@@ -62,6 +64,21 @@ function completePredictionPosition(
   });
 }
 
+function completeDecisionCriterion(
+  comparator = DecisionCriterionComparator.LESS_THAN_OR_EQUAL,
+) {
+  return create(DecisionCriterionSchema, {
+    criterionId: "potency_policy",
+    criterionVersion: "2026.07",
+    comparator,
+    thresholdDecimal: "0.75",
+    criterionEvidence: create(EvidenceSnapshotRefSchema, {
+      id: "ES-CRITERION-001",
+      sha256: validSha256,
+    }),
+  });
+}
+
 function completeRecord(recommendation = Recommendation.ABSTAIN) {
   const evidence = create(EvidenceSnapshotRefSchema, {
     id: "ES-001",
@@ -104,6 +121,12 @@ function completeRecordWithPredictionPositions() {
   return record;
 }
 
+function completeRecordWithDecisionCriterion() {
+  const record = completeRecordWithPredictionPositions();
+  record.decisionCriterion = completeDecisionCriterion();
+  return record;
+}
+
 function expectAdapterError(
   record: ReturnType<typeof completeRecord>,
   code: DecisionRecordAdapterErrorCode,
@@ -134,6 +157,7 @@ describe("toDecisionSummary", () => {
       domainAssessment: "unknown",
       oodDetector: null,
       predictionInterval: null,
+      decisionCriterion: null,
       rationale: ["Evidence coverage is incomplete."],
       evidence: {
         id: "ES-001",
@@ -219,6 +243,186 @@ describe("toDecisionSummary", () => {
     const summary = toDecisionSummary(completeRecord());
 
     expect(summary).not.toHaveProperty("predictionPositions");
+  });
+
+  it("maps one exact recorded decision criterion with inherited target and unit", () => {
+    const summary = toDecisionSummary(completeRecordWithDecisionCriterion());
+
+    expect(summary.decisionCriterion).toEqual({
+      criterionId: "potency_policy",
+      criterionVersion: "2026.07",
+      comparator: "less_than_or_equal",
+      thresholdDecimal: "0.75",
+      target: "binding_affinity",
+      unit: "nM",
+      criterionEvidence: {
+        id: "ES-CRITERION-001",
+        sha256: validSha256,
+      },
+    });
+  });
+
+  it("inherits changed target and unit without changing criterion wire data", () => {
+    const record = completeRecordWithDecisionCriterion();
+    record.predictionInterval!.target = "selectivity_ratio";
+    record.predictionInterval!.unit = "ratio";
+    for (const position of record.predictionPositions) {
+      position.interval!.target = "selectivity_ratio";
+      position.interval!.unit = "ratio";
+    }
+
+    expect(record.decisionCriterion).toMatchObject({
+      criterionId: "potency_policy",
+      thresholdDecimal: "0.75",
+    });
+    expect(toDecisionSummary(record).decisionCriterion).toMatchObject({
+      target: "selectivity_ratio",
+      unit: "ratio",
+    });
+  });
+
+  it("maps absent historical decision criterion metadata to null", () => {
+    const record = completeRecordWithPredictionPositions();
+
+    expect(toDecisionSummary(record).decisionCriterion).toBeNull();
+  });
+
+  it.each([
+    [DecisionCriterionComparator.LESS_THAN, "less_than"],
+    [DecisionCriterionComparator.LESS_THAN_OR_EQUAL, "less_than_or_equal"],
+    [DecisionCriterionComparator.GREATER_THAN, "greater_than"],
+    [
+      DecisionCriterionComparator.GREATER_THAN_OR_EQUAL,
+      "greater_than_or_equal",
+    ],
+  ] as const)("maps decision criterion comparator %s", (wire, expected) => {
+    const record = completeRecordWithDecisionCriterion();
+    record.decisionCriterion = completeDecisionCriterion(wire);
+
+    expect(toDecisionSummary(record).decisionCriterion?.comparator).toBe(
+      expected,
+    );
+  });
+
+  it.each([
+    ["blank criterion ID", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.criterionId = " ";
+    }],
+    ["criterion version containing NUL", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.criterionVersion = "2026\0.07";
+    }],
+    ["oversized criterion ID", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.criterionId = "x".repeat(201);
+    }],
+    ["multibyte version exceeding the byte limit", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.criterionVersion = "é".repeat(101);
+    }],
+    ["noncanonical threshold", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.thresholdDecimal = "0.750";
+    }],
+    ["oversized threshold", (criterion: ReturnType<typeof completeDecisionCriterion>) => {
+      criterion.thresholdDecimal = "1".repeat(65);
+    }],
+  ])("rejects a decision criterion with %s", (_case, invalidate) => {
+    const record = completeRecordWithDecisionCriterion();
+    invalidate(record.decisionCriterion!);
+
+    expectAdapterError(record, "invalid_decision_criterion");
+  });
+
+  it("accepts exact decision criterion identifier and threshold byte limits", () => {
+    const record = completeRecordWithDecisionCriterion();
+    record.decisionCriterion!.criterionId = "i".repeat(200);
+    record.decisionCriterion!.criterionVersion = "v".repeat(200);
+    record.decisionCriterion!.thresholdDecimal = "1".repeat(64);
+
+    expect(toDecisionSummary(record).decisionCriterion).toMatchObject({
+      criterionId: "i".repeat(200),
+      criterionVersion: "v".repeat(200),
+      thresholdDecimal: "1".repeat(64),
+    });
+  });
+
+  it("matches the domain Unicode whitespace boundary contract", () => {
+    const preserved = completeRecordWithDecisionCriterion();
+    preserved.decisionCriterion!.criterionId = "\ufeffpotency_policy\ufeff";
+    preserved.decisionCriterion!.criterionVersion = "\ufeff2026.07\ufeff";
+    preserved.decisionCriterion!.criterionEvidence!.id =
+      "\ufeffES-CRITERION-001\ufeff";
+
+    expect(toDecisionSummary(preserved).decisionCriterion).toMatchObject({
+      criterionId: "\ufeffpotency_policy\ufeff",
+      criterionVersion: "\ufeff2026.07\ufeff",
+      criterionEvidence: { id: "\ufeffES-CRITERION-001\ufeff" },
+    });
+
+    const invalidCriterion = completeRecordWithDecisionCriterion();
+    invalidCriterion.decisionCriterion!.criterionId = "\u2003potency_policy";
+    expectAdapterError(invalidCriterion, "invalid_decision_criterion");
+
+    const invalidEvidence = completeRecordWithDecisionCriterion();
+    invalidEvidence.decisionCriterion!.criterionEvidence!.id =
+      "ES-CRITERION-001\u2003";
+    expectAdapterError(
+      invalidEvidence,
+      "invalid_decision_criterion_evidence",
+    );
+  });
+
+  it("preserves bounded hostile criterion text as data", () => {
+    const record = completeRecordWithDecisionCriterion();
+    record.decisionCriterion!.criterionId = "<img src=x onerror=alert(1)>";
+    record.decisionCriterion!.criterionVersion = "<script>alert(2)</script>";
+
+    expect(toDecisionSummary(record).decisionCriterion).toMatchObject({
+      criterionId: "<img src=x onerror=alert(1)>",
+      criterionVersion: "<script>alert(2)</script>",
+    });
+  });
+
+  it("rejects a decision criterion without its parent prediction interval", () => {
+    const record = completeRecordWithDecisionCriterion();
+    record.predictionInterval = undefined;
+
+    expectAdapterError(record, "incomparable_decision_criterion");
+  });
+
+  it("rejects a decision criterion without evidence", () => {
+    const record = completeRecordWithDecisionCriterion();
+    record.decisionCriterion!.criterionEvidence = undefined;
+
+    expectAdapterError(record, "missing_decision_criterion_evidence");
+  });
+
+  it.each([
+    ["blank ID", (record: ReturnType<typeof completeRecordWithDecisionCriterion>) => {
+      record.decisionCriterion!.criterionEvidence!.id = " ";
+    }],
+    ["NUL ID", (record: ReturnType<typeof completeRecordWithDecisionCriterion>) => {
+      record.decisionCriterion!.criterionEvidence!.id = "ES\0CRITERION";
+    }],
+    ["invalid digest", (record: ReturnType<typeof completeRecordWithDecisionCriterion>) => {
+      record.decisionCriterion!.criterionEvidence!.sha256 = "INVALID";
+    }],
+  ])("rejects decision criterion evidence with %s", (_case, invalidate) => {
+    const record = completeRecordWithDecisionCriterion();
+    invalidate(record);
+
+    expectAdapterError(record, "invalid_decision_criterion_evidence");
+  });
+
+  it("rejects unspecified and unknown decision criterion comparators distinctly", () => {
+    const unspecified = completeRecordWithDecisionCriterion();
+    unspecified.decisionCriterion!.comparator =
+      DecisionCriterionComparator.UNSPECIFIED;
+    expectAdapterError(
+      unspecified,
+      "unspecified_decision_criterion_comparator",
+    );
+
+    const unknown = completeRecordWithDecisionCriterion();
+    unknown.decisionCriterion!.comparator = 99 as DecisionCriterionComparator;
+    expectAdapterError(unknown, "unknown_decision_criterion_comparator");
   });
 
   it("maps exact recorded prediction positions in recorded order", () => {
