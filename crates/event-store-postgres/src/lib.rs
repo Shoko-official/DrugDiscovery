@@ -3,8 +3,10 @@
 mod reader;
 
 pub use reader::{
-    InvalidDecisionSourceScope, PostgresDecisionEventReader, PostgresLatestDecisionSource,
-    ReadDecisionEventError,
+    DecisionStreamContinuation, DecisionStreamPage, DecisionStreamPageSize,
+    InvalidDecisionSourceScope, InvalidDecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS,
+    PostgresDecisionEventReader, PostgresLatestDecisionSource, ReadDecisionEventError,
+    ReadDecisionStreamPageError,
 };
 
 use bioworld_contracts::v2::DecisionEvent;

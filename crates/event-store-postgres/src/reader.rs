@@ -20,6 +20,7 @@ use crate::{
 };
 
 const READER_ROLE: &str = "bioworld_reader";
+pub const MAX_DECISION_STREAM_PAGE_EVENTS: usize = 16;
 const SELECT_DECISION_EVENT: &str = r#"
 SELECT
   event_id,
@@ -92,6 +93,53 @@ FROM (
   LIMIT 1
 ) AS bounded_event
 "#;
+const SELECT_DECISION_STREAM_HORIZON: &str = r#"
+SELECT MAX(aggregate_version)::text
+FROM public.scientific_event
+WHERE tenant_id = $1 AND aggregate_type = $2 AND aggregate_id = $3
+"#;
+const SELECT_DECISION_STREAM_PAGE: &str = r#"
+SELECT
+  event_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_id END AS aggregate_id,
+  CASE WHEN decision_envelope_is_bounded THEN aggregate_version::text END AS aggregate_version,
+  occurred_at,
+  CASE WHEN decision_envelope_is_bounded THEN payload::text END AS payload_json,
+  CASE WHEN decision_envelope_is_bounded THEN payload_sha256 END AS payload_sha256,
+  CASE WHEN decision_envelope_is_bounded THEN signature::text END AS signature_json,
+  decision_envelope_is_bounded
+FROM (
+  SELECT
+    event_id,
+    aggregate_id,
+    aggregate_version,
+    occurred_at,
+    payload,
+    payload_sha256,
+    signature,
+    event_type = $7
+      AND schema_version = $8
+      AND aggregate_type = $2
+      AND pg_catalog.char_length(aggregate_id) <= $9
+      AND pg_catalog.octet_length(aggregate_id) <= $10
+      AND aggregate_version >= 1
+      AND aggregate_version <= 18446744073709551615
+      AND aggregate_version = pg_catalog.trunc(aggregate_version)
+      AND payload_sha256 COLLATE "C" ~ '^[0-9a-f]{64}$'
+      AND pg_catalog.octet_length(payload::text) <= $11
+      AND pg_catalog.octet_length(signature::text) <= $12
+      AS decision_envelope_is_bounded
+  FROM public.scientific_event
+  WHERE tenant_id = $1
+    AND aggregate_type = $2
+    AND aggregate_id = $3
+    AND aggregate_version > $4::text::numeric
+    AND aggregate_version <= $5::text::numeric
+  ORDER BY aggregate_version ASC
+  LIMIT $6
+) AS bounded_event
+ORDER BY bounded_event.aggregate_version ASC
+"#;
 
 #[derive(Clone, Copy)]
 enum DecisionEventLookup {
@@ -121,6 +169,63 @@ pub enum ReadDecisionEventError {
     DatabaseRejected,
     #[error("database transaction cleanup failed")]
     TransactionCleanupFailed,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReadDecisionStreamPageError {
+    #[error("decision stream continuation was rejected before database access")]
+    InvalidContinuation,
+    #[error(transparent)]
+    Read(#[from] ReadDecisionEventError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecisionStreamPageSize(u8);
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("decision stream page size is invalid")]
+pub struct InvalidDecisionStreamPageSize;
+
+impl TryFrom<usize> for DecisionStreamPageSize {
+    type Error = InvalidDecisionStreamPageSize;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if !(1..=MAX_DECISION_STREAM_PAGE_EVENTS).contains(&value) {
+            return Err(InvalidDecisionStreamPageSize);
+        }
+
+        let value = u8::try_from(value).map_err(|_| InvalidDecisionStreamPageSize)?;
+        Ok(Self(value))
+    }
+}
+
+impl DecisionStreamPageSize {
+    fn query_limit(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+#[derive(Clone)]
+pub struct DecisionStreamContinuation {
+    tenant_id: String,
+    decision_id: Uuid,
+    exclusive_start: u64,
+    inclusive_horizon: u64,
+}
+
+pub struct DecisionStreamPage {
+    events: Vec<DecisionEvent>,
+    continuation: Option<DecisionStreamContinuation>,
+}
+
+impl DecisionStreamPage {
+    pub fn events(&self) -> &[DecisionEvent] {
+        &self.events
+    }
+
+    pub fn continuation(&self) -> Option<&DecisionStreamContinuation> {
+        self.continuation.as_ref()
+    }
 }
 
 pub struct PostgresDecisionEventReader<'client> {
@@ -186,6 +291,54 @@ impl<'client> PostgresDecisionEventReader<'client> {
             .await
     }
 
+    pub async fn get_stream_page(
+        &mut self,
+        tenant_id: &str,
+        decision_id: Uuid,
+        page_size: DecisionStreamPageSize,
+        continuation: Option<&DecisionStreamContinuation>,
+    ) -> Result<DecisionStreamPage, ReadDecisionStreamPageError> {
+        if !tenant_id_is_valid(tenant_id) {
+            return Err(ReadDecisionEventError::InvalidTenantId.into());
+        }
+        if continuation.is_some_and(|continuation| {
+            continuation.tenant_id != tenant_id || continuation.decision_id != decision_id
+        }) {
+            return Err(ReadDecisionStreamPageError::InvalidContinuation);
+        }
+
+        let transaction = self
+            .client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|error| classify_reader_database_error(&error))
+            .map_err(ReadDecisionStreamPageError::from)?;
+
+        let result = match read_stream_page_in_transaction(
+            &transaction,
+            tenant_id,
+            decision_id,
+            page_size,
+            continuation,
+        )
+        .await
+        {
+            Ok(page) => transaction
+                .commit()
+                .await
+                .map_err(|error| classify_reader_database_error(&error))
+                .map(|()| page),
+            Err(error) => match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(_) => Err(ReadDecisionEventError::TransactionCleanupFailed),
+            },
+        };
+
+        result.map_err(ReadDecisionStreamPageError::from)
+    }
+
     async fn read(
         &mut self,
         tenant_id: &str,
@@ -215,6 +368,110 @@ impl<'client> PostgresDecisionEventReader<'client> {
             },
         }
     }
+}
+
+async fn read_stream_page_in_transaction(
+    transaction: &Transaction<'_>,
+    tenant_id: &str,
+    decision_id: Uuid,
+    page_size: DecisionStreamPageSize,
+    continuation: Option<&DecisionStreamContinuation>,
+) -> Result<DecisionStreamPage, ReadDecisionEventError> {
+    verify_role_identity(transaction, READER_ROLE)
+        .await
+        .map_err(map_append_error)?;
+    verify_read_only(transaction).await?;
+    set_tenant_context(transaction, tenant_id)
+        .await
+        .map_err(map_append_error)?;
+
+    let aggregate_id = decision_id.to_string();
+    let (exclusive_start, inclusive_horizon) = match continuation {
+        Some(continuation) => (continuation.exclusive_start, continuation.inclusive_horizon),
+        None => {
+            let row = transaction
+                .query_one(
+                    SELECT_DECISION_STREAM_HORIZON,
+                    &[&tenant_id, &DECISION_AGGREGATE_TYPE, &aggregate_id],
+                )
+                .await
+                .map_err(|error| classify_reader_database_error(&error))?;
+            let horizon = row
+                .try_get::<_, Option<String>>(0)
+                .map_err(|_| ReadDecisionEventError::StoredEventRejected)?;
+            let Some(horizon) = horizon else {
+                return Ok(DecisionStreamPage {
+                    events: Vec::new(),
+                    continuation: None,
+                });
+            };
+            let horizon = parse_aggregate_version(&horizon)
+                .ok_or(ReadDecisionEventError::StoredEventRejected)?;
+            (0, horizon)
+        }
+    };
+
+    if exclusive_start >= inclusive_horizon {
+        return Ok(DecisionStreamPage {
+            events: Vec::new(),
+            continuation: None,
+        });
+    }
+
+    let identifier_chars_limit = i32::try_from(MAX_STORED_EVENT_IDENTIFIER_CHARS)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let identifier_bytes_limit = i32::try_from(MAX_STORED_EVENT_IDENTIFIER_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let payload_limit = i32::try_from(MAX_STORED_EVENT_PAYLOAD_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let signature_limit = i32::try_from(MAX_STORED_EVENT_SIGNATURE_BYTES)
+        .map_err(|_| ReadDecisionEventError::DatabaseRejected)?;
+    let exclusive_start = exclusive_start.to_string();
+    let inclusive_horizon_text = inclusive_horizon.to_string();
+    let query_limit = page_size.query_limit();
+    let rows = transaction
+        .query(
+            SELECT_DECISION_STREAM_PAGE,
+            &[
+                &tenant_id,
+                &DECISION_AGGREGATE_TYPE,
+                &aggregate_id,
+                &exclusive_start,
+                &inclusive_horizon_text,
+                &query_limit,
+                &DECISION_EVENT_TYPE,
+                &DECISION_SCHEMA_VERSION,
+                &identifier_chars_limit,
+                &identifier_bytes_limit,
+                &payload_limit,
+                &signature_limit,
+            ],
+        )
+        .await
+        .map_err(|error| classify_reader_database_error(&error))?;
+
+    let events = rows
+        .into_iter()
+        .map(|row| reconstruct_row(row, tenant_id, DecisionEventLookup::Latest(decision_id)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(last_version) = events
+        .last()
+        .and_then(|event| event.decision.as_ref())
+        .map(|decision| decision.aggregate_version)
+    else {
+        return Err(ReadDecisionEventError::StoredEventRejected);
+    };
+    let continuation = (last_version < inclusive_horizon).then_some(DecisionStreamContinuation {
+        tenant_id: tenant_id.to_owned(),
+        decision_id,
+        exclusive_start: last_version,
+        inclusive_horizon,
+    });
+
+    Ok(DecisionStreamPage {
+        events,
+        continuation,
+    })
 }
 
 async fn read_in_transaction(
@@ -438,9 +695,9 @@ mod tests {
     use bioworld_decision_query::LatestDecisionSourceError;
 
     use super::{
-        READER_ROLE, ReadDecisionEventError, SELECT_DECISION_EVENT, SELECT_LATEST_DECISION_EVENT,
-        decision_from_event, map_append_error, map_read_error, parse_aggregate_version,
-        tenant_id_is_valid,
+        READER_ROLE, ReadDecisionEventError, SELECT_DECISION_EVENT, SELECT_DECISION_STREAM_HORIZON,
+        SELECT_DECISION_STREAM_PAGE, SELECT_LATEST_DECISION_EVENT, decision_from_event,
+        map_append_error, map_read_error, parse_aggregate_version, tenant_id_is_valid,
     };
     use crate::{AppendDecisionEventError, RoleAttributes, role_identity_is_valid};
 
@@ -500,7 +757,11 @@ mod tests {
 
     #[test]
     fn guards_json_fields_before_client_deserialization() {
-        for query in [SELECT_DECISION_EVENT, SELECT_LATEST_DECISION_EVENT] {
+        for query in [
+            SELECT_DECISION_EVENT,
+            SELECT_LATEST_DECISION_EVENT,
+            SELECT_DECISION_STREAM_PAGE,
+        ] {
             assert!(query.contains("CASE WHEN"));
             assert!(query.contains("THEN aggregate_id END AS aggregate_id"));
             assert!(query.contains("THEN aggregate_version::text END AS aggregate_version"));
@@ -510,10 +771,36 @@ mod tests {
             assert!(query.contains("AS decision_envelope_is_bounded"));
             assert!(query.contains("pg_catalog.char_length(aggregate_id)"));
             assert!(query.contains("pg_catalog.octet_length(aggregate_id)"));
+            assert!(query.contains("pg_catalog.octet_length(payload::text)"));
+            assert!(query.contains("pg_catalog.octet_length(signature::text)"));
             assert!(!query.contains("public.scientific_event.*"));
             assert!(!query.contains("THEN payload END"));
             assert!(!query.contains("THEN signature END"));
         }
+    }
+
+    #[test]
+    fn scopes_stream_horizon_and_pages_with_numeric_keyset_sql() {
+        for query in [SELECT_DECISION_STREAM_HORIZON, SELECT_DECISION_STREAM_PAGE] {
+            assert!(query.contains("tenant_id = $1"));
+            assert!(query.contains("aggregate_type = $2"));
+            assert!(query.contains("aggregate_id = $3"));
+        }
+
+        assert!(SELECT_DECISION_STREAM_PAGE.contains("aggregate_version > $4::text::numeric"));
+        assert!(SELECT_DECISION_STREAM_PAGE.contains("aggregate_version <= $5::text::numeric"));
+        assert!(SELECT_DECISION_STREAM_PAGE.contains("ORDER BY aggregate_version ASC"));
+        assert!(
+            SELECT_DECISION_STREAM_PAGE.contains("ORDER BY bounded_event.aggregate_version ASC")
+        );
+        assert!(SELECT_DECISION_STREAM_PAGE.contains("LIMIT $6"));
+        assert!(
+            SELECT_DECISION_STREAM_PAGE.contains("pg_catalog.octet_length(payload::text) <= $11")
+        );
+        assert!(
+            SELECT_DECISION_STREAM_PAGE.contains("pg_catalog.octet_length(signature::text) <= $12")
+        );
+        assert!(!SELECT_DECISION_STREAM_PAGE.contains("OFFSET"));
     }
 
     #[test]

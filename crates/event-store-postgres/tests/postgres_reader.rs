@@ -16,8 +16,10 @@ use bioworld_event_store_contracts::{
     ScientificEventRow, project_decision_event,
 };
 use bioworld_event_store_postgres::{
-    AppendDecisionEventError, InvalidDecisionSourceScope, PostgresDecisionEventReader,
+    AppendDecisionEventError, DecisionStreamPageSize, InvalidDecisionSourceScope,
+    InvalidDecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS, PostgresDecisionEventReader,
     PostgresDecisionEventWriter, PostgresLatestDecisionSource, ReadDecisionEventError,
+    ReadDecisionStreamPageError,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -33,6 +35,21 @@ const POSTGRES_READER_USER: &str = "bioworld_reader";
 const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PASSWORD";
 const READER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_READER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
+
+#[test]
+fn validates_decision_stream_page_size_before_database_access() {
+    assert_eq!(MAX_DECISION_STREAM_PAGE_EVENTS, 16);
+    for valid in 1..=16 {
+        assert!(DecisionStreamPageSize::try_from(valid).is_ok());
+    }
+
+    for invalid in [0, 17, usize::MAX] {
+        assert_eq!(
+            DecisionStreamPageSize::try_from(invalid),
+            Err(InvalidDecisionStreamPageSize)
+        );
+    }
+}
 
 struct IntegrationPasswords {
     writer: String,
@@ -539,6 +556,434 @@ async fn returns_the_only_version_one_event_for_a_decision_stream() {
 }
 
 #[tokio::test]
+async fn reads_a_complete_single_event_decision_stream_page() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m37-single-page";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe701")
+        .expect("fixed decision identifier must parse");
+    let expected = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8201",
+        &decision_id.to_string(),
+        1,
+    );
+
+    append(&mut writer, expected.clone(), tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
+    let page = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, page_size, None)
+        .await
+        .expect("reader must load the complete stream page");
+
+    assert_eq!(page.events(), std::slice::from_ref(&expected));
+    assert!(page.continuation().is_none());
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn rejects_a_continuation_reused_for_another_tenant_or_decision_stream() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_a = "tenant-m37-cursor-a";
+    let tenant_b = "tenant-m37-cursor-b";
+    let decision_a = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe702")
+        .expect("fixed decision identifier must parse");
+    let decision_b = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe703")
+        .expect("fixed decision identifier must parse");
+
+    for (event_id, tenant_id, decision_id, version) in [
+        (
+            "01910d47-6f80-7a31-8c29-1d5c4f6b8202",
+            tenant_a,
+            decision_a,
+            1,
+        ),
+        (
+            "01910d47-6f80-7a31-8c29-1d5c4f6b8203",
+            tenant_a,
+            decision_a,
+            2,
+        ),
+        (
+            "01910d47-6f80-7a31-8c29-1d5c4f6b8204",
+            tenant_a,
+            decision_b,
+            2,
+        ),
+        (
+            "01910d47-6f80-7a31-8c29-1d5c4f6b8205",
+            tenant_b,
+            decision_a,
+            2,
+        ),
+    ] {
+        append(
+            &mut writer,
+            decision_event_at_version(event_id, &decision_id.to_string(), version),
+            tenant_id,
+        )
+        .await;
+    }
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
+    let first = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_a, decision_a, page_size, None)
+        .await
+        .expect("first page must load");
+    let continuation = first
+        .continuation()
+        .expect("a second exact-stream event must require continuation");
+
+    for (tenant_id, decision_id) in [(tenant_a, decision_b), (tenant_b, decision_a)] {
+        let error = PostgresDecisionEventReader::new(&mut reader)
+            .get_stream_page(tenant_id, decision_id, page_size, Some(continuation))
+            .await
+            .err()
+            .expect("cross-stream continuation reuse must fail");
+        assert_eq!(error, ReadDecisionStreamPageError::InvalidContinuation);
+        assert_redacted(&error);
+        assert!(tenant_context_is_absent(&reader).await);
+    }
+
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn orders_and_resumes_gapped_versions_through_u64_max() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m37-gapped-pages";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe704")
+        .expect("fixed decision identifier must parse");
+    let versions = [1, 3, 10, u64::MAX];
+    let events = [
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8206",
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8207",
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8208",
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8209",
+    ]
+    .into_iter()
+    .zip(versions)
+    .map(|(event_id, version)| {
+        decision_event_at_version(event_id, &decision_id.to_string(), version)
+    })
+    .collect::<Vec<_>>();
+
+    for event in events.iter().rev() {
+        insert_scientific_event_row(&mut writer, projected_row(event, tenant_id)).await;
+    }
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let page_size = DecisionStreamPageSize::try_from(2).expect("fixed page size must be valid");
+    let first = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, page_size, None)
+        .await
+        .expect("first page must load");
+    assert_eq!(
+        first.events(),
+        &events[..2],
+        "first page must use numeric ascending order"
+    );
+    let continuation = first
+        .continuation()
+        .expect("remaining events must produce a continuation");
+
+    let second = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, page_size, Some(continuation))
+        .await
+        .expect("second page must resume");
+
+    assert_eq!(second.events(), &events[2..]);
+    assert!(second.continuation().is_none());
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn freezes_the_replay_horizon_until_a_fresh_page_sequence() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m37-stable-horizon";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe705")
+        .expect("fixed decision identifier must parse");
+    let first_event = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8210",
+        &decision_id.to_string(),
+        1,
+    );
+    let horizon_event = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8211",
+        &decision_id.to_string(),
+        3,
+    );
+    let later_event = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8212",
+        &decision_id.to_string(),
+        10,
+    );
+
+    append(&mut writer, first_event.clone(), tenant_id).await;
+    append(&mut writer, horizon_event.clone(), tenant_id).await;
+
+    let one = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
+    let first = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, one, None)
+        .await
+        .expect("first page must capture the horizon");
+    assert_eq!(first.events(), std::slice::from_ref(&first_event));
+    let continuation = first
+        .continuation()
+        .expect("captured history must require a continuation");
+    let all = DecisionStreamPageSize::try_from(MAX_DECISION_STREAM_PAGE_EVENTS)
+        .expect("maximum page size must be valid");
+
+    append(&mut writer, later_event.clone(), tenant_id).await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let frozen = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, all, Some(continuation))
+        .await
+        .expect("frozen replay must resume");
+    assert_eq!(frozen.events(), std::slice::from_ref(&horizon_event));
+    assert!(frozen.continuation().is_none());
+
+    let fresh = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, all, None)
+        .await
+        .expect("fresh replay must observe the later append");
+    assert_eq!(fresh.events(), &[first_event, horizon_event, later_event]);
+    assert!(fresh.continuation().is_none());
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn makes_cross_tenant_and_missing_stream_pages_indistinguishable() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_a = "tenant-m37-hidden-a";
+    let tenant_b = "tenant-m37-hidden-b";
+    let hidden_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe706")
+        .expect("fixed hidden decision identifier must parse");
+    let missing_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe707")
+        .expect("fixed missing decision identifier must parse");
+    let hidden = decision_event_at_version(
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8213",
+        &hidden_decision_id.to_string(),
+        1,
+    );
+    append(&mut writer, hidden, tenant_b).await;
+
+    let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
+    for decision_id in [hidden_decision_id, missing_decision_id] {
+        let page = PostgresDecisionEventReader::new(&mut reader)
+            .get_stream_page(tenant_a, decision_id, page_size, None)
+            .await
+            .expect("hidden and missing streams must both return empty pages");
+        assert!(page.events().is_empty());
+        assert!(page.continuation().is_none());
+        assert!(tenant_context_is_absent(&reader).await);
+    }
+
+    assert!(tenant_context_is_absent(&writer).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let page_size = DecisionStreamPageSize::try_from(16).expect("maximum page size must be valid");
+    let cases = [
+        (
+            "tenant-m37-corrupt-first",
+            "018f5a72-9c4b-7d31-8f6a-26f08f3fe708",
+            [
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8214",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8215",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8216",
+            ],
+            0,
+        ),
+        (
+            "tenant-m37-corrupt-middle",
+            "018f5a72-9c4b-7d31-8f6a-26f08f3fe709",
+            [
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8217",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8218",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8219",
+            ],
+            1,
+        ),
+        (
+            "tenant-m37-corrupt-final",
+            "018f5a72-9c4b-7d31-8f6a-26f08f3fe710",
+            [
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8220",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8221",
+                "01910d47-6f80-7a31-8c29-1d5c4f6b8222",
+            ],
+            2,
+        ),
+    ];
+
+    for (tenant_id, decision_id, event_ids, corrupt_index) in cases {
+        let decision_id =
+            Uuid::parse_str(decision_id).expect("fixed decision identifier must parse");
+        for (index, event_id) in event_ids.into_iter().enumerate() {
+            let event = decision_event_at_version(
+                event_id,
+                &decision_id.to_string(),
+                u64::try_from(index + 1).expect("fixed version must fit"),
+            );
+            if index == corrupt_index {
+                insert_corrupt_event(&mut writer, event, tenant_id).await;
+            } else {
+                append(&mut writer, event, tenant_id).await;
+            }
+        }
+        assert!(tenant_context_is_absent(&writer).await);
+
+        let error = PostgresDecisionEventReader::new(&mut reader)
+            .get_stream_page(tenant_id, decision_id, page_size, None)
+            .await
+            .err()
+            .expect("any corrupt selected row must reject the complete page");
+
+        assert_eq!(
+            error,
+            ReadDecisionStreamPageError::Read(ReadDecisionEventError::StoredEventRejected)
+        );
+        assert_redacted(&error);
+        assert!(tenant_context_is_absent(&reader).await);
+    }
+
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn caps_pages_at_sixteen_events_and_excludes_other_decision_streams() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m37-page-cap";
+    let target_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe711")
+        .expect("fixed target decision identifier must parse");
+    let other_decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fe712")
+        .expect("fixed other decision identifier must parse");
+    let mut expected = Vec::new();
+
+    for version in 1_u64..=17 {
+        let event = decision_event_at_version(
+            &format!("01910d47-6f80-7a31-8c29-1d5c4f6b{:04x}", 0x8300 + version),
+            &target_decision_id.to_string(),
+            version,
+        );
+        append(&mut writer, event.clone(), tenant_id).await;
+        expected.push(event);
+    }
+    append(
+        &mut writer,
+        decision_event_at_version(
+            "01910d47-6f80-7a31-8c29-1d5c4f6b8312",
+            &other_decision_id.to_string(),
+            1,
+        ),
+        tenant_id,
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let page_size = DecisionStreamPageSize::try_from(MAX_DECISION_STREAM_PAGE_EVENTS)
+        .expect("maximum page size must be valid");
+    let first = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, target_decision_id, page_size, None)
+        .await
+        .expect("maximum first page must load");
+    assert_eq!(first.events(), &expected[..16]);
+    let continuation = first
+        .continuation()
+        .expect("seventeenth event must require continuation");
+
+    let second = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, target_decision_id, page_size, Some(continuation))
+        .await
+        .expect("final page must load");
+    assert_eq!(second.events(), &expected[16..]);
+    assert!(second.continuation().is_none());
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
+async fn preserves_historical_optional_field_absence_in_stream_pages() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let tenant_id = "tenant-m37-historical-page";
+    let row = historical_ood_status_row(tenant_id);
+    let decision_id =
+        Uuid::parse_str(&row.aggregate_id).expect("historical decision identifier must parse");
+    insert_scientific_event_row(&mut writer, row).await;
+
+    let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
+    let page = PostgresDecisionEventReader::new(&mut reader)
+        .get_stream_page(tenant_id, decision_id, page_size, None)
+        .await
+        .expect("historical stream page must remain readable");
+    let decision = page
+        .events()
+        .first()
+        .and_then(|event| event.decision.as_ref())
+        .expect("historical page must contain one decision");
+
+    assert_eq!(decision.ood_status, Some(OodStatus::Unknown as i32));
+    assert!(decision.ood_detector.is_none());
+    assert!(decision.prediction_interval.is_none());
+    assert!(decision.prediction_positions.is_empty());
+    assert!(decision.decision_criterion.is_none());
+    assert_eq!(decision.recommendation, Recommendation::StopProgram as i32);
+    assert!(page.continuation().is_none());
+    assert!(tenant_context_is_absent(&writer).await);
+    assert!(tenant_context_is_absent(&reader).await);
+    writer_task.abort();
+    reader_task.abort();
+}
+
+#[tokio::test]
 async fn returns_u64_max_when_version_one_was_inserted_and_occurred_later() {
     let Some(passwords) = integration_passwords() else {
         return;
@@ -868,7 +1313,7 @@ fn projected_row_at(
         .expect("fixed historical event must project")
 }
 
-fn assert_redacted(error: &ReadDecisionEventError) {
+fn assert_redacted(error: &(impl std::fmt::Debug + std::fmt::Display)) {
     let rendered = format!("{error:?} {error}");
     for sensitive in [
         WRITER_PASSWORD_ENVIRONMENT_VARIABLE,
@@ -881,6 +1326,10 @@ fn assert_redacted(error: &ReadDecisionEventError) {
         "tenant-m14-corrupt",
         "018f5a72-9c4b-7d31-8f6a-26f08f3fe605",
         "01910d47-6f80-7a31-8c29-1d5c4f6b8106",
+        "tenant-m37-corrupt-middle",
+        "tenant-m37-cursor-a",
+        "018f5a72-9c4b-7d31-8f6a-26f08f3fe702",
+        "01910d47-6f80-7a31-8c29-1d5c4f6b8218",
     ] {
         assert!(!rendered.contains(sensitive));
     }
@@ -904,6 +1353,13 @@ fn exposes_a_narrow_reader_api_and_redacted_errors() {
         ReadDecisionEventError::ConnectionUnavailable,
         ReadDecisionEventError::DatabaseRejected,
         ReadDecisionEventError::TransactionCleanupFailed,
+    ] {
+        assert_redacted(&error);
+    }
+
+    for error in [
+        ReadDecisionStreamPageError::InvalidContinuation,
+        ReadDecisionStreamPageError::Read(ReadDecisionEventError::StoredEventRejected),
     ] {
         assert_redacted(&error);
     }
@@ -1055,9 +1511,11 @@ async fn rejects_writer_for_reads_and_reader_for_appends() {
     let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
     let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
     let tenant_id = "tenant-m13-opposite-identities";
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3fd501")
+        .expect("fixed decision identifier must parse");
     let event = decision_event(
         "01910d47-6f80-7a31-8c29-1d5c4f6b7401",
-        "018f5a72-9c4b-7d31-8f6a-26f08f3fd501",
+        &decision_id.to_string(),
     );
     let event_id = projected_row(&event, tenant_id).event_id;
 
@@ -1067,6 +1525,23 @@ async fn rejects_writer_for_reads_and_reader_for_appends() {
         .expect_err("writer identity must not be accepted for reads");
     assert_eq!(read_error, ReadDecisionEventError::ReaderIdentityRejected);
     assert_redacted(&read_error);
+    assert!(tenant_context_is_absent(&writer).await);
+
+    let page_error = PostgresDecisionEventReader::new(&mut writer)
+        .get_stream_page(
+            tenant_id,
+            decision_id,
+            DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid"),
+            None,
+        )
+        .await
+        .err()
+        .expect("writer identity must not be accepted for stream pages");
+    assert_eq!(
+        page_error,
+        ReadDecisionStreamPageError::Read(ReadDecisionEventError::ReaderIdentityRejected)
+    );
+    assert_redacted(&page_error);
     assert!(tenant_context_is_absent(&writer).await);
 
     let append_error = PostgresDecisionEventWriter::new(&mut reader)
