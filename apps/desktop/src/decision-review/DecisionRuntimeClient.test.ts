@@ -1,5 +1,6 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
+  DecisionPredictionIntervalSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -39,6 +40,22 @@ function validPayload(
     detectorId: "mahalanobis",
     detectorVersion: "model-2026.07",
   });
+  const calibrationEvidence = create(EvidenceSnapshotRefSchema, {
+    id: "ES-CAL-001",
+    sha256: validSha256,
+  });
+  const predictionInterval = create(DecisionPredictionIntervalSchema, {
+    target: "binding_affinity",
+    unit: "nM",
+    lowerDecimal: "0.25",
+    upperDecimal: "1.5",
+    nominalCoverageDecimal: "0.95",
+    intervalMethodId: "split_conformal",
+    intervalMethodVersion: "1.0",
+    calibrationMethodId: "held_out_calibration",
+    calibrationMethodVersion: "2026.07",
+    calibrationEvidence,
+  });
   const record = create(DecisionRecordSchema, {
     decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
     couId: "COU-001",
@@ -49,6 +66,7 @@ function validPayload(
     evidence,
     oodStatus,
     oodDetector,
+    predictionInterval,
   });
 
   return {
@@ -87,6 +105,21 @@ describe("createDecisionReviewLoader", () => {
         oodDetector: {
           detectorId: "mahalanobis",
           detectorVersion: "model-2026.07",
+        },
+        predictionInterval: {
+          target: "binding_affinity",
+          unit: "nM",
+          lowerDecimal: "0.25",
+          upperDecimal: "1.5",
+          nominalCoverageDecimal: "0.95",
+          intervalMethodId: "split_conformal",
+          intervalMethodVersion: "1.0",
+          calibrationMethodId: "held_out_calibration",
+          calibrationMethodVersion: "2026.07",
+          calibrationEvidence: {
+            id: "ES-CAL-001",
+            sha256: validSha256,
+          },
         },
         rationale: ["Evidence coverage is incomplete."],
         evidence: {
@@ -131,8 +164,47 @@ describe("createDecisionReviewLoader", () => {
         decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
         domainAssessment: "unknown",
         oodDetector: null,
+        predictionInterval: null,
       },
     });
+  });
+
+  it("returns a safe error for an invalid prediction interval", async () => {
+    const payload = validPayload();
+    const record = create(DecisionRecordSchema, {
+      decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
+      couId: "COU-001",
+      evidenceSnapshotId: "ES-001",
+      recommendation: Recommendation.ABSTAIN,
+      rationale: ["Evidence coverage is incomplete."],
+      aggregateVersion: 7n,
+      evidence: create(EvidenceSnapshotRefSchema, {
+        id: "ES-001",
+        sha256: validSha256,
+      }),
+      oodStatus: OodStatus.IN_DOMAIN,
+      predictionInterval: create(DecisionPredictionIntervalSchema, {
+        target: "binding_affinity",
+        unit: "nM",
+        lowerDecimal: "2",
+        upperDecimal: "1",
+        nominalCoverageDecimal: "0.95",
+        intervalMethodId: "split_conformal",
+        intervalMethodVersion: "1.0",
+        calibrationMethodId: "held_out_calibration",
+        calibrationMethodVersion: "2026.07",
+        calibrationEvidence: create(EvidenceSnapshotRefSchema, {
+          id: "ES-CAL-001",
+          sha256: validSha256,
+        }),
+      }),
+    });
+    const loader = createDecisionReviewLoader(async () => ({
+      ...payload,
+      protobuf: Array.from(toBinary(DecisionRecordSchema, record)),
+    }));
+
+    expectSafeRuntimeError(await loader());
   });
 
   it("maps a null runtime response to empty", async () => {

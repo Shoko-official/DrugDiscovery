@@ -24,6 +24,18 @@ message OodDetectorRef {
   string detector_id = 1;
   string detector_version = 2;
 }
+message DecisionPredictionInterval {
+  string target = 1;
+  string unit = 2;
+  string lower_decimal = 3;
+  string upper_decimal = 4;
+  string nominal_coverage_decimal = 5;
+  string interval_method_id = 6;
+  string interval_method_version = 7;
+  string calibration_method_id = 8;
+  string calibration_method_version = 9;
+  EvidenceSnapshotRef calibration_evidence = 10;
+}
 message DecisionRecord {
   string decision_id = 1;
   string cou_id = 2;
@@ -34,6 +46,7 @@ message DecisionRecord {
   EvidenceSnapshotRef evidence = 7;
   optional OodStatus ood_status = 8;
   OodDetectorRef ood_detector = 9;
+  DecisionPredictionInterval prediction_interval = 10;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {

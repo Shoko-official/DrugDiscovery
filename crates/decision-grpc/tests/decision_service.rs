@@ -12,8 +12,8 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES,
     v2::{
-        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
-        ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
+        DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+        OodDetectorRef, OodStatus, ProposeDecisionRequest, Recommendation, WatchDecisionRequest,
         decision_service_server::DecisionService as GeneratedDecisionService,
     },
 };
@@ -283,6 +283,24 @@ impl TenantScopedGetDecisionExecutor for BlockingFirstExecutor {
     }
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn record() -> DecisionRecord {
     DecisionRecord {
@@ -301,6 +319,7 @@ fn record() -> DecisionRecord {
             detector_id: "service-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -483,6 +502,7 @@ async fn authenticates_and_executes_the_exact_tenant_scoped_query() {
 
     let response = response.into_inner();
     assert_eq!(response.ood_status, Some(OodStatus::InDomain as i32));
+    assert_eq!(response.prediction_interval, Some(prediction_interval()));
     assert_eq!(response, expected);
     assert_eq!(
         *observed.lock().unwrap(),

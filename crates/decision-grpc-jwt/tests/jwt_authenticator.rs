@@ -15,8 +15,9 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
-    Recommendation, decision_service_server::DecisionService as GeneratedDecisionService,
+    DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+    OodDetectorRef, OodStatus, Recommendation,
+    decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
     DecisionGrpcService, DecisionGrpcServiceConfig, TenantScope, TenantScopedGetDecisionExecutor,
@@ -263,6 +264,24 @@ impl TenantScopedGetDecisionExecutor for RecordingExecutor {
     }
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn record() -> DecisionRecord {
     DecisionRecord {
@@ -281,6 +300,7 @@ fn record() -> DecisionRecord {
             detector_id: "jwt-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -1247,6 +1267,8 @@ async fn valid_access_token_executes_with_the_signed_tenant_only() {
         .await
         .unwrap();
 
-    assert_eq!(response.into_inner(), record());
+    let response = response.into_inner();
+    assert_eq!(response.prediction_interval, Some(prediction_interval()));
+    assert_eq!(response, record());
     assert_eq!(*tenants.lock().unwrap(), vec![TENANT_ID.to_owned()]);
 }

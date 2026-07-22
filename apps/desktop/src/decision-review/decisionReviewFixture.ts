@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  DecisionPredictionIntervalSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -20,6 +21,25 @@ const oodDetector = create(OodDetectorRefSchema, {
   detectorVersion: "model-2026.07",
 });
 
+const calibrationEvidence = create(EvidenceSnapshotRefSchema, {
+  id: "ES-CAL-001",
+  sha256:
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+});
+
+const predictionInterval = create(DecisionPredictionIntervalSchema, {
+  target: "binding_affinity",
+  unit: "nM",
+  lowerDecimal: "0.25",
+  upperDecimal: "1.5",
+  nominalCoverageDecimal: "0.95",
+  intervalMethodId: "split_conformal",
+  intervalMethodVersion: "1.0",
+  calibrationMethodId: "held_out_calibration",
+  calibrationMethodVersion: "2026.07",
+  calibrationEvidence,
+});
+
 const decision = create(DecisionRecordSchema, {
   decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
   couId: "COU-001",
@@ -30,6 +50,7 @@ const decision = create(DecisionRecordSchema, {
   evidence,
   oodStatus: OodStatus.IN_DOMAIN,
   oodDetector,
+  predictionInterval,
 });
 
 export const decisionPreviewFixture = {

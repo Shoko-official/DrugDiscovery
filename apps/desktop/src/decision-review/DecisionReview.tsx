@@ -18,6 +18,22 @@ export type OodDetectorMetadata = {
   detectorVersion: string;
 };
 
+export type PredictionIntervalMetadata = {
+  target: string;
+  unit: string;
+  lowerDecimal: string;
+  upperDecimal: string;
+  nominalCoverageDecimal: string;
+  intervalMethodId: string;
+  intervalMethodVersion: string;
+  calibrationMethodId: string;
+  calibrationMethodVersion: string;
+  calibrationEvidence: {
+    id: string;
+    sha256: string;
+  };
+};
+
 export type DecisionSummary = {
   decisionId: string;
   couId: string;
@@ -25,6 +41,7 @@ export type DecisionSummary = {
   recommendation: Recommendation;
   domainAssessment: DomainAssessment;
   oodDetector?: OodDetectorMetadata | null;
+  predictionInterval?: PredictionIntervalMetadata | null;
   rationale: readonly string[];
   evidence: {
     id: string;
@@ -163,6 +180,102 @@ function ErrorState({
   );
 }
 
+function PredictionIntervalSection({
+  interval,
+}: {
+  interval?: PredictionIntervalMetadata | null;
+}): React.JSX.Element {
+  return (
+    <section
+      className="prediction-interval"
+      aria-labelledby="prediction-interval-title"
+    >
+      <header className="prediction-interval__header">
+        <div>
+          <p className="section-label">Recorded uncertainty</p>
+          <h3 id="prediction-interval-title">Prediction interval</h3>
+        </div>
+        <span className="status status--neutral">
+          {interval ? "Recorded metadata" : "Historical interval unavailable"}
+        </span>
+      </header>
+      {interval ? (
+        <>
+          <dl className="prediction-interval__range">
+            <div>
+              <dt>Lower bound</dt>
+              <dd className="technical-value">{interval.lowerDecimal}</dd>
+            </div>
+            <div>
+              <dt>Upper bound</dt>
+              <dd className="technical-value">{interval.upperDecimal}</dd>
+            </div>
+            <div>
+              <dt>Unit</dt>
+              <dd className="technical-value">{interval.unit}</dd>
+            </div>
+          </dl>
+          <dl className="prediction-interval__facts">
+            <div>
+              <dt>Target</dt>
+              <dd className="technical-value">{interval.target}</dd>
+            </div>
+            <div>
+              <dt>Nominal coverage</dt>
+              <dd className="technical-value">
+                {interval.nominalCoverageDecimal}
+              </dd>
+            </div>
+            <div>
+              <dt>Interval method</dt>
+              <dd className="technical-value">{interval.intervalMethodId}</dd>
+            </div>
+            <div>
+              <dt>Interval method version</dt>
+              <dd className="technical-value">
+                {interval.intervalMethodVersion}
+              </dd>
+            </div>
+            <div>
+              <dt>Calibration method</dt>
+              <dd className="technical-value">
+                {interval.calibrationMethodId}
+              </dd>
+            </div>
+            <div>
+              <dt>Calibration method version</dt>
+              <dd className="technical-value">
+                {interval.calibrationMethodVersion}
+              </dd>
+            </div>
+            <div>
+              <dt>Calibration evidence ID</dt>
+              <dd className="technical-value">
+                {interval.calibrationEvidence.id}
+              </dd>
+            </div>
+            <div>
+              <dt>Calibration evidence SHA-256</dt>
+              <dd className="technical-value">
+                {interval.calibrationEvidence.sha256}
+              </dd>
+            </div>
+          </dl>
+          <p className="prediction-interval__note">
+            Values and provenance are displayed as recorded. Calibration
+            evidence content is not included in this review.
+          </p>
+        </>
+      ) : (
+        <p className="prediction-interval__note">
+          This historical decision does not include a recorded prediction
+          interval.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function ReadyState({
   decision,
   source,
@@ -248,6 +361,8 @@ function ReadyState({
             </p>
           )}
         </section>
+
+        <PredictionIntervalSection interval={decision.predictionInterval} />
 
         <section
           className="rationale-section"

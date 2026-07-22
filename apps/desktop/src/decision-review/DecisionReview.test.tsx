@@ -191,6 +191,110 @@ describe("DecisionReview", () => {
     expect(markup).not.toContain("<script");
   });
 
+  it("renders the exact recorded prediction interval after OOD provenance", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: {
+              target: "binding_affinity",
+              unit: "nM",
+              lowerDecimal: "0.25",
+              upperDecimal: "1.5",
+              nominalCoverageDecimal: "0.95",
+              intervalMethodId: "split_conformal",
+              intervalMethodVersion: "1.0",
+              calibrationMethodId: "held_out_calibration",
+              calibrationMethodVersion: "2026.07",
+              calibrationEvidence: {
+                id: "ES-CAL-001",
+                sha256:
+                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              },
+            },
+          },
+        }}
+      />,
+    );
+    const detectorIndex = markup.indexOf("OOD detector");
+    const intervalIndex = markup.indexOf("Prediction interval");
+    const rationaleIndex = markup.indexOf("Decision rationale");
+
+    expect(intervalIndex).toBeGreaterThan(detectorIndex);
+    expect(rationaleIndex).toBeGreaterThan(intervalIndex);
+    expect(markup).toContain("Recorded metadata");
+    expect(markup).toContain("binding_affinity");
+    expect(markup).toContain("0.25");
+    expect(markup).toContain("1.5");
+    expect(markup).toContain("nM");
+    expect(markup).toContain("Nominal coverage");
+    expect(markup).toContain("0.95");
+    expect(markup).toContain("split_conformal");
+    expect(markup).toContain("held_out_calibration");
+    expect(markup).toContain("ES-CAL-001");
+    expect(markup).toContain(
+      "Values and provenance are displayed as recorded.",
+    );
+    expect(markup).not.toContain("scientifically calibrated");
+  });
+
+  it("states when a historical prediction interval is unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "bundled_sample",
+          decision: { ...tracedDecision, predictionInterval: null },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Prediction interval");
+    expect(markup).toContain("Historical interval unavailable");
+    expect(markup).toContain(
+      "This historical decision does not include a recorded prediction interval.",
+    );
+    expect(markup).not.toContain("Nominal coverage</dt>");
+  });
+
+  it("renders prediction interval metadata as escaped React text", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: {
+              target: "<img src=x onerror=alert(1)>",
+              unit: "nM<script>alert(2)</script>",
+              lowerDecimal: "0.25",
+              upperDecimal: "1.5",
+              nominalCoverageDecimal: "0.95",
+              intervalMethodId: "split_conformal",
+              intervalMethodVersion: "1.0",
+              calibrationMethodId: "held_out_calibration",
+              calibrationMethodVersion: "2026.07",
+              calibrationEvidence: {
+                id: "ES-CAL-001",
+                sha256:
+                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(markup).toContain("nM&lt;script&gt;alert(2)&lt;/script&gt;");
+    expect(markup).not.toContain("<img");
+    expect(markup).not.toContain("<script");
+  });
+
   it("renders rationale in source order and an honest evidence reference", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview

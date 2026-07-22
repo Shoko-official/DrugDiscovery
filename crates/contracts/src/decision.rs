@@ -1,6 +1,7 @@
 use std::num::NonZeroU64;
 
 use bioworld_domain::{
+    DecisionPredictionInterval as DomainDecisionPredictionInterval,
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
     MAX_DECISION_RATIONALE_ITEMS, OodDetectorRef as DomainOodDetectorRef,
     OodStatus as DomainOodStatus, Recommendation as DomainRecommendation,
@@ -48,6 +49,8 @@ pub enum DecisionContractError {
     MissingEvidence,
     #[error("evidence id is required")]
     MissingEvidenceId,
+    #[error("prediction interval calibration evidence is required")]
+    MissingPredictionIntervalCalibrationEvidence,
     #[error("legacy evidence_snapshot_id conflicts with evidence.id")]
     ConflictingEvidenceIds,
     #[error("aggregate_version must be greater than zero")]
@@ -103,13 +106,40 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
                 DomainOodDetectorRef::try_new(detector.detector_id, detector.detector_version)
             })
             .transpose()?;
+        let prediction_interval = value
+            .prediction_interval
+            .map(|interval| {
+                let calibration_evidence = interval
+                    .calibration_evidence
+                    .ok_or(Self::Error::MissingPredictionIntervalCalibrationEvidence)?;
+                let calibration_evidence = EvidenceSnapshotRef::try_new(
+                    calibration_evidence.id,
+                    calibration_evidence.sha256,
+                )?;
+
+                DomainDecisionPredictionInterval::try_new(
+                    interval.target,
+                    interval.unit,
+                    interval.lower_decimal,
+                    interval.upper_decimal,
+                    interval.nominal_coverage_decimal,
+                    interval.interval_method_id,
+                    interval.interval_method_version,
+                    interval.calibration_method_id,
+                    interval.calibration_method_version,
+                    calibration_evidence,
+                )
+                .map_err(Self::Error::from)
+            })
+            .transpose()?;
         let evidence = EvidenceSnapshotRef::try_new(evidence.id, evidence.sha256)?;
-        let decision = DomainDecisionRecord::try_new_with_ood_detector(
+        let decision = DomainDecisionRecord::try_new_with_prediction_interval(
             decision_id,
             value.cou_id,
             recommendation,
             ood_status,
             ood_detector,
+            prediction_interval,
             evidence,
             value.rationale,
         )?;
@@ -139,6 +169,25 @@ impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
             ood_detector: decision.ood_detector().map(|detector| v2::OodDetectorRef {
                 detector_id: detector.detector_id().to_owned(),
                 detector_version: detector.detector_version().to_owned(),
+            }),
+            prediction_interval: decision.prediction_interval().map(|interval| {
+                let calibration_evidence = interval.calibration_evidence();
+
+                v2::DecisionPredictionInterval {
+                    target: interval.target().to_owned(),
+                    unit: interval.unit().to_owned(),
+                    lower_decimal: interval.lower_decimal().to_owned(),
+                    upper_decimal: interval.upper_decimal().to_owned(),
+                    nominal_coverage_decimal: interval.nominal_coverage_decimal().to_owned(),
+                    interval_method_id: interval.interval_method_id().to_owned(),
+                    interval_method_version: interval.interval_method_version().to_owned(),
+                    calibration_method_id: interval.calibration_method_id().to_owned(),
+                    calibration_method_version: interval.calibration_method_version().to_owned(),
+                    calibration_evidence: Some(v2::EvidenceSnapshotRef {
+                        id: calibration_evidence.id().to_owned(),
+                        sha256: calibration_evidence.sha256().to_owned(),
+                    }),
+                }
             }),
         }
     }

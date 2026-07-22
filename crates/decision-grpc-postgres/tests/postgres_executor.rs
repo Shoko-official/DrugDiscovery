@@ -15,8 +15,8 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus, Recommendation,
-    decision_service_server::DecisionService as GeneratedDecisionService,
+    DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus,
+    Recommendation, decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
@@ -70,12 +70,12 @@ const JWT_ISSUER: &str = "https://identity.bioworld.test";
 const JWT_AUDIENCE: &str = "https://decision.bioworld.test";
 const JWT_REQUIRED_SCOPE: &str = "decision:read";
 const JWT_KEY_ID: &str = "postgres-integration-key";
-const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
+const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
-    "22735232adcac85cc4bd3d3b0fee84866ec86d41e112733a1ceeac3ef699ca0c";
-const TENANT_B_PAYLOAD: &str = r#"{"aggregate_version":"7","cou_id":"COU-GRPC-PG-B","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-B","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"rationale":["Tenant B decision."],"recommendation":"stop_program"}"#;
+    "6edfb37aaa32fa129e69b0dfe5ba81e73b6e6f3947bd484e30617ac71b21624c";
+const TENANT_B_PAYLOAD: &str = r#"{"aggregate_version":"7","cou_id":"COU-GRPC-PG-B","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-B","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Tenant B decision."],"recommendation":"stop_program"}"#;
 const TENANT_B_PAYLOAD_SHA256: &str =
-    "1b2612cd0ddf808245e6b021d4e6b21099edfaa26369edd9e8ac61495dab11a5";
+    "c1f679539a2c90b2750bf06655dbcf62b57ee35a3286bde4ce54e8865fd1394b";
 
 struct IntegrationPasswords {
     writer: String,
@@ -528,6 +528,24 @@ async fn tenant_context_is_absent(client: &Client) -> bool {
         .get(0)
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn record(
     decision_id: &str,
@@ -551,6 +569,7 @@ fn record(
         }),
         ood_status: Some(OodStatus::Unknown as i32),
         ood_detector: None,
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -1011,18 +1030,14 @@ async fn production_pool_executes_concurrent_tenant_isolated_reads() {
         get_decision(&executor, scope(POOL_TENANT_A), request(SHARED_DECISION_ID),),
         get_decision(&executor, scope(POOL_TENANT_B), request(SHARED_DECISION_ID),),
     );
+    let tenant_a_response = tenant_a_response.expect("tenant A decision must be returned");
+    let tenant_b_response = tenant_b_response.expect("tenant B decision must be returned");
 
+    assert_eq!(tenant_a_response.get_ref(), &tenant_a.record);
+    assert_eq!(tenant_b_response.get_ref(), &tenant_b.record);
     assert_eq!(
-        tenant_a_response
-            .expect("tenant A decision must be returned")
-            .get_ref(),
-        &tenant_a.record
-    );
-    assert_eq!(
-        tenant_b_response
-            .expect("tenant B decision must be returned")
-            .get_ref(),
-        &tenant_b.record
+        tenant_a_response.get_ref().prediction_interval,
+        Some(prediction_interval())
     );
 
     let mut first = pool.acquire().await.expect("first clean lease must return");

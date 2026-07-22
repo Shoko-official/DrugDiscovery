@@ -1,5 +1,6 @@
 use bioworld_contracts::v2::{
-    DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
+    DecisionEvent, DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef,
+    OodStatus, Recommendation,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
@@ -24,6 +25,24 @@ fn occurred_at() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
     DecisionEvent {
@@ -45,6 +64,7 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
                 detector_id: "mahalanobis".to_owned(),
                 detector_version: "model-2026.07".to_owned(),
             }),
+            prediction_interval: Some(prediction_interval()),
         }),
     }
 }
@@ -211,6 +231,24 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
         json!({
             "detector_id": "mahalanobis",
             "detector_version": "model-2026.07"
+        })
+    );
+    assert_eq!(
+        stored.payload["prediction_interval"],
+        json!({
+            "target": "binding_affinity",
+            "unit": "nM",
+            "lower_decimal": "0.25",
+            "upper_decimal": "1.5",
+            "nominal_coverage_decimal": "0.95",
+            "interval_method_id": "split_conformal",
+            "interval_method_version": "1.0",
+            "calibration_method_id": "held_out_calibration",
+            "calibration_method_version": "2026.07",
+            "calibration_evidence": {
+                "id": "ES-CAL-001",
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
         })
     );
     assert_eq!(stored.payload_sha256, expected.payload_sha256);

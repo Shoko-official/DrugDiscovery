@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file bioworld/v2/decision.proto.
  */
 export const file_bioworld_v2_decision: GenFile = /*@__PURE__*/
-  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAkiPwoOT29kRGV0ZWN0b3JSZWYSEwoLZGV0ZWN0b3JfaWQYASABKAkSGAoQZGV0ZWN0b3JfdmVyc2lvbhgCIAEoCSLhAgoORGVjaXNpb25SZWNvcmQSEwoLZGVjaXNpb25faWQYASABKAkSDgoGY291X2lkGAIgASgJEiAKFGV2aWRlbmNlX3NuYXBzaG90X2lkGAMgASgJQgIYARIzCg5yZWNvbW1lbmRhdGlvbhgEIAEoDjIbLmJpb3dvcmxkLnYyLlJlY29tbWVuZGF0aW9uEhEKCXJhdGlvbmFsZRgFIAMoCRIZChFhZ2dyZWdhdGVfdmVyc2lvbhgGIAEoBBIyCghldmlkZW5jZRgHIAEoCzIgLmJpb3dvcmxkLnYyLkV2aWRlbmNlU25hcHNob3RSZWYSLwoKb29kX3N0YXR1cxgIIAEoDjIWLmJpb3dvcmxkLnYyLk9vZFN0YXR1c0gAiAEBEjEKDG9vZF9kZXRlY3RvchgJIAEoCzIbLmJpb3dvcmxkLnYyLk9vZERldGVjdG9yUmVmQg0KC19vb2Rfc3RhdHVzIlAKDURlY2lzaW9uRXZlbnQSLQoIZGVjaXNpb24YASABKAsyGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBIQCghldmVudF9pZBgCIAEoCSq+AQoOUmVjb21tZW5kYXRpb24SHgoaUkVDT01NRU5EQVRJT05fVU5TUEVDSUZJRUQQABIaChZSRUNPTU1FTkRBVElPTl9QUk9NT1RFEAESGQoVUkVDT01NRU5EQVRJT05fUkVKRUNUEAISGgoWUkVDT01NRU5EQVRJT05fQUJTVEFJThADEhgKFFJFQ09NTUVOREFUSU9OX0RFRkVSEAQSHwobUkVDT01NRU5EQVRJT05fU1RPUF9QUk9HUkFNEAUqkgEKCU9vZFN0YXR1cxIaChZPT0RfU1RBVFVTX1VOU1BFQ0lGSUVEEAASGAoUT09EX1NUQVRVU19JTl9ET01BSU4QARIZChVPT0RfU1RBVFVTX0JPUkRFUkxJTkUQAhIcChhPT0RfU1RBVFVTX09VVF9PRl9ET01BSU4QAxIWChJPT0RfU1RBVFVTX1VOS05PV04QBDKFAgoPRGVjaXNpb25TZXJ2aWNlEksKC0dldERlY2lzaW9uEh8uYmlvd29ybGQudjIuR2V0RGVjaXNpb25SZXF1ZXN0GhsuYmlvd29ybGQudjIuRGVjaXNpb25SZWNvcmQSUwoPUHJvcG9zZURlY2lzaW9uEiMuYmlvd29ybGQudjIuUHJvcG9zZURlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElAKDVdhdGNoRGVjaXNpb24SIS5iaW93b3JsZC52Mi5XYXRjaERlY2lzaW9uUmVxdWVzdBoaLmJpb3dvcmxkLnYyLkRlY2lzaW9uRXZlbnQwAWIGcHJvdG8z");
+  fileDesc("ChpiaW93b3JsZC92Mi9kZWNpc2lvbi5wcm90bxILYmlvd29ybGQudjIiKQoSR2V0RGVjaXNpb25SZXF1ZXN0EhMKC2RlY2lzaW9uX2lkGAEgASgJIqcBChZQcm9wb3NlRGVjaXNpb25SZXF1ZXN0EhcKD2lkZW1wb3RlbmN5X2tleRgBIAEoCRIOCgZjb3VfaWQYAiABKAkSHAoUZXZpZGVuY2Vfc25hcHNob3RfaWQYAyABKAkSMwoOcmVjb21tZW5kYXRpb24YBCABKA4yGy5iaW93b3JsZC52Mi5SZWNvbW1lbmRhdGlvbhIRCglyYXRpb25hbGUYBSADKAkiKwoUV2F0Y2hEZWNpc2lvblJlcXVlc3QSEwoLZGVjaXNpb25faWQYASABKAkiMQoTRXZpZGVuY2VTbmFwc2hvdFJlZhIKCgJpZBgBIAEoCRIOCgZzaGEyNTYYAiABKAkiPwoOT29kRGV0ZWN0b3JSZWYSEwoLZGV0ZWN0b3JfaWQYASABKAkSGAoQZGV0ZWN0b3JfdmVyc2lvbhgCIAEoCSLKAgoaRGVjaXNpb25QcmVkaWN0aW9uSW50ZXJ2YWwSDgoGdGFyZ2V0GAEgASgJEgwKBHVuaXQYAiABKAkSFQoNbG93ZXJfZGVjaW1hbBgDIAEoCRIVCg11cHBlcl9kZWNpbWFsGAQgASgJEiAKGG5vbWluYWxfY292ZXJhZ2VfZGVjaW1hbBgFIAEoCRIaChJpbnRlcnZhbF9tZXRob2RfaWQYBiABKAkSHwoXaW50ZXJ2YWxfbWV0aG9kX3ZlcnNpb24YByABKAkSHQoVY2FsaWJyYXRpb25fbWV0aG9kX2lkGAggASgJEiIKGmNhbGlicmF0aW9uX21ldGhvZF92ZXJzaW9uGAkgASgJEj4KFGNhbGlicmF0aW9uX2V2aWRlbmNlGAogASgLMiAuYmlvd29ybGQudjIuRXZpZGVuY2VTbmFwc2hvdFJlZiKnAwoORGVjaXNpb25SZWNvcmQSEwoLZGVjaXNpb25faWQYASABKAkSDgoGY291X2lkGAIgASgJEiAKFGV2aWRlbmNlX3NuYXBzaG90X2lkGAMgASgJQgIYARIzCg5yZWNvbW1lbmRhdGlvbhgEIAEoDjIbLmJpb3dvcmxkLnYyLlJlY29tbWVuZGF0aW9uEhEKCXJhdGlvbmFsZRgFIAMoCRIZChFhZ2dyZWdhdGVfdmVyc2lvbhgGIAEoBBIyCghldmlkZW5jZRgHIAEoCzIgLmJpb3dvcmxkLnYyLkV2aWRlbmNlU25hcHNob3RSZWYSLwoKb29kX3N0YXR1cxgIIAEoDjIWLmJpb3dvcmxkLnYyLk9vZFN0YXR1c0gAiAEBEjEKDG9vZF9kZXRlY3RvchgJIAEoCzIbLmJpb3dvcmxkLnYyLk9vZERldGVjdG9yUmVmEkQKE3ByZWRpY3Rpb25faW50ZXJ2YWwYCiABKAsyJy5iaW93b3JsZC52Mi5EZWNpc2lvblByZWRpY3Rpb25JbnRlcnZhbEINCgtfb29kX3N0YXR1cyJQCg1EZWNpc2lvbkV2ZW50Ei0KCGRlY2lzaW9uGAEgASgLMhsuYmlvd29ybGQudjIuRGVjaXNpb25SZWNvcmQSEAoIZXZlbnRfaWQYAiABKAkqvgEKDlJlY29tbWVuZGF0aW9uEh4KGlJFQ09NTUVOREFUSU9OX1VOU1BFQ0lGSUVEEAASGgoWUkVDT01NRU5EQVRJT05fUFJPTU9URRABEhkKFVJFQ09NTUVOREFUSU9OX1JFSkVDVBACEhoKFlJFQ09NTUVOREFUSU9OX0FCU1RBSU4QAxIYChRSRUNPTU1FTkRBVElPTl9ERUZFUhAEEh8KG1JFQ09NTUVOREFUSU9OX1NUT1BfUFJPR1JBTRAFKpIBCglPb2RTdGF0dXMSGgoWT09EX1NUQVRVU19VTlNQRUNJRklFRBAAEhgKFE9PRF9TVEFUVVNfSU5fRE9NQUlOEAESGQoVT09EX1NUQVRVU19CT1JERVJMSU5FEAISHAoYT09EX1NUQVRVU19PVVRfT0ZfRE9NQUlOEAMSFgoST09EX1NUQVRVU19VTktOT1dOEAQyhQIKD0RlY2lzaW9uU2VydmljZRJLCgtHZXREZWNpc2lvbhIfLmJpb3dvcmxkLnYyLkdldERlY2lzaW9uUmVxdWVzdBobLmJpb3dvcmxkLnYyLkRlY2lzaW9uUmVjb3JkElMKD1Byb3Bvc2VEZWNpc2lvbhIjLmJpb3dvcmxkLnYyLlByb3Bvc2VEZWNpc2lvblJlcXVlc3QaGy5iaW93b3JsZC52Mi5EZWNpc2lvblJlY29yZBJQCg1XYXRjaERlY2lzaW9uEiEuYmlvd29ybGQudjIuV2F0Y2hEZWNpc2lvblJlcXVlc3QaGi5iaW93b3JsZC52Mi5EZWNpc2lvbkV2ZW50MAFiBnByb3RvMw");
 
 /**
  * @generated from message bioworld.v2.GetDecisionRequest
@@ -128,6 +128,68 @@ export const OodDetectorRefSchema: GenMessage<OodDetectorRef> = /*@__PURE__*/
   messageDesc(file_bioworld_v2_decision, 4);
 
 /**
+ * @generated from message bioworld.v2.DecisionPredictionInterval
+ */
+export type DecisionPredictionInterval = Message<"bioworld.v2.DecisionPredictionInterval"> & {
+  /**
+   * @generated from field: string target = 1;
+   */
+  target: string;
+
+  /**
+   * @generated from field: string unit = 2;
+   */
+  unit: string;
+
+  /**
+   * @generated from field: string lower_decimal = 3;
+   */
+  lowerDecimal: string;
+
+  /**
+   * @generated from field: string upper_decimal = 4;
+   */
+  upperDecimal: string;
+
+  /**
+   * @generated from field: string nominal_coverage_decimal = 5;
+   */
+  nominalCoverageDecimal: string;
+
+  /**
+   * @generated from field: string interval_method_id = 6;
+   */
+  intervalMethodId: string;
+
+  /**
+   * @generated from field: string interval_method_version = 7;
+   */
+  intervalMethodVersion: string;
+
+  /**
+   * @generated from field: string calibration_method_id = 8;
+   */
+  calibrationMethodId: string;
+
+  /**
+   * @generated from field: string calibration_method_version = 9;
+   */
+  calibrationMethodVersion: string;
+
+  /**
+   * @generated from field: bioworld.v2.EvidenceSnapshotRef calibration_evidence = 10;
+   */
+  calibrationEvidence?: EvidenceSnapshotRef | undefined;
+};
+
+/**
+ * Describes the message bioworld.v2.DecisionPredictionInterval.
+ * Use `create(DecisionPredictionIntervalSchema)` to create a new message.
+ */
+export const DecisionPredictionIntervalSchema: GenMessage<DecisionPredictionInterval> = /*@__PURE__*/
+  messageDesc(file_bioworld_v2_decision, 5);
+
+/**
  * @generated from message bioworld.v2.DecisionRecord
  */
 export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
@@ -176,6 +238,11 @@ export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
    * @generated from field: bioworld.v2.OodDetectorRef ood_detector = 9;
    */
   oodDetector?: OodDetectorRef | undefined;
+
+  /**
+   * @generated from field: bioworld.v2.DecisionPredictionInterval prediction_interval = 10;
+   */
+  predictionInterval?: DecisionPredictionInterval | undefined;
 };
 
 /**
@@ -183,7 +250,7 @@ export type DecisionRecord = Message<"bioworld.v2.DecisionRecord"> & {
  * Use `create(DecisionRecordSchema)` to create a new message.
  */
 export const DecisionRecordSchema: GenMessage<DecisionRecord> = /*@__PURE__*/
-  messageDesc(file_bioworld_v2_decision, 5);
+  messageDesc(file_bioworld_v2_decision, 6);
 
 /**
  * @generated from message bioworld.v2.DecisionEvent
@@ -205,7 +272,7 @@ export type DecisionEvent = Message<"bioworld.v2.DecisionEvent"> & {
  * Use `create(DecisionEventSchema)` to create a new message.
  */
 export const DecisionEventSchema: GenMessage<DecisionEvent> = /*@__PURE__*/
-  messageDesc(file_bioworld_v2_decision, 6);
+  messageDesc(file_bioworld_v2_decision, 7);
 
 /**
  * @generated from enum bioworld.v2.Recommendation
