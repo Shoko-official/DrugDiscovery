@@ -10,8 +10,9 @@ use bioworld_event_store_contracts::{
 use bioworld_event_store_postgres::{AppendDecisionEventError, PostgresDecisionEventWriter};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Transaction, types::ToSql};
 
 const POSTGRES_HOST: &str = "127.0.0.1";
 const POSTGRES_PORT: u16 = 5432;
@@ -82,8 +83,16 @@ fn prediction_positions() -> Vec<DecisionPredictionPosition> {
     .collect()
 }
 
-#[allow(deprecated)]
 fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
+    decision_event_at_version(event_id, decision_id, u64::MAX)
+}
+
+#[allow(deprecated)]
+fn decision_event_at_version(
+    event_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+) -> DecisionEvent {
     DecisionEvent {
         event_id: event_id.to_owned(),
         decision: Some(DecisionRecord {
@@ -92,7 +101,7 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
             evidence_snapshot_id: "ES-M10".to_owned(),
             recommendation: Recommendation::Abstain as i32,
             rationale: vec!["Integration verification event.".to_owned()],
-            aggregate_version: u64::MAX,
+            aggregate_version,
             evidence: Some(EvidenceSnapshotRef {
                 id: "ES-M10".to_owned(),
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -178,6 +187,70 @@ async fn tenant_context_is_absent(client: &Client) -> bool {
         .get(0)
 }
 
+async fn backend_pid(client: &Client) -> i32 {
+    client
+        .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+        .await
+        .expect("writer backend identity must be queryable")
+        .get(0)
+}
+
+async fn insert_blocking_event(
+    transaction: &Transaction<'_>,
+    event: DecisionEvent,
+    tenant_id: &str,
+) {
+    let row =
+        project_decision_event(event, metadata(tenant_id)).expect("blocking event must project");
+    let aggregate_version = row.aggregate_version.to_string();
+    let signature = Value::Object(row.signature);
+    let parameters: [&(dyn ToSql + Sync); 11] = [
+        &row.event_id,
+        &row.event_type,
+        &row.schema_version,
+        &row.aggregate_type,
+        &row.aggregate_id,
+        &aggregate_version,
+        &row.occurred_at,
+        &row.tenant_id,
+        &row.payload,
+        &row.payload_sha256,
+        &signature,
+    ];
+    transaction
+        .execute(
+            "INSERT INTO public.scientific_event (event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature) VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7, $8, $9, $10, $11)",
+            &parameters,
+        )
+        .await
+        .expect("blocking event must remain uncommitted");
+}
+
+async fn wait_until_writer_is_blocked(
+    observer: &Transaction<'_>,
+    blocker_pid: i32,
+    writer_pid: i32,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let is_blocked: bool = observer
+                .query_one(
+                    "SELECT $1 = ANY(pg_catalog.pg_blocking_pids($2))",
+                    &[&blocker_pid, &writer_pid],
+                )
+                .await
+                .expect("writer blocking state must be queryable")
+                .get(0);
+            if is_blocked {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the lock holder must reach its blocked unique check");
+}
+
 async fn load_event(client: &mut Client, tenant_id: &str, event_id: &str) -> ScientificEventRow {
     let transaction = client
         .transaction()
@@ -224,6 +297,33 @@ async fn load_event(client: &mut Client, tenant_id: &str, event_id: &str) -> Sci
             .expect("stored signature must be an object")
             .clone(),
     }
+}
+
+async fn event_is_stored(client: &mut Client, tenant_id: &str, event_id: &str) -> bool {
+    let transaction = client
+        .transaction()
+        .await
+        .expect("verification transaction must begin");
+    transaction
+        .query_one(
+            "SELECT pg_catalog.set_config('bioworld.tenant_id', $1, true)",
+            &[&tenant_id],
+        )
+        .await
+        .expect("verification tenant context must be set");
+    let exists = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM public.scientific_event WHERE tenant_id = $1 AND event_id::text = $2)",
+            &[&tenant_id, &event_id],
+        )
+        .await
+        .expect("stored event identity must be queryable")
+        .get(0);
+    transaction
+        .commit()
+        .await
+        .expect("verification transaction must commit");
+    exists
 }
 
 fn assert_redacted(error: &AppendDecisionEventError) {
@@ -365,4 +465,232 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
     assert!(tenant_context_is_absent(&client).await);
 
     connection_task.abort();
+}
+
+#[tokio::test]
+async fn enforces_strictly_advancing_versions_per_exact_tenant_stream() {
+    let Some(password) = integration_password() else {
+        return;
+    };
+    let (mut client, connection_task) = connect_writer(password).await;
+
+    let tenant_a = "tenant-m36-a";
+    let tenant_b = "tenant-m36-b";
+    let decision_a = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d90";
+    let decision_b = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d91";
+
+    for (event_id, aggregate_version) in [
+        ("01910d47-6f80-7a31-8c29-1d5c4f6b7020", 7),
+        ("01910d47-6f80-7a31-8c29-1d5c4f6b7021", 10),
+        ("01910d47-6f80-7a31-8c29-1d5c4f6b7022", u64::MAX),
+    ] {
+        append(
+            &mut client,
+            decision_event_at_version(event_id, decision_a, aggregate_version),
+            tenant_a,
+        )
+        .await
+        .expect("first and strictly greater stream versions must persist");
+        assert!(tenant_context_is_absent(&client).await);
+    }
+
+    let lower_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6b7023";
+    let error = append(
+        &mut client,
+        decision_event_at_version(lower_event_id, decision_a, 9),
+        tenant_a,
+    )
+    .await
+    .expect_err("a lower committed stream version must be rejected");
+    assert_eq!(error, AppendDecisionEventError::NonMonotonicStreamVersion);
+    assert_redacted(&error);
+    assert!(!event_is_stored(&mut client, tenant_a, lower_event_id).await);
+    assert!(tenant_context_is_absent(&client).await);
+
+    let equal_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6b7024";
+    let error = append(
+        &mut client,
+        decision_event_at_version(equal_event_id, decision_a, u64::MAX),
+        tenant_a,
+    )
+    .await
+    .expect_err("an equal committed stream version must retain duplicate semantics");
+    assert_eq!(error, AppendDecisionEventError::DuplicateStreamVersion);
+    assert!(!event_is_stored(&mut client, tenant_a, equal_event_id).await);
+    assert!(tenant_context_is_absent(&client).await);
+
+    let historical_equal_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6b7026";
+    let error = append(
+        &mut client,
+        decision_event_at_version(historical_equal_event_id, decision_a, 7),
+        tenant_a,
+    )
+    .await
+    .expect_err("any existing stream version must retain duplicate semantics");
+    assert_eq!(error, AppendDecisionEventError::DuplicateStreamVersion);
+    assert!(!event_is_stored(&mut client, tenant_a, historical_equal_event_id).await);
+    assert!(tenant_context_is_absent(&client).await);
+
+    let existing_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6b7020";
+    let error = append(
+        &mut client,
+        decision_event_at_version(existing_event_id, decision_a, 9),
+        tenant_a,
+    )
+    .await
+    .expect_err("a visible duplicate event identity must precede stale-version rejection");
+    assert_eq!(error, AppendDecisionEventError::DuplicateEvent);
+    assert!(tenant_context_is_absent(&client).await);
+
+    append(
+        &mut client,
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7025", decision_b, 1),
+        tenant_a,
+    )
+    .await
+    .expect("another decision stream must have an independent head");
+    append(
+        &mut client,
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7020", decision_a, 1),
+        tenant_b,
+    )
+    .await
+    .expect("another tenant must have an independent head");
+    assert!(tenant_context_is_absent(&client).await);
+
+    connection_task.abort();
+}
+
+#[tokio::test]
+async fn prevents_concurrent_first_appends_from_committing_an_unsafe_order() {
+    let Some(password) = integration_password() else {
+        return;
+    };
+    let (mut blocker, blocker_task) = connect_writer(password.clone()).await;
+    let (writer_two, writer_two_task) = connect_writer(password.clone()).await;
+    let (writer_three, writer_three_task) = connect_writer(password).await;
+
+    let tenant_id = "tenant-m36-concurrent";
+    let decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d92";
+    let writer_two_pid = backend_pid(&writer_two).await;
+    let writer_three_pid = backend_pid(&writer_three).await;
+    let blocker_pid = backend_pid(&blocker).await;
+    let blocker_transaction = blocker
+        .transaction()
+        .await
+        .expect("blocking transaction must begin");
+    blocker_transaction
+        .query_one(
+            "SELECT pg_catalog.set_config('bioworld.tenant_id', $1, true)",
+            &[&tenant_id],
+        )
+        .await
+        .expect("blocking tenant context must be set");
+    insert_blocking_event(
+        &blocker_transaction,
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7030", decision_id, 2),
+        tenant_id,
+    )
+    .await;
+    insert_blocking_event(
+        &blocker_transaction,
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7031", decision_id, 3),
+        tenant_id,
+    )
+    .await;
+
+    let event_two =
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7032", decision_id, 2);
+    let event_three =
+        decision_event_at_version("01910d47-6f80-7a31-8c29-1d5c4f6b7033", decision_id, 3);
+    let tenant_for_two = tenant_id.to_owned();
+    let tenant_for_three = tenant_id.to_owned();
+    let mut writer_two_handle = tokio::spawn(async move {
+        let mut client = writer_two;
+        let result = append(&mut client, event_two.clone(), &tenant_for_two).await;
+        (client, event_two, result)
+    });
+    let mut writer_three_handle = tokio::spawn(async move {
+        let mut client = writer_three;
+        let result = append(&mut client, event_three.clone(), &tenant_for_three).await;
+        (client, event_three, result)
+    });
+
+    let (retry_is_version_two, (mut retry_client, retry_event, retry_result)) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut writer_two_handle => (
+                    true,
+                    result.expect("version two writer task must complete"),
+                ),
+                result = &mut writer_three_handle => (
+                    false,
+                    result.expect("version three writer task must complete"),
+                ),
+            }
+        })
+        .await
+        .expect("one concurrent writer must fail fast on stream lock contention");
+    assert_eq!(
+        retry_result,
+        Err(AppendDecisionEventError::RetryableTransaction),
+    );
+    assert!(tenant_context_is_absent(&retry_client).await);
+    let pending_pid = if retry_is_version_two {
+        writer_three_pid
+    } else {
+        writer_two_pid
+    };
+    wait_until_writer_is_blocked(&blocker_transaction, blocker_pid, pending_pid).await;
+    blocker_transaction
+        .rollback()
+        .await
+        .expect("blocking transaction must roll back");
+    assert!(tenant_context_is_absent(&blocker).await);
+
+    let (mut committed_client, _, committed_result) = if retry_is_version_two {
+        writer_three_handle
+            .await
+            .expect("version three writer task must complete")
+    } else {
+        writer_two_handle
+            .await
+            .expect("version two writer task must complete")
+    };
+    committed_result.expect("the stream lock holder must commit after blocker rollback");
+
+    if retry_is_version_two {
+        let error = append(&mut retry_client, retry_event, tenant_id)
+            .await
+            .expect_err("the lower retry must observe the committed higher version");
+        assert_eq!(error, AppendDecisionEventError::NonMonotonicStreamVersion);
+    } else {
+        append(&mut retry_client, retry_event, tenant_id)
+            .await
+            .expect("the higher retry must advance the committed lower version");
+    }
+
+    assert!(tenant_context_is_absent(&retry_client).await);
+    assert!(tenant_context_is_absent(&committed_client).await);
+    assert!(
+        event_is_stored(
+            &mut committed_client,
+            tenant_id,
+            "01910d47-6f80-7a31-8c29-1d5c4f6b7033",
+        )
+        .await
+    );
+    assert_eq!(
+        event_is_stored(
+            &mut committed_client,
+            tenant_id,
+            "01910d47-6f80-7a31-8c29-1d5c4f6b7032",
+        )
+        .await,
+        !retry_is_version_two,
+    );
+
+    blocker_task.abort();
+    writer_two_task.abort();
+    writer_three_task.abort();
 }
