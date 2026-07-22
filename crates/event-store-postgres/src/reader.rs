@@ -421,6 +421,7 @@ fn map_append_error(error: AppendDecisionEventError) -> ReadDecisionEventError {
         AppendDecisionEventError::EventRejected
         | AppendDecisionEventError::DuplicateEvent
         | AppendDecisionEventError::DuplicateStreamVersion
+        | AppendDecisionEventError::NonMonotonicStreamVersion
         | AppendDecisionEventError::ContractViolation
         | AppendDecisionEventError::DatabaseRejected
         | AppendDecisionEventError::UnexpectedAppendResult
@@ -552,6 +553,10 @@ mod tests {
             ),
             (
                 AppendDecisionEventError::ContractViolation,
+                ReadDecisionEventError::DatabaseRejected,
+            ),
+            (
+                AppendDecisionEventError::NonMonotonicStreamVersion,
                 ReadDecisionEventError::DatabaseRejected,
             ),
         ];

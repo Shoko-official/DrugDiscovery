@@ -564,27 +564,33 @@ async fn returns_u64_max_when_version_one_was_inserted_and_occurred_later() {
         9,
     );
 
-    append_at(
+    insert_scientific_event_row(
         &mut writer,
-        expected.clone(),
-        tenant_id,
-        occurred_at_value("2026-07-19T00:00:00Z"),
+        projected_row_at(
+            &expected,
+            tenant_id,
+            occurred_at_value("2026-07-19T00:00:00Z"),
+        ),
     )
     .await;
     assert!(tenant_context_is_absent(&writer).await);
-    append_at(
+    insert_scientific_event_row(
         &mut writer,
-        later_insert,
-        tenant_id,
-        occurred_at_value("2026-07-21T00:00:00Z"),
+        projected_row_at(
+            &later_insert,
+            tenant_id,
+            occurred_at_value("2026-07-21T00:00:00Z"),
+        ),
     )
     .await;
     assert!(tenant_context_is_absent(&writer).await);
-    append_at(
+    insert_scientific_event_row(
         &mut writer,
-        lexically_greater,
-        tenant_id,
-        occurred_at_value("2026-07-22T00:00:00Z"),
+        projected_row_at(
+            &lexically_greater,
+            tenant_id,
+            occurred_at_value("2026-07-22T00:00:00Z"),
+        ),
     )
     .await;
     assert!(tenant_context_is_absent(&writer).await);
@@ -851,6 +857,15 @@ async fn tenant_context_is_absent(client: &Client) -> bool {
 
 fn projected_row(event: &DecisionEvent, tenant_id: &str) -> ScientificEventRow {
     project_decision_event(event.clone(), metadata(tenant_id)).expect("fixed event must project")
+}
+
+fn projected_row_at(
+    event: &DecisionEvent,
+    tenant_id: &str,
+    event_occurred_at: DateTime<Utc>,
+) -> ScientificEventRow {
+    project_decision_event(event.clone(), metadata_at(tenant_id, event_occurred_at))
+        .expect("fixed historical event must project")
 }
 
 fn assert_redacted(error: &ReadDecisionEventError) {

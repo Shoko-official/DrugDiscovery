@@ -43,6 +43,8 @@ pub enum AppendDecisionEventError {
     DuplicateEvent,
     #[error("aggregate version already exists for this tenant stream")]
     DuplicateStreamVersion,
+    #[error("aggregate version does not advance this tenant stream")]
+    NonMonotonicStreamVersion,
     #[error("database access was denied")]
     AccessDenied,
     #[error("database contract rejected the event")]
@@ -71,6 +73,8 @@ pub enum RollbackPrimary {
     DuplicateEvent,
     #[error("stream version conflict")]
     DuplicateStreamVersion,
+    #[error("non-monotonic stream version")]
+    NonMonotonicStreamVersion,
     #[error("access denial")]
     AccessDenied,
     #[error("storage contract violation")]
@@ -131,6 +135,8 @@ async fn append_in_transaction(
     set_tenant_context(transaction, &row.tenant_id).await?;
 
     let aggregate_version = row.aggregate_version.to_string();
+    acquire_stream_lock(transaction, &row).await?;
+    verify_stream_version_advances(transaction, &row, &aggregate_version).await?;
     let signature = Value::Object(row.signature);
     let parameters: [&(dyn ToSql + Sync); 11] = [
         &row.event_id,
@@ -155,6 +161,68 @@ async fn append_in_transaction(
 
     if affected_rows != 1 {
         return Err(AppendDecisionEventError::UnexpectedAppendResult);
+    }
+
+    Ok(())
+}
+
+async fn acquire_stream_lock(
+    transaction: &Transaction<'_>,
+    row: &ScientificEventRow,
+) -> Result<(), AppendDecisionEventError> {
+    let acquired = transaction
+        .query_one(
+            "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(pg_catalog.jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+            &[&row.tenant_id, &row.aggregate_type, &row.aggregate_id],
+        )
+        .await
+        .map_err(|error| classify_database_error(&error))?
+        .try_get::<_, bool>(0)
+        .map_err(|_| AppendDecisionEventError::UnexpectedAppendResult)?;
+
+    if !acquired {
+        return Err(AppendDecisionEventError::RetryableTransaction);
+    }
+
+    Ok(())
+}
+
+async fn verify_stream_version_advances(
+    transaction: &Transaction<'_>,
+    row: &ScientificEventRow,
+    aggregate_version: &str,
+) -> Result<(), AppendDecisionEventError> {
+    let state = transaction
+        .query_one(
+            "WITH stream_head AS (SELECT MAX(aggregate_version) AS maximum FROM public.scientific_event WHERE tenant_id = $1 AND aggregate_type = $3 AND aggregate_id = $4) SELECT EXISTS (SELECT 1 FROM public.scientific_event WHERE tenant_id = $1 AND event_id = $2) AS duplicate_event, EXISTS (SELECT 1 FROM public.scientific_event WHERE tenant_id = $1 AND aggregate_type = $3 AND aggregate_id = $4 AND aggregate_version = $5::text::numeric) AS duplicate_stream_version, COALESCE(stream_head.maximum > $5::text::numeric, false) AS non_monotonic_stream_version FROM stream_head",
+            &[
+                &row.tenant_id,
+                &row.event_id,
+                &row.aggregate_type,
+                &row.aggregate_id,
+                &aggregate_version,
+            ],
+        )
+        .await
+        .map_err(|error| classify_database_error(&error))?;
+    let duplicate_event = state
+        .try_get::<_, bool>("duplicate_event")
+        .map_err(|_| AppendDecisionEventError::UnexpectedAppendResult)?;
+    let duplicate_stream_version = state
+        .try_get::<_, bool>("duplicate_stream_version")
+        .map_err(|_| AppendDecisionEventError::UnexpectedAppendResult)?;
+    let non_monotonic_stream_version = state
+        .try_get::<_, bool>("non_monotonic_stream_version")
+        .map_err(|_| AppendDecisionEventError::UnexpectedAppendResult)?;
+
+    if duplicate_event {
+        return Err(AppendDecisionEventError::DuplicateEvent);
+    }
+    if duplicate_stream_version {
+        return Err(AppendDecisionEventError::DuplicateStreamVersion);
+    }
+    if non_monotonic_stream_version {
+        return Err(AppendDecisionEventError::NonMonotonicStreamVersion);
     }
 
     Ok(())
@@ -292,6 +360,9 @@ fn rollback_primary(error: AppendDecisionEventError) -> RollbackPrimary {
         AppendDecisionEventError::TenantContextRejected => RollbackPrimary::TenantContextRejected,
         AppendDecisionEventError::DuplicateEvent => RollbackPrimary::DuplicateEvent,
         AppendDecisionEventError::DuplicateStreamVersion => RollbackPrimary::DuplicateStreamVersion,
+        AppendDecisionEventError::NonMonotonicStreamVersion => {
+            RollbackPrimary::NonMonotonicStreamVersion
+        }
         AppendDecisionEventError::AccessDenied => RollbackPrimary::AccessDenied,
         AppendDecisionEventError::ContractViolation => RollbackPrimary::ContractViolation,
         AppendDecisionEventError::RetryableTransaction => RollbackPrimary::RetryableTransaction,
@@ -529,6 +600,10 @@ mod tests {
             rollback_primary(AppendDecisionEventError::AccessDenied),
             RollbackPrimary::AccessDenied,
         );
+        assert_eq!(
+            rollback_primary(AppendDecisionEventError::NonMonotonicStreamVersion),
+            RollbackPrimary::NonMonotonicStreamVersion,
+        );
     }
 
     #[test]
@@ -539,6 +614,7 @@ mod tests {
             AppendDecisionEventError::TenantContextRejected,
             AppendDecisionEventError::DuplicateEvent,
             AppendDecisionEventError::DuplicateStreamVersion,
+            AppendDecisionEventError::NonMonotonicStreamVersion,
             AppendDecisionEventError::AccessDenied,
             AppendDecisionEventError::ContractViolation,
             AppendDecisionEventError::RetryableTransaction,
