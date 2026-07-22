@@ -1,8 +1,8 @@
 use bioworld_contracts::{
     DecisionContractError, MAX_TENANT_ID_BYTES,
     v2::{
-        DecisionEvent, DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef,
-        OodDetectorRef, OodStatus, Recommendation,
+        DecisionEvent, DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
+        EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_event_store_contracts::{
@@ -24,7 +24,8 @@ const LEGACY_PAYLOAD_WITHOUT_OOD_STATUS: &str = r#"{"aggregate_version":"1844674
 const LEGACY_PAYLOAD_WITH_OOD_STATUS_ONLY: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_status":"unknown","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 const HISTORICAL_OUT_OF_DOMAIN_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_status":"out_of_domain","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 const LEGACY_PAYLOAD_WITH_OOD_PROVENANCE: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
-const CURRENT_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const M33_CANONICAL_PAYLOAD_WITHOUT_POSITIONS: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const CURRENT_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 
 fn prediction_interval() -> DecisionPredictionInterval {
     DecisionPredictionInterval {
@@ -39,6 +40,30 @@ fn prediction_interval() -> DecisionPredictionInterval {
         calibration_method_version: "2026.07".to_owned(),
         calibration_evidence: Some(EvidenceSnapshotRef {
             id: "ES-CAL-001".to_owned(),
+            sha256: VALID_SHA256.to_owned(),
+        }),
+    }
+}
+
+fn prediction_position(
+    source_id: &str,
+    source_version: &str,
+    dependency_group_id: &str,
+    lower_decimal: &str,
+    upper_decimal: &str,
+    evidence_id: &str,
+) -> DecisionPredictionPosition {
+    let mut interval = prediction_interval();
+    interval.lower_decimal = lower_decimal.to_owned();
+    interval.upper_decimal = upper_decimal.to_owned();
+
+    DecisionPredictionPosition {
+        source_id: source_id.to_owned(),
+        source_version: source_version.to_owned(),
+        dependency_group_id: dependency_group_id.to_owned(),
+        interval: Some(interval),
+        prediction_evidence: Some(EvidenceSnapshotRef {
+            id: evidence_id.to_owned(),
             sha256: VALID_SHA256.to_owned(),
         }),
     }
@@ -69,6 +94,24 @@ fn complete_event() -> DecisionEvent {
                 detector_version: "model-2026.07".to_owned(),
             }),
             prediction_interval: Some(prediction_interval()),
+            prediction_positions: vec![
+                prediction_position(
+                    "model-z",
+                    "2026.07",
+                    "shared-training-set",
+                    "0.4",
+                    "1.4",
+                    "ES-PRED-Z",
+                ),
+                prediction_position(
+                    "model-a",
+                    "2026.06",
+                    "independent-assay",
+                    "0.2",
+                    "1.2",
+                    "ES-PRED-A",
+                ),
+            ],
         }),
     }
 }
@@ -363,13 +406,95 @@ fn projects_canonical_payload_and_round_trips_without_loss() {
     );
     assert_eq!(
         row.payload_sha256,
-        "9c3a2a6e704371ecda6d1ec56c59606c868c3dabea3ed82bc5ca48b6cf1375e3"
+        "1d8a4aa0f60fb75fcca44744b07c0c85e2e81974ed95d7eb7926c029ab47f655"
     );
     assert_eq!(
         String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap(),
         CURRENT_CANONICAL_PAYLOAD
     );
     assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
+}
+
+#[test]
+fn projects_prediction_positions_in_recorded_order() {
+    let event = complete_event();
+    let row = project_decision_event(event.clone(), metadata()).unwrap();
+
+    assert_eq!(
+        row.payload["prediction_positions"],
+        json!([
+            {
+                "source_id": "model-z",
+                "source_version": "2026.07",
+                "dependency_group_id": "shared-training-set",
+                "interval": {
+                    "target": "binding_affinity",
+                    "unit": "nM",
+                    "lower_decimal": "0.4",
+                    "upper_decimal": "1.4",
+                    "nominal_coverage_decimal": "0.95",
+                    "interval_method_id": "split_conformal",
+                    "interval_method_version": "1.0",
+                    "calibration_method_id": "held_out_calibration",
+                    "calibration_method_version": "2026.07",
+                    "calibration_evidence": {
+                        "id": "ES-CAL-001",
+                        "sha256": VALID_SHA256
+                    }
+                },
+                "prediction_evidence": {
+                    "id": "ES-PRED-Z",
+                    "sha256": VALID_SHA256
+                }
+            },
+            {
+                "source_id": "model-a",
+                "source_version": "2026.06",
+                "dependency_group_id": "independent-assay",
+                "interval": {
+                    "target": "binding_affinity",
+                    "unit": "nM",
+                    "lower_decimal": "0.2",
+                    "upper_decimal": "1.2",
+                    "nominal_coverage_decimal": "0.95",
+                    "interval_method_id": "split_conformal",
+                    "interval_method_version": "1.0",
+                    "calibration_method_id": "held_out_calibration",
+                    "calibration_method_version": "2026.07",
+                    "calibration_evidence": {
+                        "id": "ES-CAL-001",
+                        "sha256": VALID_SHA256
+                    }
+                },
+                "prediction_evidence": {
+                    "id": "ES-PRED-A",
+                    "sha256": VALID_SHA256
+                }
+            }
+        ])
+    );
+    assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
+}
+
+#[test]
+fn maximum_prediction_positions_and_rationales_fit_the_canonical_node_envelope() {
+    let mut event = complete_event();
+    let decision = event.decision.as_mut().unwrap();
+    decision.rationale = vec!["r".to_owned(); 32];
+    decision.prediction_positions.push(prediction_position(
+        "model-c",
+        "2026.05",
+        "orthogonal-screen",
+        "0.3",
+        "1.3",
+        "ES-PRED-C",
+    ));
+
+    let row = project_decision_event(event, metadata()).unwrap();
+    let payload = serde_jcs::to_string(&row.payload).unwrap();
+
+    assert_eq!(MAX_CANONICAL_DECISION_PAYLOAD_NODES, 128);
+    assert!(parse_stored_decision_payload(&payload).is_ok());
 }
 
 #[test]
@@ -845,6 +970,56 @@ fn canonical_hash_is_independent_of_json_object_key_order() {
                     "id":"ES-CAL-001"
                 }
             },
+            "prediction_positions":[
+                {
+                    "source_version":"2026.07",
+                    "source_id":"model-z",
+                    "prediction_evidence":{
+                        "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "id":"ES-PRED-Z"
+                    },
+                    "interval":{
+                        "unit":"nM",
+                        "upper_decimal":"1.4",
+                        "target":"binding_affinity",
+                        "nominal_coverage_decimal":"0.95",
+                        "lower_decimal":"0.4",
+                        "interval_method_version":"1.0",
+                        "interval_method_id":"split_conformal",
+                        "calibration_method_version":"2026.07",
+                        "calibration_method_id":"held_out_calibration",
+                        "calibration_evidence":{
+                            "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "id":"ES-CAL-001"
+                        }
+                    },
+                    "dependency_group_id":"shared-training-set"
+                },
+                {
+                    "source_version":"2026.06",
+                    "source_id":"model-a",
+                    "prediction_evidence":{
+                        "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "id":"ES-PRED-A"
+                    },
+                    "interval":{
+                        "unit":"nM",
+                        "upper_decimal":"1.2",
+                        "target":"binding_affinity",
+                        "nominal_coverage_decimal":"0.95",
+                        "lower_decimal":"0.2",
+                        "interval_method_version":"1.0",
+                        "interval_method_id":"split_conformal",
+                        "calibration_method_version":"2026.07",
+                        "calibration_method_id":"held_out_calibration",
+                        "calibration_evidence":{
+                            "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "id":"ES-CAL-001"
+                        }
+                    },
+                    "dependency_group_id":"independent-assay"
+                }
+            ],
             "cou_id":"COU-001",
             "decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
             "aggregate_version":"18446744073709551615"
@@ -925,9 +1100,12 @@ fn round_trips_every_supported_ood_status() {
         let row = project_decision_event(event.clone(), metadata()).unwrap();
         let canonical_payload =
             String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap();
-        let expected_payload = format!(
-            r#"{{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"ood_detector":{{"detector_id":"mahalanobis","detector_version":"model-2026.07"}},"ood_status":"{canonical_ood_status}","prediction_interval":{{"calibration_evidence":{{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"}},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"{canonical_recommendation}"}}"#
-        );
+        let mut expected_payload: serde_json::Value =
+            serde_json::from_str(CURRENT_CANONICAL_PAYLOAD).unwrap();
+        expected_payload["ood_status"] = json!(canonical_ood_status);
+        expected_payload["recommendation"] = json!(canonical_recommendation);
+        let expected_payload =
+            String::from_utf8(serde_jcs::to_vec(&expected_payload).unwrap()).unwrap();
 
         assert_eq!(canonical_payload, expected_payload);
         assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
@@ -1035,6 +1213,29 @@ fn historical_payload_without_prediction_interval_reconstructs_without_mutation(
 }
 
 #[test]
+fn historical_m33_payload_without_prediction_positions_reconstructs_without_mutation() {
+    const M33_PAYLOAD_SHA256: &str =
+        "9c3a2a6e704371ecda6d1ec56c59606c868c3dabea3ed82bc5ca48b6cf1375e3";
+
+    let row = row_with_literal_payload(M33_CANONICAL_PAYLOAD_WITHOUT_POSITIONS, M33_PAYLOAD_SHA256);
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(M33_CANONICAL_PAYLOAD_WITHOUT_POSITIONS)
+        ),
+        M33_PAYLOAD_SHA256
+    );
+    let original = row.clone();
+
+    let reconstructed = reconstruct_decision_event(&row).unwrap();
+    let decision = reconstructed.decision.unwrap();
+
+    assert!(decision.prediction_interval.is_some());
+    assert!(decision.prediction_positions.is_empty());
+    assert_eq!(row, original);
+}
+
+#[test]
 fn rejects_unqualified_ood_status_before_persistence_with_redacted_errors() {
     for (invalid, missing) in [
         (None, true),
@@ -1108,6 +1309,28 @@ fn rejects_missing_prediction_interval_before_persistence_with_a_fixed_error() {
 }
 
 #[test]
+fn rejects_missing_prediction_positions_before_persistence_with_a_fixed_error() {
+    let mut event = complete_event();
+    event
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_positions
+        .clear();
+
+    let error = project_decision_event(event, metadata()).unwrap_err();
+
+    assert!(matches!(
+        &error,
+        EventProjectionError::MissingPredictionPositions
+    ));
+    assert_eq!(
+        error.to_string(),
+        "new decision events require prediction positions"
+    );
+}
+
+#[test]
 fn rejects_incomplete_prediction_interval_before_persistence() {
     let mut missing_evidence = complete_event();
     missing_evidence
@@ -1163,6 +1386,66 @@ fn rejects_incomplete_prediction_interval_before_persistence() {
         error.to_string(),
         "decision contract is invalid: prediction interval lower bound exceeds upper bound"
     );
+}
+
+#[test]
+fn rejects_incomplete_or_incomparable_prediction_positions_before_persistence() {
+    let mut missing_interval = complete_event();
+    missing_interval
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_positions[0]
+        .interval = None;
+    assert!(matches!(
+        project_decision_event(missing_interval, metadata()),
+        Err(EventProjectionError::InvalidDecision(
+            DecisionContractError::MissingPredictionPositionInterval
+        ))
+    ));
+
+    let mut missing_evidence = complete_event();
+    missing_evidence
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_positions[0]
+        .prediction_evidence = None;
+    assert!(matches!(
+        project_decision_event(missing_evidence, metadata()),
+        Err(EventProjectionError::InvalidDecision(
+            DecisionContractError::MissingPredictionPositionEvidence
+        ))
+    ));
+
+    for mutate in [
+        |decision: &mut DecisionRecord| {
+            decision.prediction_positions.truncate(1);
+        },
+        |decision: &mut DecisionRecord| {
+            decision.prediction_positions[1].source_id =
+                decision.prediction_positions[0].source_id.clone();
+            decision.prediction_positions[1].source_version =
+                decision.prediction_positions[0].source_version.clone();
+        },
+        |decision: &mut DecisionRecord| {
+            decision.prediction_positions[0]
+                .interval
+                .as_mut()
+                .unwrap()
+                .target = "solubility".to_owned();
+        },
+    ] {
+        let mut event = complete_event();
+        mutate(event.decision.as_mut().unwrap());
+
+        assert!(matches!(
+            project_decision_event(event, metadata()),
+            Err(EventProjectionError::InvalidDecision(
+                DecisionContractError::InvalidDomain(_)
+            ))
+        ));
+    }
 }
 
 #[test]

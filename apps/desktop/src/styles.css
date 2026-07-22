@@ -221,6 +221,7 @@ h3 {
 
 .rationale-section,
 .prediction-interval,
+.prediction-positions,
 .evidence-reference {
   margin-top: 1.75rem;
   padding-top: 1.5rem;
@@ -232,6 +233,66 @@ h3 {
   gap: 1.5rem;
   align-items: flex-start;
   justify-content: space-between;
+}
+
+.prediction-positions__header {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.prediction-positions__table {
+  width: 100%;
+  margin-top: 1rem;
+  border-collapse: collapse;
+  table-layout: fixed;
+  text-align: left;
+}
+
+.prediction-positions__table caption {
+  padding-bottom: 0.625rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  text-align: left;
+}
+
+.prediction-positions__table th,
+.prediction-positions__table td {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--outline);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.prediction-positions__table th {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.prediction-positions__table td {
+  line-height: 1.5;
+}
+
+.prediction-positions__table td strong,
+.prediction-positions__table td span {
+  display: block;
+}
+
+.prediction-positions__table td span {
+  margin-top: 0.25rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.prediction-positions__note {
+  max-width: 68ch;
+  margin: 1.25rem 0 0;
+  color: var(--text-secondary);
+  line-height: 1.6;
 }
 
 .prediction-interval__range {
@@ -471,6 +532,7 @@ h3 {
   .evidence-reference__header,
   .ood-detector__header,
   .prediction-interval__header,
+  .prediction-positions__header,
   .source-boundary {
     flex-direction: column;
   }
@@ -490,6 +552,56 @@ h3 {
   .connection-state,
   .status {
     white-space: normal;
+  }
+
+  .prediction-positions__table,
+  .prediction-positions__table tbody,
+  .prediction-positions__table tr,
+  .prediction-positions__table td {
+    display: block;
+    width: 100%;
+  }
+
+  .prediction-positions__table caption {
+    display: block;
+    width: 100%;
+  }
+
+  .prediction-positions__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .prediction-positions__table tr {
+    padding: 0.5rem 0;
+    border-top: 1px solid var(--outline);
+  }
+
+  .prediction-positions__table td {
+    display: grid;
+    grid-template-columns: minmax(7rem, 0.8fr) minmax(0, 1.2fr);
+    gap: 0.75rem;
+    padding: 0.625rem 0;
+    border-bottom: 0;
+  }
+
+  .prediction-positions__table td::before {
+    content: attr(data-label);
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    font-weight: 650;
+    line-height: 1.4;
+  }
+
+  .prediction-positions__table td > span {
+    grid-column: 2;
   }
 }
 

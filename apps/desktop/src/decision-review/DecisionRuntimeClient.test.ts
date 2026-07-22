@@ -1,6 +1,7 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
   DecisionPredictionIntervalSchema,
+  DecisionPredictionPositionSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -56,6 +57,36 @@ function validPayload(
     calibrationMethodVersion: "2026.07",
     calibrationEvidence,
   });
+  const predictionPositions = [
+    create(DecisionPredictionPositionSchema, {
+      sourceId: "model-z",
+      sourceVersion: "2026.07",
+      dependencyGroupId: "shared-training-set",
+      interval: create(DecisionPredictionIntervalSchema, {
+        ...predictionInterval,
+        lowerDecimal: "0.4",
+        upperDecimal: "1.4",
+      }),
+      predictionEvidence: create(EvidenceSnapshotRefSchema, {
+        id: "ES-PRED-Z",
+        sha256: validSha256,
+      }),
+    }),
+    create(DecisionPredictionPositionSchema, {
+      sourceId: "model-a",
+      sourceVersion: "2026.06",
+      dependencyGroupId: "independent-assay",
+      interval: create(DecisionPredictionIntervalSchema, {
+        ...predictionInterval,
+        lowerDecimal: "0.2",
+        upperDecimal: "1.2",
+      }),
+      predictionEvidence: create(EvidenceSnapshotRefSchema, {
+        id: "ES-PRED-A",
+        sha256: validSha256,
+      }),
+    }),
+  ];
   const record = create(DecisionRecordSchema, {
     decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
     couId: "COU-001",
@@ -67,6 +98,7 @@ function validPayload(
     oodStatus,
     oodDetector,
     predictionInterval,
+    predictionPositions,
   });
 
   return {
@@ -121,6 +153,56 @@ describe("createDecisionReviewLoader", () => {
             sha256: validSha256,
           },
         },
+        predictionPositions: [
+          {
+            sourceId: "model-z",
+            sourceVersion: "2026.07",
+            dependencyGroupId: "shared-training-set",
+            interval: {
+              target: "binding_affinity",
+              unit: "nM",
+              lowerDecimal: "0.4",
+              upperDecimal: "1.4",
+              nominalCoverageDecimal: "0.95",
+              intervalMethodId: "split_conformal",
+              intervalMethodVersion: "1.0",
+              calibrationMethodId: "held_out_calibration",
+              calibrationMethodVersion: "2026.07",
+              calibrationEvidence: {
+                id: "ES-CAL-001",
+                sha256: validSha256,
+              },
+            },
+            predictionEvidence: {
+              id: "ES-PRED-Z",
+              sha256: validSha256,
+            },
+          },
+          {
+            sourceId: "model-a",
+            sourceVersion: "2026.06",
+            dependencyGroupId: "independent-assay",
+            interval: {
+              target: "binding_affinity",
+              unit: "nM",
+              lowerDecimal: "0.2",
+              upperDecimal: "1.2",
+              nominalCoverageDecimal: "0.95",
+              intervalMethodId: "split_conformal",
+              intervalMethodVersion: "1.0",
+              calibrationMethodId: "held_out_calibration",
+              calibrationMethodVersion: "2026.07",
+              calibrationEvidence: {
+                id: "ES-CAL-001",
+                sha256: validSha256,
+              },
+            },
+            predictionEvidence: {
+              id: "ES-PRED-A",
+              sha256: validSha256,
+            },
+          },
+        ],
         rationale: ["Evidence coverage is incomplete."],
         evidence: {
           id: "ES-001",

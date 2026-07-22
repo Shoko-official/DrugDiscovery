@@ -15,8 +15,9 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
-    DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodStatus,
-    Recommendation, decision_service_server::DecisionService as GeneratedDecisionService,
+    DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef,
+    GetDecisionRequest, OodStatus, Recommendation,
+    decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
@@ -70,12 +71,12 @@ const JWT_ISSUER: &str = "https://identity.bioworld.test";
 const JWT_AUDIENCE: &str = "https://decision.bioworld.test";
 const JWT_REQUIRED_SCOPE: &str = "decision:read";
 const JWT_KEY_ID: &str = "postgres-integration-key";
-const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
+const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
-    "6edfb37aaa32fa129e69b0dfe5ba81e73b6e6f3947bd484e30617ac71b21624c";
-const TENANT_B_PAYLOAD: &str = r#"{"aggregate_version":"7","cou_id":"COU-GRPC-PG-B","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-B","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Tenant B decision."],"recommendation":"stop_program"}"#;
+    "fb6f8025346e9471ff088157960c3ae647d68056079772615db61948a0611b79";
+const TENANT_B_PAYLOAD: &str = r#"{"aggregate_version":"7","cou_id":"COU-GRPC-PG-B","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-B","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Tenant B decision."],"recommendation":"stop_program"}"#;
 const TENANT_B_PAYLOAD_SHA256: &str =
-    "c1f679539a2c90b2750bf06655dbcf62b57ee35a3286bde4ce54e8865fd1394b";
+    "55ca24153725158d6eb59c8c415c763625aad8b5162631cb2535aded1f7c6bbd";
 
 struct IntegrationPasswords {
     writer: String,
@@ -528,12 +529,12 @@ async fn tenant_context_is_absent(client: &Client) -> bool {
         .get(0)
 }
 
-fn prediction_interval() -> DecisionPredictionInterval {
+fn prediction_interval(lower_decimal: &str, upper_decimal: &str) -> DecisionPredictionInterval {
     DecisionPredictionInterval {
         target: "binding_affinity".to_owned(),
         unit: "nM".to_owned(),
-        lower_decimal: "0.25".to_owned(),
-        upper_decimal: "1.5".to_owned(),
+        lower_decimal: lower_decimal.to_owned(),
+        upper_decimal: upper_decimal.to_owned(),
         nominal_coverage_decimal: "0.95".to_owned(),
         interval_method_id: "split_conformal".to_owned(),
         interval_method_version: "1.0".to_owned(),
@@ -544,6 +545,53 @@ fn prediction_interval() -> DecisionPredictionInterval {
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
     }
+}
+
+fn prediction_positions() -> Vec<DecisionPredictionPosition> {
+    [
+        (
+            "model-z",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-Z",
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        ),
+        (
+            "model-a",
+            "2026.06",
+            "independent-assay",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            source_id,
+            source_version,
+            dependency_group_id,
+            lower,
+            upper,
+            evidence_id,
+            evidence_sha256,
+        )| {
+            DecisionPredictionPosition {
+                source_id: source_id.to_owned(),
+                source_version: source_version.to_owned(),
+                dependency_group_id: dependency_group_id.to_owned(),
+                interval: Some(prediction_interval(lower, upper)),
+                prediction_evidence: Some(EvidenceSnapshotRef {
+                    id: evidence_id.to_owned(),
+                    sha256: evidence_sha256.to_owned(),
+                }),
+            }
+        },
+    )
+    .collect()
 }
 
 #[allow(deprecated)]
@@ -569,7 +617,8 @@ fn record(
         }),
         ood_status: Some(OodStatus::Unknown as i32),
         ood_detector: None,
-        prediction_interval: Some(prediction_interval()),
+        prediction_interval: Some(prediction_interval("0.25", "1.5")),
+        prediction_positions: prediction_positions(),
     }
 }
 
@@ -1037,7 +1086,11 @@ async fn production_pool_executes_concurrent_tenant_isolated_reads() {
     assert_eq!(tenant_b_response.get_ref(), &tenant_b.record);
     assert_eq!(
         tenant_a_response.get_ref().prediction_interval,
-        Some(prediction_interval())
+        Some(prediction_interval("0.25", "1.5"))
+    );
+    assert_eq!(
+        tenant_a_response.get_ref().prediction_positions,
+        prediction_positions()
     );
 
     let mut first = pool.acquire().await.expect("first clean lease must return");

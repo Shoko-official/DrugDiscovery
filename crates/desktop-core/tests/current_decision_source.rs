@@ -57,6 +57,7 @@ fn record() -> DecisionRecord {
         ood_status: Some(OodStatus::Unknown as i32),
         ood_detector: None,
         prediction_interval: None,
+        prediction_positions: Vec::new(),
     }
 }
 

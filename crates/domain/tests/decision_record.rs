@@ -1,10 +1,10 @@
 use bioworld_domain::{
-    DecisionPredictionInterval, DecisionRecord, DomainError, EvidenceSnapshotRef,
-    MAX_DECISION_IDENTIFIER_BYTES, MAX_DECISION_IDENTIFIER_CHARS,
+    DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord, DomainError,
+    EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES, MAX_DECISION_IDENTIFIER_CHARS,
     MAX_DECISION_RATIONALE_ITEM_BYTES, MAX_DECISION_RATIONALE_ITEMS,
     MAX_DECISION_RATIONALE_TOTAL_BYTES, MAX_OOD_DETECTOR_ID_BYTES, MAX_OOD_DETECTOR_VERSION_BYTES,
     MAX_PREDICTION_INTERVAL_DECIMAL_BYTES, MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES,
-    OodDetectorRef, OodStatus, Recommendation,
+    MAX_PREDICTION_POSITION_IDENTIFIER_BYTES, OodDetectorRef, OodStatus, Recommendation,
 };
 use uuid::Uuid;
 
@@ -51,6 +51,60 @@ fn try_prediction_interval(values: [String; 9]) -> Result<DecisionPredictionInte
         calibration_method_id,
         calibration_method_version,
         calibration_evidence(),
+    )
+}
+
+fn prediction_position(
+    source_id: &str,
+    source_version: &str,
+    dependency_group_id: &str,
+    lower_decimal: &str,
+    upper_decimal: &str,
+    evidence_id: &str,
+) -> DecisionPredictionPosition {
+    let mut values = prediction_interval_values();
+    values[2] = lower_decimal.to_owned();
+    values[3] = upper_decimal.to_owned();
+
+    DecisionPredictionPosition::try_new(
+        source_id.to_owned(),
+        source_version.to_owned(),
+        dependency_group_id.to_owned(),
+        try_prediction_interval(values).unwrap(),
+        EvidenceSnapshotRef::try_new(evidence_id.to_owned(), VALID_SHA256.to_owned()).unwrap(),
+    )
+    .unwrap()
+}
+
+fn try_prediction_position_identifiers(
+    identifiers: [String; 3],
+) -> Result<DecisionPredictionPosition, DomainError> {
+    let [source_id, source_version, dependency_group_id] = identifiers;
+
+    DecisionPredictionPosition::try_new(
+        source_id,
+        source_version,
+        dependency_group_id,
+        try_prediction_interval(prediction_interval_values()).unwrap(),
+        EvidenceSnapshotRef::try_new("ES-PRED-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+    )
+}
+
+fn try_decision_with_prediction_positions(
+    positions: Vec<DecisionPredictionPosition>,
+) -> Result<DecisionRecord, DomainError> {
+    DecisionRecord::try_new_with_prediction_positions(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        Some(
+            OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap(),
+        ),
+        Some(try_prediction_interval(prediction_interval_values()).unwrap()),
+        positions,
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Evidence coverage is incomplete.".to_owned()],
     )
 }
 
@@ -244,6 +298,252 @@ fn constructs_decision_with_prediction_interval() {
 }
 
 #[test]
+fn constructs_decision_with_prediction_positions_in_recorded_order() {
+    let evidence =
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap();
+    let detector =
+        OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap();
+    let interval = try_prediction_interval(prediction_interval_values()).unwrap();
+    let positions = vec![
+        prediction_position(
+            "model-z",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-Z",
+        ),
+        prediction_position(
+            "model-a",
+            "2026.06",
+            "independent-assay",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+    ];
+    let record = DecisionRecord::try_new_with_prediction_positions(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        Some(detector),
+        Some(interval),
+        positions.clone(),
+        evidence,
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(record.prediction_positions(), positions);
+}
+
+#[test]
+fn validates_prediction_position_identifiers_with_exact_byte_budgets() {
+    let fields: [(usize, fn() -> DomainError); 3] = [
+        (0, || DomainError::InvalidPredictionPositionSourceId),
+        (1, || DomainError::InvalidPredictionPositionSourceVersion),
+        (2, || {
+            DomainError::InvalidPredictionPositionDependencyGroupId
+        }),
+    ];
+    let exact = "\u{10000}".repeat(MAX_PREDICTION_POSITION_IDENTIFIER_BYTES / 4);
+    assert_eq!(exact.len(), MAX_PREDICTION_POSITION_IDENTIFIER_BYTES);
+
+    for (index, expected_error) in fields {
+        let mut identifiers = [
+            "model-a".to_owned(),
+            "2026.07".to_owned(),
+            "shared-training-set".to_owned(),
+        ];
+        identifiers[index] = exact.clone();
+        assert!(try_prediction_position_identifiers(identifiers).is_ok());
+
+        for invalid in [
+            String::new(),
+            " ".to_owned(),
+            " leading".to_owned(),
+            "trailing ".to_owned(),
+            "embedded\0nul".to_owned(),
+            format!("{exact}x"),
+        ] {
+            let mut identifiers = [
+                "model-a".to_owned(),
+                "2026.07".to_owned(),
+                "shared-training-set".to_owned(),
+            ];
+            identifiers[index] = invalid;
+            assert_eq!(
+                try_prediction_position_identifiers(identifiers),
+                Err(expected_error()),
+                "identifier field index {index}",
+            );
+        }
+    }
+}
+
+#[test]
+fn validates_prediction_position_collection_bounds() {
+    let positions = [
+        prediction_position(
+            "model-a",
+            "2026.07",
+            "shared-training-set",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+        prediction_position(
+            "model-b",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-B",
+        ),
+        prediction_position(
+            "model-c",
+            "2026.07",
+            "independent-assay",
+            "0.3",
+            "1.3",
+            "ES-PRED-C",
+        ),
+        prediction_position(
+            "model-d",
+            "2026.07",
+            "independent-assay",
+            "0.1",
+            "1.1",
+            "ES-PRED-D",
+        ),
+    ];
+
+    assert!(try_decision_with_prediction_positions(Vec::new()).is_ok());
+    assert_eq!(
+        try_decision_with_prediction_positions(positions[..1].to_vec()),
+        Err(DomainError::TooFewPredictionPositions),
+    );
+    assert!(try_decision_with_prediction_positions(positions[..2].to_vec()).is_ok());
+    assert!(try_decision_with_prediction_positions(positions[..3].to_vec()).is_ok());
+    assert_eq!(
+        try_decision_with_prediction_positions(positions.to_vec()),
+        Err(DomainError::TooManyPredictionPositions),
+    );
+}
+
+#[test]
+fn rejects_duplicate_prediction_position_sources() {
+    let positions = vec![
+        prediction_position(
+            "model-a",
+            "2026.07",
+            "shared-training-set",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+        prediction_position(
+            "model-a",
+            "2026.07",
+            "independent-assay",
+            "0.4",
+            "1.4",
+            "ES-PRED-B",
+        ),
+    ];
+
+    assert_eq!(
+        try_decision_with_prediction_positions(positions),
+        Err(DomainError::DuplicatePredictionPositionSource),
+    );
+}
+
+#[test]
+fn rejects_prediction_positions_without_a_decision_interval() {
+    let positions = vec![
+        prediction_position(
+            "model-a",
+            "2026.07",
+            "shared-training-set",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+        prediction_position(
+            "model-b",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-B",
+        ),
+    ];
+    let result = DecisionRecord::try_new_with_prediction_positions(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        Some(
+            OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap(),
+        ),
+        None,
+        positions,
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    );
+
+    assert_eq!(
+        result,
+        Err(DomainError::MissingPredictionIntervalForPositions),
+    );
+}
+
+#[test]
+fn requires_prediction_positions_to_match_the_decision_interval() {
+    for (field_index, replacement, expected) in [
+        (
+            0,
+            "cellular_activity",
+            DomainError::IncomparablePredictionPositionTarget,
+        ),
+        (1, "uM", DomainError::IncomparablePredictionPositionUnit),
+        (
+            4,
+            "0.9",
+            DomainError::IncomparablePredictionPositionNominalCoverage,
+        ),
+    ] {
+        let mut values = prediction_interval_values();
+        values[field_index] = replacement.to_owned();
+        let positions = vec![
+            DecisionPredictionPosition::try_new(
+                "model-a".to_owned(),
+                "2026.07".to_owned(),
+                "shared-training-set".to_owned(),
+                try_prediction_interval(values).unwrap(),
+                EvidenceSnapshotRef::try_new("ES-PRED-A".to_owned(), VALID_SHA256.to_owned())
+                    .unwrap(),
+            )
+            .unwrap(),
+            prediction_position(
+                "model-b",
+                "2026.07",
+                "shared-training-set",
+                "0.4",
+                "1.4",
+                "ES-PRED-B",
+            ),
+        ];
+
+        assert_eq!(
+            try_decision_with_prediction_positions(positions),
+            Err(expected)
+        );
+    }
+}
+
+#[test]
 fn validates_strict_canonical_prediction_interval_coverage() {
     for valid in [
         "0.1".to_owned(),
@@ -331,6 +631,54 @@ fn prediction_interval_errors_have_fixed_text() {
 }
 
 #[test]
+fn prediction_position_errors_have_fixed_text() {
+    for (error, expected) in [
+        (
+            DomainError::InvalidPredictionPositionSourceId,
+            "prediction position source identifier is invalid",
+        ),
+        (
+            DomainError::InvalidPredictionPositionSourceVersion,
+            "prediction position source version is invalid",
+        ),
+        (
+            DomainError::InvalidPredictionPositionDependencyGroupId,
+            "prediction position dependency group identifier is invalid",
+        ),
+        (
+            DomainError::TooFewPredictionPositions,
+            "a decision has too few prediction positions",
+        ),
+        (
+            DomainError::TooManyPredictionPositions,
+            "a decision has too many prediction positions",
+        ),
+        (
+            DomainError::DuplicatePredictionPositionSource,
+            "prediction position source and version pairs must be unique",
+        ),
+        (
+            DomainError::MissingPredictionIntervalForPositions,
+            "prediction positions require a decision prediction interval",
+        ),
+        (
+            DomainError::IncomparablePredictionPositionTarget,
+            "prediction position target does not match the decision interval",
+        ),
+        (
+            DomainError::IncomparablePredictionPositionUnit,
+            "prediction position unit does not match the decision interval",
+        ),
+        (
+            DomainError::IncomparablePredictionPositionNominalCoverage,
+            "prediction position nominal coverage does not match the decision interval",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn prediction_interval_json_enforces_domain_invariants() {
     let invalid = serde_json::json!({
         "target": "binding_affinity",
@@ -354,6 +702,144 @@ fn prediction_interval_json_enforces_domain_invariants() {
         error
             .to_string()
             .contains("prediction interval lower bound is invalid")
+    );
+}
+
+#[test]
+fn prediction_position_json_enforces_domain_invariants() {
+    let position = prediction_position(
+        "model-a",
+        "2026.07",
+        "shared-training-set",
+        "0.2",
+        "1.2",
+        "ES-PRED-A",
+    );
+    let valid = serde_json::to_value(position).unwrap();
+    let mut invalid_identifier = valid.clone();
+    invalid_identifier["source_id"] = serde_json::Value::String(" model-a".to_owned());
+
+    let error =
+        serde_json::from_value::<DecisionPredictionPosition>(invalid_identifier).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("prediction position source identifier is invalid")
+    );
+
+    let mut invalid_interval = valid.clone();
+    invalid_interval["interval"]["lower_decimal"] = serde_json::Value::String("01".to_owned());
+    assert!(
+        serde_json::from_value::<DecisionPredictionPosition>(invalid_interval)
+            .unwrap_err()
+            .to_string()
+            .contains("prediction interval lower bound is invalid")
+    );
+
+    let mut invalid_evidence = valid;
+    invalid_evidence["prediction_evidence"]["sha256"] =
+        serde_json::Value::String("invalid".to_owned());
+    assert!(
+        serde_json::from_value::<DecisionPredictionPosition>(invalid_evidence)
+            .unwrap_err()
+            .to_string()
+            .contains("evidence digest must be a lowercase sha256")
+    );
+}
+
+#[test]
+fn decision_json_round_trip_preserves_prediction_positions_in_recorded_order() {
+    let positions = vec![
+        prediction_position(
+            "model-z",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-Z",
+        ),
+        prediction_position(
+            "model-a",
+            "2026.06",
+            "independent-assay",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+    ];
+    let record = try_decision_with_prediction_positions(positions.clone()).unwrap();
+
+    let serialized = serde_json::to_value(&record).unwrap();
+    let deserialized: DecisionRecord = serde_json::from_value(serialized.clone()).unwrap();
+
+    assert_eq!(
+        serialized["prediction_positions"][0]["source_id"],
+        "model-z"
+    );
+    assert_eq!(
+        serialized["prediction_positions"][1]["source_id"],
+        "model-a"
+    );
+    assert_eq!(deserialized.prediction_positions(), positions);
+    assert_eq!(deserialized, record);
+}
+
+#[test]
+fn decision_json_rejects_invalid_prediction_position_collections() {
+    let record = try_decision_with_prediction_positions(vec![
+        prediction_position(
+            "model-a",
+            "2026.07",
+            "shared-training-set",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+        prediction_position(
+            "model-b",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-B",
+        ),
+    ])
+    .unwrap();
+    let valid = serde_json::to_value(record).unwrap();
+
+    let mut too_few = valid.clone();
+    too_few["prediction_positions"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    assert!(
+        serde_json::from_value::<DecisionRecord>(too_few)
+            .unwrap_err()
+            .to_string()
+            .contains("a decision has too few prediction positions")
+    );
+
+    let mut duplicate = valid.clone();
+    duplicate["prediction_positions"][1]["source_id"] =
+        duplicate["prediction_positions"][0]["source_id"].clone();
+    duplicate["prediction_positions"][1]["source_version"] =
+        duplicate["prediction_positions"][0]["source_version"].clone();
+    assert!(
+        serde_json::from_value::<DecisionRecord>(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("prediction position source and version pairs must be unique")
+    );
+
+    let mut incomparable = valid;
+    incomparable["prediction_positions"][0]["interval"]["target"] =
+        serde_json::Value::String("cellular_activity".to_owned());
+    assert!(
+        serde_json::from_value::<DecisionRecord>(incomparable)
+            .unwrap_err()
+            .to_string()
+            .contains("prediction position target does not match the decision interval")
     );
 }
 

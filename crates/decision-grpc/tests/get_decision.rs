@@ -12,8 +12,8 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES, MAX_TENANT_ID_BYTES,
     v2::{
-        DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
-        OodDetectorRef, OodStatus, Recommendation,
+        DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
+        EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_decision_grpc::{
@@ -79,12 +79,12 @@ fn executor(result: Result<DecisionRecord, GetDecisionRequestExecutionError>) ->
     )
 }
 
-fn prediction_interval() -> DecisionPredictionInterval {
+fn prediction_interval(lower_decimal: &str, upper_decimal: &str) -> DecisionPredictionInterval {
     DecisionPredictionInterval {
         target: "binding_affinity".to_owned(),
         unit: "nM".to_owned(),
-        lower_decimal: "0.25".to_owned(),
-        upper_decimal: "1.5".to_owned(),
+        lower_decimal: lower_decimal.to_owned(),
+        upper_decimal: upper_decimal.to_owned(),
         nominal_coverage_decimal: "0.95".to_owned(),
         interval_method_id: "split_conformal".to_owned(),
         interval_method_version: "1.0".to_owned(),
@@ -95,6 +95,44 @@ fn prediction_interval() -> DecisionPredictionInterval {
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         }),
     }
+}
+
+fn prediction_positions() -> Vec<DecisionPredictionPosition> {
+    [
+        (
+            "model-z",
+            "2026.07",
+            "shared-training-set",
+            "0.4",
+            "1.4",
+            "ES-PRED-Z",
+        ),
+        (
+            "model-a",
+            "2026.06",
+            "independent-assay",
+            "0.2",
+            "1.2",
+            "ES-PRED-A",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(source_id, source_version, dependency_group_id, lower, upper, evidence_id)| {
+            DecisionPredictionPosition {
+                source_id: source_id.to_owned(),
+                source_version: source_version.to_owned(),
+                dependency_group_id: dependency_group_id.to_owned(),
+                interval: Some(prediction_interval(lower, upper)),
+                prediction_evidence: Some(EvidenceSnapshotRef {
+                    id: evidence_id.to_owned(),
+                    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                }),
+            }
+        },
+    )
+    .collect()
 }
 
 #[allow(deprecated)]
@@ -115,7 +153,8 @@ fn record(aggregate_version: u64) -> DecisionRecord {
             detector_id: "grpc-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
-        prediction_interval: Some(prediction_interval()),
+        prediction_interval: Some(prediction_interval("0.25", "1.5")),
+        prediction_positions: prediction_positions(),
     }
 }
 
@@ -156,7 +195,11 @@ fn passes_the_exact_scope_and_typed_query_once() {
     );
     assert_eq!(
         response.get_ref().prediction_interval,
-        Some(prediction_interval())
+        Some(prediction_interval("0.25", "1.5"))
+    );
+    assert_eq!(
+        response.get_ref().prediction_positions,
+        prediction_positions()
     );
     assert!(response.metadata().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 1);

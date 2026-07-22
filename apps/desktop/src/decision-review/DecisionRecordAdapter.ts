@@ -7,6 +7,7 @@ import type {
   DecisionSummary,
   DomainAssessment,
   PredictionIntervalMetadata,
+  PredictionPositionMetadata,
   Recommendation,
 } from "./DecisionReview";
 
@@ -21,6 +22,11 @@ export type DecisionRecordAdapterErrorCode =
   | "missing_prediction_interval_calibration_evidence"
   | "invalid_prediction_interval"
   | "invalid_prediction_interval_calibration_evidence"
+  | "invalid_prediction_positions"
+  | "missing_prediction_position_interval"
+  | "missing_prediction_position_evidence"
+  | "invalid_prediction_position_evidence"
+  | "incomparable_prediction_positions"
   | "missing_rationale"
   | "unspecified_ood_status"
   | "unspecified_recommendation"
@@ -47,6 +53,8 @@ const maxDecisionIdentifierChars = 200;
 const maxDecisionIdentifierBytes = 800;
 const maxPredictionIntervalIdentifierBytes = 200;
 const maxPredictionIntervalDecimalBytes = 64;
+const minPredictionPositions = 2;
+const maxPredictionPositions = 3;
 const utf8Encoder = new TextEncoder();
 
 type ResolvedEvidence =
@@ -162,10 +170,9 @@ function compareCanonicalDecimals(left: string, right: string): number {
   return leftNegative ? -order : order;
 }
 
-function resolvePredictionInterval(
-  record: DecisionRecord,
+function resolvePredictionIntervalValue(
+  interval: DecisionRecord["predictionInterval"],
 ): PredictionIntervalMetadata | null {
-  const interval = record.predictionInterval;
   if (!interval) {
     return null;
   }
@@ -231,6 +238,112 @@ function resolvePredictionInterval(
       sha256: calibrationEvidence.sha256,
     },
   };
+}
+
+function resolvePredictionInterval(
+  record: DecisionRecord,
+): PredictionIntervalMetadata | null {
+  return resolvePredictionIntervalValue(record.predictionInterval);
+}
+
+function resolvePredictionPositions(
+  record: DecisionRecord,
+  decisionInterval: PredictionIntervalMetadata | null,
+): PredictionPositionMetadata[] {
+  const positions = record.predictionPositions;
+  if (positions.length === 0) {
+    return [];
+  }
+  if (
+    positions.length < minPredictionPositions ||
+    positions.length > maxPredictionPositions
+  ) {
+    throw new DecisionRecordAdapterError(
+      "invalid_prediction_positions",
+      "Prediction position count is invalid",
+    );
+  }
+  if (!decisionInterval) {
+    throw new DecisionRecordAdapterError(
+      "incomparable_prediction_positions",
+      "Prediction positions require a decision interval",
+    );
+  }
+
+  const seenSources = new Set<string>();
+  return positions.map((position) => {
+    if (
+      !boundedOpaqueValueIsValid(position.sourceId) ||
+      !boundedOpaqueValueIsValid(position.sourceVersion) ||
+      !boundedOpaqueValueIsValid(position.dependencyGroupId)
+    ) {
+      throw new DecisionRecordAdapterError(
+        "invalid_prediction_positions",
+        "Prediction position metadata is invalid",
+      );
+    }
+    const sourceKey = `${position.sourceId.length}:${position.sourceId}${position.sourceVersion}`;
+    if (seenSources.has(sourceKey)) {
+      throw new DecisionRecordAdapterError(
+        "invalid_prediction_positions",
+        "Prediction position sources must be unique",
+      );
+    }
+    seenSources.add(sourceKey);
+
+    if (!position.interval) {
+      throw new DecisionRecordAdapterError(
+        "missing_prediction_position_interval",
+        "Prediction position interval is required",
+      );
+    }
+    const interval = resolvePredictionIntervalValue(position.interval);
+    if (!interval) {
+      throw new DecisionRecordAdapterError(
+        "missing_prediction_position_interval",
+        "Prediction position interval is required",
+      );
+    }
+    if (
+      interval.target !== decisionInterval.target ||
+      interval.unit !== decisionInterval.unit ||
+      interval.nominalCoverageDecimal !==
+        decisionInterval.nominalCoverageDecimal
+    ) {
+      throw new DecisionRecordAdapterError(
+        "incomparable_prediction_positions",
+        "Prediction position interval is not comparable",
+      );
+    }
+
+    const predictionEvidence = position.predictionEvidence;
+    if (!predictionEvidence) {
+      throw new DecisionRecordAdapterError(
+        "missing_prediction_position_evidence",
+        "Prediction position evidence is required",
+      );
+    }
+    if (
+      !decisionIdentifierIsValid(predictionEvidence.id) ||
+      !lowercaseSha256.test(predictionEvidence.sha256)
+    ) {
+      throw new DecisionRecordAdapterError(
+        "invalid_prediction_position_evidence",
+        "Prediction position evidence is invalid",
+      );
+    }
+
+    return {
+      sourceId: position.sourceId,
+      sourceVersion: position.sourceVersion,
+      dependencyGroupId: position.dependencyGroupId,
+      interval,
+      predictionEvidence: {
+        id: predictionEvidence.id,
+        sha256: predictionEvidence.sha256,
+      },
+    };
+  });
 }
 
 function toRecommendation(value: WireRecommendation): Recommendation {
@@ -318,6 +431,10 @@ export function toDecisionSummary(
       }
     : null;
   const predictionInterval = resolvePredictionInterval(record);
+  const predictionPositions = resolvePredictionPositions(
+    record,
+    predictionInterval,
+  );
   validateEvidenceDigest(evidence);
   const rationale = record.rationale.filter(
     (entry) => entry.trim().length > 0,
@@ -337,6 +454,7 @@ export function toDecisionSummary(
     domainAssessment,
     oodDetector,
     predictionInterval,
+    ...(predictionPositions.length > 0 ? { predictionPositions } : {}),
     rationale,
     evidence: {
       id: evidence.id,
