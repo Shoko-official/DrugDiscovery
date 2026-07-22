@@ -34,6 +34,17 @@ export type PredictionIntervalMetadata = {
   };
 };
 
+export type PredictionPositionMetadata = {
+  sourceId: string;
+  sourceVersion: string;
+  dependencyGroupId: string;
+  interval: PredictionIntervalMetadata;
+  predictionEvidence: {
+    id: string;
+    sha256: string;
+  };
+};
+
 export type DecisionSummary = {
   decisionId: string;
   couId: string;
@@ -42,6 +53,7 @@ export type DecisionSummary = {
   domainAssessment: DomainAssessment;
   oodDetector?: OodDetectorMetadata | null;
   predictionInterval?: PredictionIntervalMetadata | null;
+  predictionPositions?: readonly PredictionPositionMetadata[];
   rationale: readonly string[];
   evidence: {
     id: string;
@@ -276,6 +288,95 @@ function PredictionIntervalSection({
   );
 }
 
+function PredictionPositionsSection({
+  positions,
+}: {
+  positions?: readonly PredictionPositionMetadata[];
+}): React.JSX.Element {
+  const recordedPositions = positions ?? [];
+
+  return (
+    <section
+      className="prediction-positions"
+      aria-labelledby="prediction-positions-title"
+    >
+      <header className="prediction-positions__header">
+        <div>
+          <p className="section-label">Recorded comparison</p>
+          <h3 id="prediction-positions-title">Prediction positions</h3>
+        </div>
+        <span className="status status--neutral">
+          {recordedPositions.length > 0
+            ? `${recordedPositions.length} recorded positions`
+            : "Historical positions unavailable"}
+        </span>
+      </header>
+      {recordedPositions.length > 0 ? (
+        <>
+          <table className="prediction-positions__table">
+            <caption>Recorded positions in source order</caption>
+            <thead>
+              <tr>
+                <th scope="col">Source and version</th>
+                <th scope="col">Dependency group</th>
+                <th scope="col">Recorded interval</th>
+                <th scope="col">Prediction evidence</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recordedPositions.map((position) => (
+                <tr
+                  key={`${position.sourceId.length}:${position.sourceId}${position.sourceVersion}`}
+                >
+                  <td data-label="Source and version">
+                    <strong className="technical-value">
+                      {position.sourceId}
+                    </strong>
+                    <span className="technical-value">
+                      {position.sourceVersion}
+                    </span>
+                  </td>
+                  <td
+                    className="technical-value"
+                    data-label="Dependency group"
+                  >
+                    {position.dependencyGroupId}
+                  </td>
+                  <td data-label="Recorded interval">
+                    <strong className="technical-value">
+                      {`${position.interval.lowerDecimal} to ${position.interval.upperDecimal} ${position.interval.unit}`}
+                    </strong>
+                    <span className="technical-value">
+                      Coverage {position.interval.nominalCoverageDecimal}
+                    </span>
+                  </td>
+                  <td data-label="Prediction evidence">
+                    <strong className="technical-value">
+                      {position.predictionEvidence.id}
+                    </strong>
+                    <span className="technical-value">
+                      {position.predictionEvidence.sha256}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="prediction-positions__note">
+            Dependency groups are displayed as recorded and do not prove
+            independence. Positions are not aggregated in this review.
+          </p>
+        </>
+      ) : (
+        <p className="prediction-positions__note">
+          This historical decision does not include recorded prediction
+          positions.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function ReadyState({
   decision,
   source,
@@ -363,6 +464,8 @@ function ReadyState({
         </section>
 
         <PredictionIntervalSection interval={decision.predictionInterval} />
+
+        <PredictionPositionsSection positions={decision.predictionPositions} />
 
         <section
           className="rationale-section"

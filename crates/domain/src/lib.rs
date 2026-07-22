@@ -13,6 +13,9 @@ pub const MAX_OOD_DETECTOR_ID_BYTES: usize = 200;
 pub const MAX_OOD_DETECTOR_VERSION_BYTES: usize = 200;
 pub const MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES: usize = 200;
 pub const MAX_PREDICTION_INTERVAL_DECIMAL_BYTES: usize = 64;
+pub const MAX_PREDICTION_POSITION_IDENTIFIER_BYTES: usize = 200;
+pub const MIN_DECISION_PREDICTION_POSITIONS: usize = 2;
+pub const MAX_DECISION_PREDICTION_POSITIONS: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +117,25 @@ struct DecisionPredictionIntervalData {
     calibration_evidence: EvidenceSnapshotRef,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "DecisionPredictionPositionData")]
+pub struct DecisionPredictionPosition {
+    source_id: String,
+    source_version: String,
+    dependency_group_id: String,
+    interval: DecisionPredictionInterval,
+    prediction_evidence: EvidenceSnapshotRef,
+}
+
+#[derive(Deserialize)]
+struct DecisionPredictionPositionData {
+    source_id: String,
+    source_version: String,
+    dependency_group_id: String,
+    interval: DecisionPredictionInterval,
+    prediction_evidence: EvidenceSnapshotRef,
+}
+
 #[derive(Deserialize)]
 struct EvidenceSnapshotRefData {
     id: String,
@@ -131,6 +153,8 @@ pub struct DecisionRecord {
     ood_detector: Option<OodDetectorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prediction_interval: Option<DecisionPredictionInterval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prediction_positions: Vec<DecisionPredictionPosition>,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -146,6 +170,8 @@ struct DecisionRecordData {
     ood_detector: Option<OodDetectorRef>,
     #[serde(default)]
     prediction_interval: Option<DecisionPredictionInterval>,
+    #[serde(default)]
+    prediction_positions: Vec<DecisionPredictionPosition>,
     evidence: EvidenceSnapshotRef,
     rationale: Vec<String>,
 }
@@ -180,6 +206,26 @@ pub enum DomainError {
     InvalidPredictionIntervalBounds,
     #[error("prediction interval nominal coverage is invalid")]
     InvalidPredictionIntervalNominalCoverageDecimal,
+    #[error("prediction position source identifier is invalid")]
+    InvalidPredictionPositionSourceId,
+    #[error("prediction position source version is invalid")]
+    InvalidPredictionPositionSourceVersion,
+    #[error("prediction position dependency group identifier is invalid")]
+    InvalidPredictionPositionDependencyGroupId,
+    #[error("a decision has too few prediction positions")]
+    TooFewPredictionPositions,
+    #[error("a decision has too many prediction positions")]
+    TooManyPredictionPositions,
+    #[error("prediction position source and version pairs must be unique")]
+    DuplicatePredictionPositionSource,
+    #[error("prediction positions require a decision prediction interval")]
+    MissingPredictionIntervalForPositions,
+    #[error("prediction position target does not match the decision interval")]
+    IncomparablePredictionPositionTarget,
+    #[error("prediction position unit does not match the decision interval")]
+    IncomparablePredictionPositionUnit,
+    #[error("prediction position nominal coverage does not match the decision interval")]
+    IncomparablePredictionPositionNominalCoverage,
     #[error("a qualified decision requires at least one rationale")]
     MissingRationale,
     #[error("a decision has too many rationales")]
@@ -358,6 +404,72 @@ impl TryFrom<DecisionPredictionIntervalData> for DecisionPredictionInterval {
     }
 }
 
+impl DecisionPredictionPosition {
+    pub fn try_new(
+        source_id: String,
+        source_version: String,
+        dependency_group_id: String,
+        interval: DecisionPredictionInterval,
+        prediction_evidence: EvidenceSnapshotRef,
+    ) -> Result<Self, DomainError> {
+        if !bounded_opaque_value_is_valid(&source_id, MAX_PREDICTION_POSITION_IDENTIFIER_BYTES) {
+            return Err(DomainError::InvalidPredictionPositionSourceId);
+        }
+        if !bounded_opaque_value_is_valid(&source_version, MAX_PREDICTION_POSITION_IDENTIFIER_BYTES)
+        {
+            return Err(DomainError::InvalidPredictionPositionSourceVersion);
+        }
+        if !bounded_opaque_value_is_valid(
+            &dependency_group_id,
+            MAX_PREDICTION_POSITION_IDENTIFIER_BYTES,
+        ) {
+            return Err(DomainError::InvalidPredictionPositionDependencyGroupId);
+        }
+
+        Ok(Self {
+            source_id,
+            source_version,
+            dependency_group_id,
+            interval,
+            prediction_evidence,
+        })
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn source_version(&self) -> &str {
+        &self.source_version
+    }
+
+    pub fn dependency_group_id(&self) -> &str {
+        &self.dependency_group_id
+    }
+
+    pub fn interval(&self) -> &DecisionPredictionInterval {
+        &self.interval
+    }
+
+    pub fn prediction_evidence(&self) -> &EvidenceSnapshotRef {
+        &self.prediction_evidence
+    }
+}
+
+impl TryFrom<DecisionPredictionPositionData> for DecisionPredictionPosition {
+    type Error = DomainError;
+
+    fn try_from(value: DecisionPredictionPositionData) -> Result<Self, Self::Error> {
+        Self::try_new(
+            value.source_id,
+            value.source_version,
+            value.dependency_group_id,
+            value.interval,
+            value.prediction_evidence,
+        )
+    }
+}
+
 impl TryFrom<EvidenceSnapshotRefData> for EvidenceSnapshotRef {
     type Error = DomainError;
 
@@ -418,6 +530,31 @@ impl DecisionRecord {
         evidence: EvidenceSnapshotRef,
         rationale: Vec<String>,
     ) -> Result<Self, DomainError> {
+        Self::try_new_with_prediction_positions(
+            id,
+            cou_id,
+            recommendation,
+            ood_status,
+            ood_detector,
+            prediction_interval,
+            Vec::new(),
+            evidence,
+            rationale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_prediction_positions(
+        id: Uuid,
+        cou_id: String,
+        recommendation: Recommendation,
+        ood_status: OodStatus,
+        ood_detector: Option<OodDetectorRef>,
+        prediction_interval: Option<DecisionPredictionInterval>,
+        prediction_positions: Vec<DecisionPredictionPosition>,
+        evidence: EvidenceSnapshotRef,
+        rationale: Vec<String>,
+    ) -> Result<Self, DomainError> {
         let decision = Self {
             id,
             cou_id,
@@ -425,6 +562,7 @@ impl DecisionRecord {
             ood_status,
             ood_detector,
             prediction_interval,
+            prediction_positions,
             evidence,
             rationale,
         };
@@ -456,6 +594,10 @@ impl DecisionRecord {
         self.prediction_interval.as_ref()
     }
 
+    pub fn prediction_positions(&self) -> &[DecisionPredictionPosition] {
+        &self.prediction_positions
+    }
+
     pub fn evidence(&self) -> &EvidenceSnapshotRef {
         &self.evidence
     }
@@ -467,6 +609,45 @@ impl DecisionRecord {
     pub fn validate(&self) -> Result<(), DomainError> {
         if !decision_identifier_is_valid(&self.cou_id) {
             return Err(DomainError::InvalidCouId);
+        }
+        if !self.prediction_positions.is_empty()
+            && self.prediction_positions.len() < MIN_DECISION_PREDICTION_POSITIONS
+        {
+            return Err(DomainError::TooFewPredictionPositions);
+        }
+        if self.prediction_positions.len() > MAX_DECISION_PREDICTION_POSITIONS {
+            return Err(DomainError::TooManyPredictionPositions);
+        }
+        if !self.prediction_positions.is_empty() && self.prediction_interval.is_none() {
+            return Err(DomainError::MissingPredictionIntervalForPositions);
+        }
+        if let Some(decision_interval) = self.prediction_interval.as_ref() {
+            for position in &self.prediction_positions {
+                if position.interval.target != decision_interval.target {
+                    return Err(DomainError::IncomparablePredictionPositionTarget);
+                }
+                if position.interval.unit != decision_interval.unit {
+                    return Err(DomainError::IncomparablePredictionPositionUnit);
+                }
+                if position.interval.nominal_coverage_decimal
+                    != decision_interval.nominal_coverage_decimal
+                {
+                    return Err(DomainError::IncomparablePredictionPositionNominalCoverage);
+                }
+            }
+        }
+        if self
+            .prediction_positions
+            .iter()
+            .enumerate()
+            .any(|(index, position)| {
+                self.prediction_positions[index + 1..].iter().any(|other| {
+                    position.source_id == other.source_id
+                        && position.source_version == other.source_version
+                })
+            })
+        {
+            return Err(DomainError::DuplicatePredictionPositionSource);
         }
         if self.rationale.len() > MAX_DECISION_RATIONALE_ITEMS {
             return Err(DomainError::TooManyRationales);
@@ -595,13 +776,14 @@ impl TryFrom<DecisionRecordData> for DecisionRecord {
     type Error = DomainError;
 
     fn try_from(value: DecisionRecordData) -> Result<Self, Self::Error> {
-        Self::try_new_with_prediction_interval(
+        Self::try_new_with_prediction_positions(
             value.id,
             value.cou_id,
             value.recommendation,
             value.ood_status,
             value.ood_detector,
             value.prediction_interval,
+            value.prediction_positions,
             value.evidence,
             value.rationale,
         )

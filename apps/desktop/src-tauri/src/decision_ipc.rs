@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_runtime_preserves_prediction_interval_and_provenance() {
+    fn bundled_runtime_preserves_prediction_interval_positions_and_provenance() {
         let runtime = bundled_runtime();
         let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
             .unwrap()
@@ -211,6 +211,18 @@ mod tests {
                         .to_owned(),
                 }),
             }),
+        );
+        assert_eq!(
+            decoded.prediction_positions,
+            bundled_decision_record().prediction_positions
+        );
+        assert_eq!(
+            decoded
+                .prediction_positions
+                .iter()
+                .map(|position| position.source_id.as_str())
+                .collect::<Vec<_>>(),
+            ["model-z", "model-a"]
         );
         assert_eq!(
             serde_json::to_value(payload.source).unwrap(),

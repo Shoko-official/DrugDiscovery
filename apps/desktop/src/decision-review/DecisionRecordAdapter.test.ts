@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
   DecisionPredictionIntervalSchema,
+  DecisionPredictionPositionSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -37,6 +38,30 @@ function completePredictionInterval() {
   });
 }
 
+function completePredictionPosition(
+  sourceId: string,
+  sourceVersion: string,
+  dependencyGroupId: string,
+  lowerDecimal: string,
+  upperDecimal: string,
+  evidenceId: string,
+) {
+  const interval = completePredictionInterval();
+  interval.lowerDecimal = lowerDecimal;
+  interval.upperDecimal = upperDecimal;
+
+  return create(DecisionPredictionPositionSchema, {
+    sourceId,
+    sourceVersion,
+    dependencyGroupId,
+    interval,
+    predictionEvidence: create(EvidenceSnapshotRefSchema, {
+      id: evidenceId,
+      sha256: validSha256,
+    }),
+  });
+}
+
 function completeRecord(recommendation = Recommendation.ABSTAIN) {
   const evidence = create(EvidenceSnapshotRefSchema, {
     id: "ES-001",
@@ -53,6 +78,30 @@ function completeRecord(recommendation = Recommendation.ABSTAIN) {
     evidence,
     oodStatus: OodStatus.UNKNOWN,
   });
+}
+
+function completeRecordWithPredictionPositions() {
+  const record = completeRecord();
+  record.predictionInterval = completePredictionInterval();
+  record.predictionPositions = [
+    completePredictionPosition(
+      "model-z",
+      "2026.07",
+      "shared-training-set",
+      "0.4",
+      "1.4",
+      "ES-PRED-Z",
+    ),
+    completePredictionPosition(
+      "model-a",
+      "2026.06",
+      "independent-assay",
+      "0.2",
+      "1.2",
+      "ES-PRED-A",
+    ),
+  ];
+  return record;
 }
 
 function expectAdapterError(
@@ -164,6 +213,221 @@ describe("toDecisionSummary", () => {
 
   it("maps absent historical prediction interval metadata to null", () => {
     expect(toDecisionSummary(completeRecord()).predictionInterval).toBeNull();
+  });
+
+  it("omits absent historical prediction positions", () => {
+    const summary = toDecisionSummary(completeRecord());
+
+    expect(summary).not.toHaveProperty("predictionPositions");
+  });
+
+  it("maps exact recorded prediction positions in recorded order", () => {
+    const record = completeRecordWithPredictionPositions();
+
+    expect(toDecisionSummary(record).predictionPositions).toEqual([
+      {
+        sourceId: "model-z",
+        sourceVersion: "2026.07",
+        dependencyGroupId: "shared-training-set",
+        interval: expect.objectContaining({
+          lowerDecimal: "0.4",
+          upperDecimal: "1.4",
+          unit: "nM",
+          nominalCoverageDecimal: "0.95",
+        }),
+        predictionEvidence: {
+          id: "ES-PRED-Z",
+          sha256: validSha256,
+        },
+      },
+      {
+        sourceId: "model-a",
+        sourceVersion: "2026.06",
+        dependencyGroupId: "independent-assay",
+        interval: expect.objectContaining({
+          lowerDecimal: "0.2",
+          upperDecimal: "1.2",
+          unit: "nM",
+          nominalCoverageDecimal: "0.95",
+        }),
+        predictionEvidence: {
+          id: "ES-PRED-A",
+          sha256: validSha256,
+        },
+      },
+    ]);
+  });
+
+  it.each([1, 4])(
+    "rejects an invalid prediction position count of %i",
+    (count) => {
+      const record = completeRecordWithPredictionPositions();
+      record.predictionPositions = Array.from({ length: count }, (_, index) =>
+        completePredictionPosition(
+          `model-${index}`,
+          `2026.${String(index).padStart(2, "0")}`,
+          `dependency-${index}`,
+          "0.2",
+          "1.2",
+          `ES-PRED-${index}`,
+        ),
+      );
+
+      expectAdapterError(record, "invalid_prediction_positions");
+    },
+  );
+
+  it.each([
+    [
+      "blank source ID",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.sourceId = " ";
+      },
+    ],
+    [
+      "source version containing NUL",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.sourceVersion = "2026\0.07";
+      },
+    ],
+    [
+      "oversized dependency group",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.dependencyGroupId = "x".repeat(201);
+      },
+    ],
+    [
+      "multibyte source ID exceeding the byte limit",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.sourceId = "é".repeat(101);
+      },
+    ],
+  ])("rejects prediction positions with %s", (_case, invalidate) => {
+    const record = completeRecordWithPredictionPositions();
+    invalidate(record.predictionPositions[0]!);
+
+    expectAdapterError(record, "invalid_prediction_positions");
+  });
+
+  it("accepts three prediction positions with exact identifier limits", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions.push(
+      completePredictionPosition(
+        "s".repeat(200),
+        "v".repeat(200),
+        "g".repeat(200),
+        "0.3",
+        "1.3",
+        "ES-PRED-LIMIT",
+      ),
+    );
+
+    const positions = toDecisionSummary(record).predictionPositions;
+
+    expect(positions).toHaveLength(3);
+    expect(positions?.[2]).toMatchObject({
+      sourceId: "s".repeat(200),
+      sourceVersion: "v".repeat(200),
+      dependencyGroupId: "g".repeat(200),
+    });
+  });
+
+  it("rejects duplicate prediction source and version pairs", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions[1]!.sourceId = "model-z";
+    record.predictionPositions[1]!.sourceVersion = "2026.07";
+
+    expectAdapterError(record, "invalid_prediction_positions");
+  });
+
+  it("rejects prediction positions without a decision interval", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionInterval = undefined;
+
+    expectAdapterError(record, "incomparable_prediction_positions");
+  });
+
+  it("rejects a prediction position without an interval", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions[0]!.interval = undefined;
+
+    expectAdapterError(record, "missing_prediction_position_interval");
+  });
+
+  it("rejects invalid nested prediction position intervals", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions[0]!.interval!.lowerDecimal = "01";
+
+    expectAdapterError(record, "invalid_prediction_interval");
+  });
+
+  it("rejects a prediction position interval without calibration evidence", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions[0]!.interval!.calibrationEvidence = undefined;
+
+    expectAdapterError(
+      record,
+      "missing_prediction_interval_calibration_evidence",
+    );
+  });
+
+  it("rejects a prediction position without prediction evidence", () => {
+    const record = completeRecordWithPredictionPositions();
+    record.predictionPositions[0]!.predictionEvidence = undefined;
+
+    expectAdapterError(record, "missing_prediction_position_evidence");
+  });
+
+  it.each([
+    [
+      "blank evidence ID",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.predictionEvidence!.id = " ";
+      },
+    ],
+    [
+      "evidence ID containing NUL",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.predictionEvidence!.id = "ES\0PRED";
+      },
+    ],
+    [
+      "malformed evidence digest",
+      (position: ReturnType<typeof completePredictionPosition>) => {
+        position.predictionEvidence!.sha256 = "INVALID";
+      },
+    ],
+  ])("rejects prediction positions with %s", (_case, invalidate) => {
+    const record = completeRecordWithPredictionPositions();
+    invalidate(record.predictionPositions[0]!);
+
+    expectAdapterError(record, "invalid_prediction_position_evidence");
+  });
+
+  it.each([
+    [
+      "target",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.target = "solubility";
+      },
+    ],
+    [
+      "unit",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.unit = "uM";
+      },
+    ],
+    [
+      "nominal coverage",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.nominalCoverageDecimal = "0.9";
+      },
+    ],
+  ])("rejects prediction positions with incomparable %s", (_case, mutate) => {
+    const record = completeRecordWithPredictionPositions();
+    mutate(record.predictionPositions[0]!.interval!);
+
+    expectAdapterError(record, "incomparable_prediction_positions");
   });
 
   it("rejects a prediction interval without calibration evidence", () => {

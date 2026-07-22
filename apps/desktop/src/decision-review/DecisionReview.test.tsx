@@ -21,6 +21,48 @@ const tracedDecision = {
   },
 } as const;
 
+const recordedPredictionInterval = {
+  target: "binding_affinity",
+  unit: "nM",
+  lowerDecimal: "0.25",
+  upperDecimal: "1.5",
+  nominalCoverageDecimal: "0.95",
+  intervalMethodId: "split_conformal",
+  intervalMethodVersion: "1.0",
+  calibrationMethodId: "held_out_calibration",
+  calibrationMethodVersion: "2026.07",
+  calibrationEvidence: {
+    id: "ES-CAL-001",
+    sha256:
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  },
+} as const;
+
+function recordedPredictionPosition(
+  sourceId: string,
+  sourceVersion: string,
+  dependencyGroupId: string,
+  lowerDecimal: string,
+  upperDecimal: string,
+  evidenceId: string,
+) {
+  return {
+    sourceId,
+    sourceVersion,
+    dependencyGroupId,
+    interval: {
+      ...recordedPredictionInterval,
+      lowerDecimal,
+      upperDecimal,
+    },
+    predictionEvidence: {
+      id: evidenceId,
+      sha256:
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
+  } as const;
+}
+
 describe("DecisionReview", () => {
   it("renders a stable loading state", () => {
     const markup = renderToStaticMarkup(
@@ -258,6 +300,203 @@ describe("DecisionReview", () => {
       "This historical decision does not include a recorded prediction interval.",
     );
     expect(markup).not.toContain("Nominal coverage</dt>");
+  });
+
+  it("renders recorded prediction positions after the decision interval", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            predictionPositions: [
+              recordedPredictionPosition(
+                "model-z",
+                "2026.07",
+                "shared-training-set",
+                "0.4",
+                "1.4",
+                "ES-PRED-Z",
+              ),
+              recordedPredictionPosition(
+                "model-a",
+                "2026.06",
+                "orthogonal-screen",
+                "0.2",
+                "1.2",
+                "ES-PRED-A",
+              ),
+            ],
+          },
+        }}
+      />,
+    );
+    const intervalIndex = markup.indexOf("Prediction interval");
+    const positionsIndex = markup.indexOf("Prediction positions");
+    const firstPositionIndex = markup.indexOf("model-z");
+    const secondPositionIndex = markup.indexOf("model-a");
+    const rationaleIndex = markup.indexOf("Decision rationale");
+
+    expect(positionsIndex).toBeGreaterThan(intervalIndex);
+    expect(rationaleIndex).toBeGreaterThan(positionsIndex);
+    expect(firstPositionIndex).toBeGreaterThan(positionsIndex);
+    expect(secondPositionIndex).toBeGreaterThan(firstPositionIndex);
+    expect(markup).toContain("<table");
+    expect(markup).toContain("Source and version");
+    expect(markup).toContain("Dependency group");
+    expect(markup).toContain("0.4 to 1.4 nM");
+    expect(markup).toContain("ES-PRED-Z");
+    expect(markup).toContain(
+      "Dependency groups are displayed as recorded and do not prove independence.",
+    );
+    expect(markup).not.toContain("Material disagreement");
+    expect(markup).not.toContain("Consensus");
+  });
+
+  it("renders preview fixture prediction positions in recorded order", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview state={decisionPreviewFixture} />,
+    );
+    const firstPositionIndex = markup.indexOf("model-z");
+    const secondPositionIndex = markup.indexOf("model-a");
+
+    expect(markup).toContain("2 recorded positions");
+    expect(firstPositionIndex).toBeGreaterThanOrEqual(0);
+    expect(secondPositionIndex).toBeGreaterThan(firstPositionIndex);
+    expect(markup).toContain("shared-training-set");
+    expect(markup).toContain("independent-assay");
+  });
+
+  it("states when historical prediction positions are unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "bundled_sample",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Prediction positions");
+    expect(markup).toContain("Historical positions unavailable");
+    expect(markup).toContain(
+      "This historical decision does not include recorded prediction positions.",
+    );
+    expect(markup).not.toContain("<table");
+    expect(markup).not.toContain("Recorded positions in source order");
+  });
+
+  it("renders prediction position metadata as escaped React text", () => {
+    const hostilePosition = {
+      ...recordedPredictionPosition(
+        "<img src=x onerror=alert(1)>",
+        "<script>alert(2)</script>",
+        "<svg onload=alert(3)>",
+        "0.4",
+        "1.4",
+        "ES-PRED-Z",
+      ),
+      predictionEvidence: {
+        id: "</strong><iframe src=javascript:alert(4)>",
+        sha256: "<script>alert(5)</script>",
+      },
+    };
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            predictionPositions: [
+              hostilePosition,
+              recordedPredictionPosition(
+                "model-a",
+                "2026.06",
+                "orthogonal-screen",
+                "0.2",
+                "1.2",
+                "ES-PRED-A",
+              ),
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(markup).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
+    expect(markup).toContain("&lt;svg onload=alert(3)&gt;");
+    expect(markup).toContain(
+      "&lt;/strong&gt;&lt;iframe src=javascript:alert(4)&gt;",
+    );
+    expect(markup).not.toContain("<img");
+    expect(markup).not.toContain("<script");
+    expect(markup).not.toContain("<svg");
+    expect(markup).not.toContain("<iframe");
+  });
+
+  it("renders three recorded positions with table semantics in source order", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            predictionPositions: [
+              recordedPredictionPosition(
+                "model-z",
+                "2026.07",
+                "shared-training-set",
+                "0.4",
+                "1.4",
+                "ES-PRED-Z",
+              ),
+              recordedPredictionPosition(
+                "model-a",
+                "2026.06",
+                "orthogonal-screen",
+                "0.2",
+                "1.2",
+                "ES-PRED-A",
+              ),
+              recordedPredictionPosition(
+                "model-b",
+                "2026.05",
+                "shared-training-set",
+                "0.3",
+                "1.3",
+                "ES-PRED-B",
+              ),
+            ],
+          },
+        }}
+      />,
+    );
+    const tableBody = markup.match(/<tbody>([\s\S]*?)<\/tbody>/)?.[1] ?? "";
+
+    expect(markup).toContain("3 recorded positions");
+    expect(markup).toContain(
+      "<caption>Recorded positions in source order</caption>",
+    );
+    expect(markup.match(/<th scope="col">/g)).toHaveLength(4);
+    expect(tableBody.match(/<tr/g)).toHaveLength(3);
+    expect(tableBody.match(/data-label=/g)).toHaveLength(12);
+    expect(tableBody.indexOf("model-z")).toBeLessThan(
+      tableBody.indexOf("model-a"),
+    );
+    expect(tableBody.indexOf("model-a")).toBeLessThan(
+      tableBody.indexOf("model-b"),
+    );
   });
 
   it("renders prediction interval metadata as escaped React text", () => {

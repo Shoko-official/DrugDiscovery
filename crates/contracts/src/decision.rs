@@ -2,6 +2,7 @@ use std::num::NonZeroU64;
 
 use bioworld_domain::{
     DecisionPredictionInterval as DomainDecisionPredictionInterval,
+    DecisionPredictionPosition as DomainDecisionPredictionPosition,
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
     MAX_DECISION_RATIONALE_ITEMS, OodDetectorRef as DomainOodDetectorRef,
     OodStatus as DomainOodStatus, Recommendation as DomainRecommendation,
@@ -51,6 +52,10 @@ pub enum DecisionContractError {
     MissingEvidenceId,
     #[error("prediction interval calibration evidence is required")]
     MissingPredictionIntervalCalibrationEvidence,
+    #[error("prediction position interval is required")]
+    MissingPredictionPositionInterval,
+    #[error("prediction position evidence is required")]
+    MissingPredictionPositionEvidence,
     #[error("legacy evidence_snapshot_id conflicts with evidence.id")]
     ConflictingEvidenceIds,
     #[error("aggregate_version must be greater than zero")]
@@ -108,38 +113,38 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
             .transpose()?;
         let prediction_interval = value
             .prediction_interval
-            .map(|interval| {
-                let calibration_evidence = interval
-                    .calibration_evidence
-                    .ok_or(Self::Error::MissingPredictionIntervalCalibrationEvidence)?;
-                let calibration_evidence = EvidenceSnapshotRef::try_new(
-                    calibration_evidence.id,
-                    calibration_evidence.sha256,
-                )?;
+            .map(prediction_interval_from_wire)
+            .transpose()?;
+        let prediction_positions = value
+            .prediction_positions
+            .into_iter()
+            .map(|position| {
+                let interval = position
+                    .interval
+                    .ok_or(Self::Error::MissingPredictionPositionInterval)?;
+                let prediction_evidence = position
+                    .prediction_evidence
+                    .ok_or(Self::Error::MissingPredictionPositionEvidence)?;
 
-                DomainDecisionPredictionInterval::try_new(
-                    interval.target,
-                    interval.unit,
-                    interval.lower_decimal,
-                    interval.upper_decimal,
-                    interval.nominal_coverage_decimal,
-                    interval.interval_method_id,
-                    interval.interval_method_version,
-                    interval.calibration_method_id,
-                    interval.calibration_method_version,
-                    calibration_evidence,
+                DomainDecisionPredictionPosition::try_new(
+                    position.source_id,
+                    position.source_version,
+                    position.dependency_group_id,
+                    prediction_interval_from_wire(interval)?,
+                    evidence_from_wire(prediction_evidence)?,
                 )
                 .map_err(Self::Error::from)
             })
-            .transpose()?;
-        let evidence = EvidenceSnapshotRef::try_new(evidence.id, evidence.sha256)?;
-        let decision = DomainDecisionRecord::try_new_with_prediction_interval(
+            .collect::<Result<Vec<_>, _>>()?;
+        let evidence = evidence_from_wire(evidence)?;
+        let decision = DomainDecisionRecord::try_new_with_prediction_positions(
             decision_id,
             value.cou_id,
             recommendation,
             ood_status,
             ood_detector,
             prediction_interval,
+            prediction_positions,
             evidence,
             value.rationale,
         )?;
@@ -161,35 +166,79 @@ impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
             recommendation: recommendation_to_wire(decision.recommendation()) as i32,
             rationale: decision.rationale().to_vec(),
             aggregate_version: value.aggregate_version().get(),
-            evidence: Some(v2::EvidenceSnapshotRef {
-                id: evidence.id().to_owned(),
-                sha256: evidence.sha256().to_owned(),
-            }),
+            evidence: Some(evidence_to_wire(evidence)),
             ood_status: Some(ood_status_to_wire(decision.ood_status()) as i32),
             ood_detector: decision.ood_detector().map(|detector| v2::OodDetectorRef {
                 detector_id: detector.detector_id().to_owned(),
                 detector_version: detector.detector_version().to_owned(),
             }),
-            prediction_interval: decision.prediction_interval().map(|interval| {
-                let calibration_evidence = interval.calibration_evidence();
-
-                v2::DecisionPredictionInterval {
-                    target: interval.target().to_owned(),
-                    unit: interval.unit().to_owned(),
-                    lower_decimal: interval.lower_decimal().to_owned(),
-                    upper_decimal: interval.upper_decimal().to_owned(),
-                    nominal_coverage_decimal: interval.nominal_coverage_decimal().to_owned(),
-                    interval_method_id: interval.interval_method_id().to_owned(),
-                    interval_method_version: interval.interval_method_version().to_owned(),
-                    calibration_method_id: interval.calibration_method_id().to_owned(),
-                    calibration_method_version: interval.calibration_method_version().to_owned(),
-                    calibration_evidence: Some(v2::EvidenceSnapshotRef {
-                        id: calibration_evidence.id().to_owned(),
-                        sha256: calibration_evidence.sha256().to_owned(),
-                    }),
-                }
-            }),
+            prediction_interval: decision
+                .prediction_interval()
+                .map(prediction_interval_to_wire),
+            prediction_positions: decision
+                .prediction_positions()
+                .iter()
+                .map(|position| v2::DecisionPredictionPosition {
+                    source_id: position.source_id().to_owned(),
+                    source_version: position.source_version().to_owned(),
+                    dependency_group_id: position.dependency_group_id().to_owned(),
+                    interval: Some(prediction_interval_to_wire(position.interval())),
+                    prediction_evidence: Some(evidence_to_wire(position.prediction_evidence())),
+                })
+                .collect(),
         }
+    }
+}
+
+fn evidence_from_wire(
+    value: v2::EvidenceSnapshotRef,
+) -> Result<EvidenceSnapshotRef, DecisionContractError> {
+    EvidenceSnapshotRef::try_new(value.id, value.sha256).map_err(DecisionContractError::from)
+}
+
+fn evidence_to_wire(value: &EvidenceSnapshotRef) -> v2::EvidenceSnapshotRef {
+    v2::EvidenceSnapshotRef {
+        id: value.id().to_owned(),
+        sha256: value.sha256().to_owned(),
+    }
+}
+
+fn prediction_interval_from_wire(
+    value: v2::DecisionPredictionInterval,
+) -> Result<DomainDecisionPredictionInterval, DecisionContractError> {
+    let calibration_evidence = value
+        .calibration_evidence
+        .ok_or(DecisionContractError::MissingPredictionIntervalCalibrationEvidence)?;
+
+    DomainDecisionPredictionInterval::try_new(
+        value.target,
+        value.unit,
+        value.lower_decimal,
+        value.upper_decimal,
+        value.nominal_coverage_decimal,
+        value.interval_method_id,
+        value.interval_method_version,
+        value.calibration_method_id,
+        value.calibration_method_version,
+        evidence_from_wire(calibration_evidence)?,
+    )
+    .map_err(DecisionContractError::from)
+}
+
+fn prediction_interval_to_wire(
+    value: &DomainDecisionPredictionInterval,
+) -> v2::DecisionPredictionInterval {
+    v2::DecisionPredictionInterval {
+        target: value.target().to_owned(),
+        unit: value.unit().to_owned(),
+        lower_decimal: value.lower_decimal().to_owned(),
+        upper_decimal: value.upper_decimal().to_owned(),
+        nominal_coverage_decimal: value.nominal_coverage_decimal().to_owned(),
+        interval_method_id: value.interval_method_id().to_owned(),
+        interval_method_version: value.interval_method_version().to_owned(),
+        calibration_method_id: value.calibration_method_id().to_owned(),
+        calibration_method_version: value.calibration_method_version().to_owned(),
+        calibration_evidence: Some(evidence_to_wire(value.calibration_evidence())),
     }
 }
 

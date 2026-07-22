@@ -82,6 +82,8 @@ pub enum EventProjectionError {
     MissingOodDetector,
     #[error("new decision events require a prediction interval")]
     MissingPredictionInterval,
+    #[error("new decision events require prediction positions")]
+    MissingPredictionPositions,
     #[error("out-of-domain decisions must abstain")]
     OutOfDomainRequiresAbstain,
     #[error("event_id must be a canonical UUID")]
@@ -134,6 +136,8 @@ struct CanonicalDecisionPayload {
     ood_detector: Option<CanonicalOodDetector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prediction_interval: Option<CanonicalPredictionInterval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prediction_positions: Vec<CanonicalPredictionPosition>,
     evidence: CanonicalEvidence,
     rationale: Vec<String>,
     aggregate_version: String,
@@ -166,6 +170,69 @@ struct CanonicalPredictionInterval {
     calibration_method_id: String,
     calibration_method_version: String,
     calibration_evidence: CanonicalEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalPredictionPosition {
+    source_id: String,
+    source_version: String,
+    dependency_group_id: String,
+    interval: CanonicalPredictionInterval,
+    prediction_evidence: CanonicalEvidence,
+}
+
+impl CanonicalEvidence {
+    fn from_wire(value: &EvidenceSnapshotRef) -> Self {
+        Self {
+            id: value.id.clone(),
+            sha256: value.sha256.clone(),
+        }
+    }
+
+    fn into_wire(self) -> EvidenceSnapshotRef {
+        EvidenceSnapshotRef {
+            id: self.id,
+            sha256: self.sha256,
+        }
+    }
+}
+
+impl CanonicalPredictionInterval {
+    fn from_wire(value: &v2::DecisionPredictionInterval) -> Result<Self, DecisionContractError> {
+        let calibration_evidence = value
+            .calibration_evidence
+            .as_ref()
+            .ok_or(DecisionContractError::MissingPredictionIntervalCalibrationEvidence)?;
+
+        Ok(Self {
+            target: value.target.clone(),
+            unit: value.unit.clone(),
+            lower_decimal: value.lower_decimal.clone(),
+            upper_decimal: value.upper_decimal.clone(),
+            nominal_coverage_decimal: value.nominal_coverage_decimal.clone(),
+            interval_method_id: value.interval_method_id.clone(),
+            interval_method_version: value.interval_method_version.clone(),
+            calibration_method_id: value.calibration_method_id.clone(),
+            calibration_method_version: value.calibration_method_version.clone(),
+            calibration_evidence: CanonicalEvidence::from_wire(calibration_evidence),
+        })
+    }
+
+    fn into_wire(self) -> v2::DecisionPredictionInterval {
+        v2::DecisionPredictionInterval {
+            target: self.target,
+            unit: self.unit,
+            lower_decimal: self.lower_decimal,
+            upper_decimal: self.upper_decimal,
+            nominal_coverage_decimal: self.nominal_coverage_decimal,
+            interval_method_id: self.interval_method_id,
+            interval_method_version: self.interval_method_version,
+            calibration_method_id: self.calibration_method_id,
+            calibration_method_version: self.calibration_method_version,
+            calibration_evidence: Some(self.calibration_evidence.into_wire()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -202,6 +269,9 @@ pub fn project_decision_event(
     validate_new_ood_metadata(&decision)?;
     if decision.prediction_interval.is_none() {
         return Err(EventProjectionError::MissingPredictionInterval);
+    }
+    if decision.prediction_positions.is_empty() {
+        return Err(EventProjectionError::MissingPredictionPositions);
     }
     let boundary = VersionedDecisionRecord::try_from(decision)?;
     let decision = v2::DecisionRecord::from(&boundary);
@@ -311,34 +381,33 @@ impl CanonicalDecisionPayload {
             prediction_interval: value
                 .prediction_interval
                 .as_ref()
+                .map(CanonicalPredictionInterval::from_wire)
+                .transpose()?,
+            prediction_positions: value
+                .prediction_positions
+                .iter()
                 .map(
-                    |interval| -> Result<CanonicalPredictionInterval, EventProjectionError> {
-                        let calibration_evidence = interval.calibration_evidence.as_ref().ok_or(
-                            DecisionContractError::MissingPredictionIntervalCalibrationEvidence,
-                        )?;
+                    |position| -> Result<CanonicalPredictionPosition, EventProjectionError> {
+                        let interval = position
+                            .interval
+                            .as_ref()
+                            .ok_or(DecisionContractError::MissingPredictionPositionInterval)?;
+                        let prediction_evidence = position
+                            .prediction_evidence
+                            .as_ref()
+                            .ok_or(DecisionContractError::MissingPredictionPositionEvidence)?;
 
-                        Ok(CanonicalPredictionInterval {
-                            target: interval.target.clone(),
-                            unit: interval.unit.clone(),
-                            lower_decimal: interval.lower_decimal.clone(),
-                            upper_decimal: interval.upper_decimal.clone(),
-                            nominal_coverage_decimal: interval.nominal_coverage_decimal.clone(),
-                            interval_method_id: interval.interval_method_id.clone(),
-                            interval_method_version: interval.interval_method_version.clone(),
-                            calibration_method_id: interval.calibration_method_id.clone(),
-                            calibration_method_version: interval.calibration_method_version.clone(),
-                            calibration_evidence: CanonicalEvidence {
-                                id: calibration_evidence.id.clone(),
-                                sha256: calibration_evidence.sha256.clone(),
-                            },
+                        Ok(CanonicalPredictionPosition {
+                            source_id: position.source_id.clone(),
+                            source_version: position.source_version.clone(),
+                            dependency_group_id: position.dependency_group_id.clone(),
+                            interval: CanonicalPredictionInterval::from_wire(interval)?,
+                            prediction_evidence: CanonicalEvidence::from_wire(prediction_evidence),
                         })
                     },
                 )
-                .transpose()?,
-            evidence: CanonicalEvidence {
-                id: evidence.id.clone(),
-                sha256: evidence.sha256.clone(),
-            },
+                .collect::<Result<Vec<_>, _>>()?,
+            evidence: CanonicalEvidence::from_wire(evidence),
             rationale: value.rationale.clone(),
             aggregate_version: value.aggregate_version.to_string(),
         })
@@ -346,10 +415,7 @@ impl CanonicalDecisionPayload {
 
     #[allow(deprecated)]
     fn into_wire(self, aggregate_version: u64) -> v2::DecisionRecord {
-        let evidence = EvidenceSnapshotRef {
-            id: self.evidence.id,
-            sha256: self.evidence.sha256,
-        };
+        let evidence = self.evidence.into_wire();
 
         v2::DecisionRecord {
             decision_id: self.decision_id,
@@ -364,23 +430,20 @@ impl CanonicalDecisionPayload {
                 detector_id: detector.detector_id,
                 detector_version: detector.detector_version,
             }),
-            prediction_interval: self.prediction_interval.map(|interval| {
-                v2::DecisionPredictionInterval {
-                    target: interval.target,
-                    unit: interval.unit,
-                    lower_decimal: interval.lower_decimal,
-                    upper_decimal: interval.upper_decimal,
-                    nominal_coverage_decimal: interval.nominal_coverage_decimal,
-                    interval_method_id: interval.interval_method_id,
-                    interval_method_version: interval.interval_method_version,
-                    calibration_method_id: interval.calibration_method_id,
-                    calibration_method_version: interval.calibration_method_version,
-                    calibration_evidence: Some(EvidenceSnapshotRef {
-                        id: interval.calibration_evidence.id,
-                        sha256: interval.calibration_evidence.sha256,
-                    }),
-                }
-            }),
+            prediction_interval: self
+                .prediction_interval
+                .map(CanonicalPredictionInterval::into_wire),
+            prediction_positions: self
+                .prediction_positions
+                .into_iter()
+                .map(|position| v2::DecisionPredictionPosition {
+                    source_id: position.source_id,
+                    source_version: position.source_version,
+                    dependency_group_id: position.dependency_group_id,
+                    interval: Some(position.interval.into_wire()),
+                    prediction_evidence: Some(position.prediction_evidence.into_wire()),
+                })
+                .collect(),
         }
     }
 }

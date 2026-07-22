@@ -36,6 +36,13 @@ message DecisionPredictionInterval {
   string calibration_method_version = 9;
   EvidenceSnapshotRef calibration_evidence = 10;
 }
+message DecisionPredictionPosition {
+  string source_id = 1;
+  string source_version = 2;
+  string dependency_group_id = 3;
+  DecisionPredictionInterval interval = 4;
+  EvidenceSnapshotRef prediction_evidence = 5;
+}
 message DecisionRecord {
   string decision_id = 1;
   string cou_id = 2;
@@ -47,6 +54,7 @@ message DecisionRecord {
   optional OodStatus ood_status = 8;
   OodDetectorRef ood_detector = 9;
   DecisionPredictionInterval prediction_interval = 10;
+  repeated DecisionPredictionPosition prediction_positions = 11;
 }
 message DecisionEvent { DecisionRecord decision = 1; string event_id = 2; }
 enum Recommendation {
