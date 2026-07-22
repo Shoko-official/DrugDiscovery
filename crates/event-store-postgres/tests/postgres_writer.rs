@@ -1,6 +1,7 @@
 use bioworld_contracts::v2::{
-    DecisionEvent, DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
-    EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
+    DecisionCriterion, DecisionCriterionComparator, DecisionEvent, DecisionPredictionInterval,
+    DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
+    Recommendation,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
@@ -104,6 +105,17 @@ fn decision_event(event_id: &str, decision_id: &str) -> DecisionEvent {
             }),
             prediction_interval: Some(prediction_interval("0.25", "1.5")),
             prediction_positions: prediction_positions(),
+            decision_criterion: Some(DecisionCriterion {
+                criterion_id: "writer_policy".to_owned(),
+                criterion_version: "2026.07".to_owned(),
+                comparator: DecisionCriterionComparator::LessThanOrEqual as i32,
+                threshold_decimal: "0.75".to_owned(),
+                criterion_evidence: Some(EvidenceSnapshotRef {
+                    id: "ES-M10-CRITERION".to_owned(),
+                    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                }),
+            }),
         }),
     }
 }

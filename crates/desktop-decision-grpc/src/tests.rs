@@ -310,6 +310,17 @@ fn decision_record() -> v2::DecisionRecord {
         }),
         prediction_interval: Some(prediction_interval("0.25", "1.5")),
         prediction_positions: prediction_positions(),
+        decision_criterion: Some(v2::DecisionCriterion {
+            criterion_id: "desktop_service_policy".to_owned(),
+            criterion_version: "2026.07".to_owned(),
+            comparator: v2::DecisionCriterionComparator::LessThanOrEqual as i32,
+            threshold_decimal: "0.75".to_owned(),
+            criterion_evidence: Some(v2::EvidenceSnapshotRef {
+                id: "ES-M30-CRITERION".to_owned(),
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
+            }),
+        }),
     }
 }
 

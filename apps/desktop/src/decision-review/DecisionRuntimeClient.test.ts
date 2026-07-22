@@ -1,5 +1,7 @@
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  DecisionCriterionComparator,
+  DecisionCriterionSchema,
   DecisionPredictionIntervalSchema,
   DecisionPredictionPositionSchema,
   DecisionRecordSchema,
@@ -57,6 +59,16 @@ function validPayload(
     calibrationMethodVersion: "2026.07",
     calibrationEvidence,
   });
+  const decisionCriterion = create(DecisionCriterionSchema, {
+    criterionId: "potency_policy",
+    criterionVersion: "2026.07",
+    comparator: DecisionCriterionComparator.LESS_THAN_OR_EQUAL,
+    thresholdDecimal: "0.75",
+    criterionEvidence: create(EvidenceSnapshotRefSchema, {
+      id: "ES-CRITERION-001",
+      sha256: validSha256,
+    }),
+  });
   const predictionPositions = [
     create(DecisionPredictionPositionSchema, {
       sourceId: "model-z",
@@ -99,6 +111,7 @@ function validPayload(
     oodDetector,
     predictionInterval,
     predictionPositions,
+    decisionCriterion,
   });
 
   return {
@@ -150,6 +163,18 @@ describe("createDecisionReviewLoader", () => {
           calibrationMethodVersion: "2026.07",
           calibrationEvidence: {
             id: "ES-CAL-001",
+            sha256: validSha256,
+          },
+        },
+        decisionCriterion: {
+          criterionId: "potency_policy",
+          criterionVersion: "2026.07",
+          comparator: "less_than_or_equal",
+          thresholdDecimal: "0.75",
+          target: "binding_affinity",
+          unit: "nM",
+          criterionEvidence: {
+            id: "ES-CRITERION-001",
             sha256: validSha256,
           },
         },
@@ -247,6 +272,7 @@ describe("createDecisionReviewLoader", () => {
         domainAssessment: "unknown",
         oodDetector: null,
         predictionInterval: null,
+        decisionCriterion: null,
       },
     });
   });
@@ -281,6 +307,21 @@ describe("createDecisionReviewLoader", () => {
         }),
       }),
     });
+    const loader = createDecisionReviewLoader(async () => ({
+      ...payload,
+      protobuf: Array.from(toBinary(DecisionRecordSchema, record)),
+    }));
+
+    expectSafeRuntimeError(await loader());
+  });
+
+  it("returns a safe error for an invalid decision criterion", async () => {
+    const payload = validPayload();
+    const record = fromBinary(
+      DecisionRecordSchema,
+      Uint8Array.from(payload.protobuf),
+    );
+    record.decisionCriterion!.thresholdDecimal = "0.750";
     const loader = createDecisionReviewLoader(async () => ({
       ...payload,
       protobuf: Array.from(toBinary(DecisionRecordSchema, record)),

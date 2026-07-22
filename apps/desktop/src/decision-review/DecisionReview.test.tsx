@@ -38,6 +38,20 @@ const recordedPredictionInterval = {
   },
 } as const;
 
+const recordedDecisionCriterion = {
+  criterionId: "potency_policy",
+  criterionVersion: "2026.07",
+  comparator: "less_than_or_equal",
+  thresholdDecimal: "0.75",
+  target: "binding_affinity",
+  unit: "nM",
+  criterionEvidence: {
+    id: "ES-CRITERION-001",
+    sha256:
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  },
+} as const;
+
 function recordedPredictionPosition(
   sourceId: string,
   sourceVersion: string,
@@ -302,6 +316,165 @@ describe("DecisionReview", () => {
     expect(markup).not.toContain("Nominal coverage</dt>");
   });
 
+  it("renders the recorded decision criterion between interval and positions", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            decisionCriterion: recordedDecisionCriterion,
+            predictionPositions: [
+              recordedPredictionPosition(
+                "model-z",
+                "2026.07",
+                "shared-training-set",
+                "0.4",
+                "1.4",
+                "ES-PRED-Z",
+              ),
+              recordedPredictionPosition(
+                "model-a",
+                "2026.06",
+                "orthogonal-screen",
+                "0.2",
+                "1.2",
+                "ES-PRED-A",
+              ),
+            ],
+          },
+        }}
+      />,
+    );
+    const intervalIndex = markup.indexOf("Prediction interval");
+    const criterionSectionIndex = markup.indexOf(
+      '<section class="decision-criterion"',
+    );
+    const criterionIndex = markup.indexOf("Decision criterion");
+    const positionsIndex = markup.indexOf("Prediction positions");
+    const criterionMarkup = markup.slice(criterionSectionIndex, positionsIndex);
+
+    expect(criterionSectionIndex).toBeGreaterThan(intervalIndex);
+    expect(criterionIndex).toBeGreaterThan(intervalIndex);
+    expect(positionsIndex).toBeGreaterThan(criterionIndex);
+    expect(criterionMarkup).toContain("Recorded threshold");
+    expect(criterionMarkup).toContain("binding_affinity ≤ 0.75 nM");
+    expect(criterionMarkup).toContain("Less than or equal to (≤)");
+    expect(criterionMarkup).toContain("potency_policy");
+    expect(criterionMarkup).toContain("2026.07");
+    expect(criterionMarkup).toContain("0.75");
+    expect(criterionMarkup).toContain("binding_affinity");
+    expect(criterionMarkup).toContain("nM");
+    expect(criterionMarkup).toContain("ES-CRITERION-001");
+    expect(criterionMarkup).toContain("No threshold result is calculated.");
+    expect(criterionMarkup).toContain(
+      'aria-labelledby="decision-criterion-title"',
+    );
+    expect(criterionMarkup).toContain(
+      '<h3 id="decision-criterion-title">Decision criterion</h3>',
+    );
+    expect(markup).not.toContain(">Pass<");
+    expect(markup).not.toContain(">Fail<");
+    expect(markup).not.toContain(">Eligible<");
+  });
+
+  it.each([
+    ["less_than", "Less than (&lt;)", "binding_affinity &lt; 0.75 nM"],
+    [
+      "less_than_or_equal",
+      "Less than or equal to (≤)",
+      "binding_affinity ≤ 0.75 nM",
+    ],
+    ["greater_than", "Greater than (&gt;)", "binding_affinity &gt; 0.75 nM"],
+    [
+      "greater_than_or_equal",
+      "Greater than or equal to (≥)",
+      "binding_affinity ≥ 0.75 nM",
+    ],
+  ] as const)(
+    "renders comparator %s with explicit operands",
+    (comparator, label, expression) => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            decisionCriterion: { ...recordedDecisionCriterion, comparator },
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain(label);
+    expect(markup).toContain(expression);
+    expect(markup).toContain("Target");
+    expect(markup).toContain("Threshold");
+    },
+  );
+
+  it("states when historical decision criterion metadata is unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "bundled_sample",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            decisionCriterion: null,
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Decision criterion");
+    expect(markup).toContain("Historical criterion unavailable");
+    expect(markup).toContain(
+      "This historical decision does not include recorded criterion metadata.",
+    );
+    expect(markup).not.toContain("ES-CRITERION-001");
+  });
+
+  it("renders decision criterion metadata as escaped React text", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionReview
+        state={{
+          kind: "ready",
+          source: "decision_service",
+          decision: {
+            ...tracedDecision,
+            predictionInterval: recordedPredictionInterval,
+            decisionCriterion: {
+              ...recordedDecisionCriterion,
+              criterionId: "<img src=x onerror=alert(1)>",
+              criterionVersion: "<script>alert(2)</script>",
+              criterionEvidence: {
+                id: "</dd><iframe src=javascript:alert(3)>",
+                sha256: "<svg onload=alert(4)>",
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(markup).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
+    expect(markup).toContain(
+      "&lt;/dd&gt;&lt;iframe src=javascript:alert(3)&gt;",
+    );
+    expect(markup).toContain("&lt;svg onload=alert(4)&gt;");
+    expect(markup).not.toContain("<img");
+    expect(markup).not.toContain("<script");
+    expect(markup).not.toContain("<iframe");
+    expect(markup).not.toContain("<svg");
+  });
+
   it("renders recorded prediction positions after the decision interval", () => {
     const markup = renderToStaticMarkup(
       <DecisionReview
@@ -367,6 +540,8 @@ describe("DecisionReview", () => {
     expect(secondPositionIndex).toBeGreaterThan(firstPositionIndex);
     expect(markup).toContain("shared-training-set");
     expect(markup).toContain("independent-assay");
+    expect(markup).toContain("potency_policy");
+    expect(markup).toContain("ES-CRITERION-001");
   });
 
   it("states when historical prediction positions are unavailable", () => {

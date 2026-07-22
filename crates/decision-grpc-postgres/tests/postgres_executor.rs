@@ -619,6 +619,7 @@ fn record(
         ood_detector: None,
         prediction_interval: Some(prediction_interval("0.25", "1.5")),
         prediction_positions: prediction_positions(),
+        decision_criterion: None,
     }
 }
 

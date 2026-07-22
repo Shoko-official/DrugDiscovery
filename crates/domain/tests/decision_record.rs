@@ -1,6 +1,8 @@
 use bioworld_domain::{
-    DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord, DomainError,
-    EvidenceSnapshotRef, MAX_DECISION_IDENTIFIER_BYTES, MAX_DECISION_IDENTIFIER_CHARS,
+    DecisionCriterion, DecisionCriterionComparator, DecisionPredictionInterval,
+    DecisionPredictionPosition, DecisionRecord, DomainError, EvidenceSnapshotRef,
+    MAX_DECISION_CRITERION_DECIMAL_BYTES, MAX_DECISION_CRITERION_IDENTIFIER_BYTES,
+    MAX_DECISION_IDENTIFIER_BYTES, MAX_DECISION_IDENTIFIER_CHARS,
     MAX_DECISION_RATIONALE_ITEM_BYTES, MAX_DECISION_RATIONALE_ITEMS,
     MAX_DECISION_RATIONALE_TOTAL_BYTES, MAX_OOD_DETECTOR_ID_BYTES, MAX_OOD_DETECTOR_VERSION_BYTES,
     MAX_PREDICTION_INTERVAL_DECIMAL_BYTES, MAX_PREDICTION_INTERVAL_IDENTIFIER_BYTES,
@@ -12,6 +14,33 @@ const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 
 fn calibration_evidence() -> EvidenceSnapshotRef {
     EvidenceSnapshotRef::try_new("ES-CAL-001".to_owned(), VALID_SHA256.to_owned()).unwrap()
+}
+
+fn decision_criterion() -> DecisionCriterion {
+    DecisionCriterion::try_new(
+        "potency_policy".to_owned(),
+        "2026.07".to_owned(),
+        DecisionCriterionComparator::LessThanOrEqual,
+        "0.75".to_owned(),
+        EvidenceSnapshotRef::try_new("ES-CRITERION-001".to_owned(), VALID_SHA256.to_owned())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn try_decision_criterion(
+    criterion_id: String,
+    criterion_version: String,
+    threshold_decimal: String,
+) -> Result<DecisionCriterion, DomainError> {
+    DecisionCriterion::try_new(
+        criterion_id,
+        criterion_version,
+        DecisionCriterionComparator::LessThanOrEqual,
+        threshold_decimal,
+        EvidenceSnapshotRef::try_new("ES-CRITERION-001".to_owned(), VALID_SHA256.to_owned())
+            .unwrap(),
+    )
 }
 
 fn prediction_interval_values() -> [String; 9] {
@@ -339,6 +368,264 @@ fn constructs_decision_with_prediction_positions_in_recorded_order() {
 }
 
 #[test]
+fn constructs_decision_with_exact_recorded_criterion() {
+    let interval = try_prediction_interval(prediction_interval_values()).unwrap();
+    let criterion = decision_criterion();
+    let record = DecisionRecord::try_new_with_decision_criterion(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        Some(
+            OodDetectorRef::try_new("mahalanobis".to_owned(), "model-2026.07".to_owned()).unwrap(),
+        ),
+        Some(interval),
+        Vec::new(),
+        Some(criterion.clone()),
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(record.decision_criterion(), Some(&criterion));
+    assert_eq!(criterion.criterion_id(), "potency_policy");
+    assert_eq!(criterion.criterion_version(), "2026.07");
+    assert_eq!(
+        criterion.comparator(),
+        &DecisionCriterionComparator::LessThanOrEqual
+    );
+    assert_eq!(criterion.threshold_decimal(), "0.75");
+    assert_eq!(criterion.criterion_evidence().id(), "ES-CRITERION-001");
+}
+
+#[test]
+fn validates_decision_criterion_identifiers_with_exact_byte_budgets() {
+    let exact = "\u{10000}".repeat(MAX_DECISION_CRITERION_IDENTIFIER_BYTES / 4);
+    assert_eq!(exact.len(), MAX_DECISION_CRITERION_IDENTIFIER_BYTES);
+
+    for (field_index, expected) in [
+        (0, DomainError::InvalidDecisionCriterionId),
+        (1, DomainError::InvalidDecisionCriterionVersion),
+    ] {
+        let mut values = ["potency_policy".to_owned(), "2026.07".to_owned()];
+        values[field_index] = exact.clone();
+        assert!(
+            try_decision_criterion(values[0].clone(), values[1].clone(), "0.75".to_owned()).is_ok()
+        );
+
+        for invalid in [
+            String::new(),
+            " ".to_owned(),
+            " leading".to_owned(),
+            "trailing ".to_owned(),
+            "embedded\0nul".to_owned(),
+            format!("{exact}x"),
+        ] {
+            let mut values = ["potency_policy".to_owned(), "2026.07".to_owned()];
+            values[field_index] = invalid;
+            assert_eq!(
+                try_decision_criterion(values[0].clone(), values[1].clone(), "0.75".to_owned()),
+                Err(match field_index {
+                    0 => DomainError::InvalidDecisionCriterionId,
+                    _ => DomainError::InvalidDecisionCriterionVersion,
+                })
+            );
+        }
+
+        assert_eq!(
+            expected,
+            match field_index {
+                0 => DomainError::InvalidDecisionCriterionId,
+                _ => DomainError::InvalidDecisionCriterionVersion,
+            }
+        );
+    }
+}
+
+#[test]
+fn decision_criterion_identifiers_use_unicode_whitespace_boundaries() {
+    let format_character = "\u{feff}";
+    let criterion = DecisionCriterion::try_new(
+        format!("{format_character}potency_policy{format_character}"),
+        format!("{format_character}2026.07{format_character}"),
+        DecisionCriterionComparator::LessThanOrEqual,
+        "0.75".to_owned(),
+        EvidenceSnapshotRef::try_new(
+            format!("{format_character}ES-CRITERION-001{format_character}"),
+            VALID_SHA256.to_owned(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(criterion.criterion_id(), "\u{feff}potency_policy\u{feff}");
+    assert_eq!(
+        criterion.criterion_evidence().id(),
+        "\u{feff}ES-CRITERION-001\u{feff}"
+    );
+    assert_eq!(
+        try_decision_criterion(
+            "\u{2003}potency_policy".to_owned(),
+            "2026.07".to_owned(),
+            "0.75".to_owned(),
+        ),
+        Err(DomainError::InvalidDecisionCriterionId)
+    );
+    assert_eq!(
+        EvidenceSnapshotRef::try_new(
+            "ES-CRITERION-001\u{2003}".to_owned(),
+            VALID_SHA256.to_owned(),
+        ),
+        Err(DomainError::InvalidEvidenceId)
+    );
+}
+
+#[test]
+fn validates_canonical_decision_criterion_threshold_decimals() {
+    for valid in ["0", "-12", "12", "-0.25", "0.25", "10.01", "1.5"] {
+        assert!(
+            try_decision_criterion(
+                "potency_policy".to_owned(),
+                "2026.07".to_owned(),
+                valid.to_owned(),
+            )
+            .is_ok()
+        );
+    }
+
+    let exact = "1".repeat(MAX_DECISION_CRITERION_DECIMAL_BYTES);
+    assert!(
+        try_decision_criterion(
+            "potency_policy".to_owned(),
+            "2026.07".to_owned(),
+            exact.clone(),
+        )
+        .is_ok()
+    );
+
+    for invalid in [
+        "".to_owned(),
+        " ".to_owned(),
+        "+1".to_owned(),
+        "-".to_owned(),
+        "-0".to_owned(),
+        "00".to_owned(),
+        "01".to_owned(),
+        ".5".to_owned(),
+        "1.".to_owned(),
+        "1.0".to_owned(),
+        "1.20".to_owned(),
+        "1e3".to_owned(),
+        "NaN".to_owned(),
+        "1 ".to_owned(),
+        format!("{exact}1"),
+    ] {
+        assert_eq!(
+            try_decision_criterion("potency_policy".to_owned(), "2026.07".to_owned(), invalid,),
+            Err(DomainError::InvalidDecisionCriterionThresholdDecimal)
+        );
+    }
+}
+
+#[test]
+fn rejects_decision_criterion_without_prediction_interval() {
+    let result = DecisionRecord::try_new_with_decision_criterion(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        None,
+        None,
+        Vec::new(),
+        Some(decision_criterion()),
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    );
+
+    assert_eq!(
+        result,
+        Err(DomainError::MissingPredictionIntervalForCriterion)
+    );
+}
+
+#[test]
+fn decision_criterion_json_enforces_invariants_and_round_trips_exactly() {
+    let criterion = decision_criterion();
+    let serialized = serde_json::to_value(&criterion).unwrap();
+    assert_eq!(serialized["comparator"], "less_than_or_equal");
+    assert_eq!(serialized["threshold_decimal"], "0.75");
+    assert_eq!(
+        serde_json::from_value::<DecisionCriterion>(serialized.clone()).unwrap(),
+        criterion
+    );
+
+    let mut invalid_decimal = serialized.clone();
+    invalid_decimal["threshold_decimal"] = serde_json::Value::String("0.750".to_owned());
+    assert!(
+        serde_json::from_value::<DecisionCriterion>(invalid_decimal)
+            .unwrap_err()
+            .to_string()
+            .contains("decision criterion threshold is invalid")
+    );
+
+    let mut invalid_evidence = serialized;
+    invalid_evidence["criterion_evidence"]["sha256"] =
+        serde_json::Value::String("invalid".to_owned());
+    assert!(
+        serde_json::from_value::<DecisionCriterion>(invalid_evidence)
+            .unwrap_err()
+            .to_string()
+            .contains("evidence digest must be a lowercase sha256")
+    );
+}
+
+#[test]
+fn decision_json_preserves_criterion_and_omits_historical_absence() {
+    let interval = try_prediction_interval(prediction_interval_values()).unwrap();
+    let criterion = decision_criterion();
+    let current = DecisionRecord::try_new_with_decision_criterion(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Borderline,
+        None,
+        Some(interval),
+        Vec::new(),
+        Some(criterion.clone()),
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Evidence coverage is incomplete.".to_owned()],
+    )
+    .unwrap();
+    let current_json = serde_json::to_value(&current).unwrap();
+    let current_round_trip: DecisionRecord = serde_json::from_value(current_json.clone()).unwrap();
+    assert_eq!(
+        current_json["decision_criterion"]["threshold_decimal"],
+        "0.75"
+    );
+    assert_eq!(current_round_trip.decision_criterion(), Some(&criterion));
+
+    let historical = DecisionRecord::try_new_with_prediction_interval(
+        Uuid::now_v7(),
+        "COU-001".to_owned(),
+        Recommendation::Abstain,
+        OodStatus::Unknown,
+        None,
+        Some(try_prediction_interval(prediction_interval_values()).unwrap()),
+        EvidenceSnapshotRef::try_new("ES-001".to_owned(), VALID_SHA256.to_owned()).unwrap(),
+        vec!["Historical decision.".to_owned()],
+    )
+    .unwrap();
+    let historical_json = serde_json::to_value(&historical).unwrap();
+    assert!(historical_json.get("decision_criterion").is_none());
+    assert!(
+        serde_json::from_value::<DecisionRecord>(historical_json)
+            .unwrap()
+            .decision_criterion()
+            .is_none()
+    );
+}
+
+#[test]
 fn validates_prediction_position_identifiers_with_exact_byte_budgets() {
     let fields: [(usize, fn() -> DomainError); 3] = [
         (0, || DomainError::InvalidPredictionPositionSourceId),
@@ -624,6 +911,30 @@ fn prediction_interval_errors_have_fixed_text() {
         (
             DomainError::InvalidPredictionIntervalNominalCoverageDecimal,
             "prediction interval nominal coverage is invalid",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn decision_criterion_errors_have_fixed_text() {
+    for (error, expected) in [
+        (
+            DomainError::InvalidDecisionCriterionId,
+            "decision criterion identifier is invalid",
+        ),
+        (
+            DomainError::InvalidDecisionCriterionVersion,
+            "decision criterion version is invalid",
+        ),
+        (
+            DomainError::InvalidDecisionCriterionThresholdDecimal,
+            "decision criterion threshold is invalid",
+        ),
+        (
+            DomainError::MissingPredictionIntervalForCriterion,
+            "a decision criterion requires a prediction interval",
         ),
     ] {
         assert_eq!(error.to_string(), expected);

@@ -1,6 +1,8 @@
 use std::num::NonZeroU64;
 
 use bioworld_domain::{
+    DecisionCriterion as DomainDecisionCriterion,
+    DecisionCriterionComparator as DomainDecisionCriterionComparator,
     DecisionPredictionInterval as DomainDecisionPredictionInterval,
     DecisionPredictionPosition as DomainDecisionPredictionPosition,
     DecisionRecord as DomainDecisionRecord, DomainError, EvidenceSnapshotRef,
@@ -56,6 +58,8 @@ pub enum DecisionContractError {
     MissingPredictionPositionInterval,
     #[error("prediction position evidence is required")]
     MissingPredictionPositionEvidence,
+    #[error("decision criterion evidence is required")]
+    MissingDecisionCriterionEvidence,
     #[error("legacy evidence_snapshot_id conflicts with evidence.id")]
     ConflictingEvidenceIds,
     #[error("aggregate_version must be greater than zero")]
@@ -68,6 +72,10 @@ pub enum DecisionContractError {
     UnspecifiedOodStatus,
     #[error("ood_status value {0} is unknown")]
     UnknownOodStatus(i32),
+    #[error("decision criterion comparator must not be unspecified")]
+    UnspecifiedDecisionCriterionComparator,
+    #[error("decision criterion comparator value {0} is unknown")]
+    UnknownDecisionCriterionComparator(i32),
     #[error(transparent)]
     InvalidDomain(#[from] DomainError),
 }
@@ -136,8 +144,24 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
                 .map_err(Self::Error::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let decision_criterion = value
+            .decision_criterion
+            .map(|criterion| {
+                let criterion_evidence = criterion
+                    .criterion_evidence
+                    .ok_or(Self::Error::MissingDecisionCriterionEvidence)?;
+                DomainDecisionCriterion::try_new(
+                    criterion.criterion_id,
+                    criterion.criterion_version,
+                    decision_criterion_comparator_from_wire(criterion.comparator)?,
+                    criterion.threshold_decimal,
+                    evidence_from_wire(criterion_evidence)?,
+                )
+                .map_err(Self::Error::from)
+            })
+            .transpose()?;
         let evidence = evidence_from_wire(evidence)?;
-        let decision = DomainDecisionRecord::try_new_with_prediction_positions(
+        let decision = DomainDecisionRecord::try_new_with_decision_criterion(
             decision_id,
             value.cou_id,
             recommendation,
@@ -145,6 +169,7 @@ impl TryFrom<v2::DecisionRecord> for VersionedDecisionRecord {
             ood_detector,
             prediction_interval,
             prediction_positions,
+            decision_criterion,
             evidence,
             value.rationale,
         )?;
@@ -186,6 +211,16 @@ impl From<&VersionedDecisionRecord> for v2::DecisionRecord {
                     prediction_evidence: Some(evidence_to_wire(position.prediction_evidence())),
                 })
                 .collect(),
+            decision_criterion: decision.decision_criterion().map(|criterion| {
+                v2::DecisionCriterion {
+                    criterion_id: criterion.criterion_id().to_owned(),
+                    criterion_version: criterion.criterion_version().to_owned(),
+                    comparator: decision_criterion_comparator_to_wire(criterion.comparator())
+                        as i32,
+                    threshold_decimal: criterion.threshold_decimal().to_owned(),
+                    criterion_evidence: Some(evidence_to_wire(criterion.criterion_evidence())),
+                }
+            }),
         }
     }
 }
@@ -283,5 +318,46 @@ fn ood_status_to_wire(value: &DomainOodStatus) -> v2::OodStatus {
         DomainOodStatus::Borderline => v2::OodStatus::Borderline,
         DomainOodStatus::OutOfDomain => v2::OodStatus::OutOfDomain,
         DomainOodStatus::Unknown => v2::OodStatus::Unknown,
+    }
+}
+
+fn decision_criterion_comparator_from_wire(
+    value: i32,
+) -> Result<DomainDecisionCriterionComparator, DecisionContractError> {
+    match v2::DecisionCriterionComparator::try_from(value)
+        .map_err(|_| DecisionContractError::UnknownDecisionCriterionComparator(value))?
+    {
+        v2::DecisionCriterionComparator::Unspecified => {
+            Err(DecisionContractError::UnspecifiedDecisionCriterionComparator)
+        }
+        v2::DecisionCriterionComparator::LessThan => {
+            Ok(DomainDecisionCriterionComparator::LessThan)
+        }
+        v2::DecisionCriterionComparator::LessThanOrEqual => {
+            Ok(DomainDecisionCriterionComparator::LessThanOrEqual)
+        }
+        v2::DecisionCriterionComparator::GreaterThan => {
+            Ok(DomainDecisionCriterionComparator::GreaterThan)
+        }
+        v2::DecisionCriterionComparator::GreaterThanOrEqual => {
+            Ok(DomainDecisionCriterionComparator::GreaterThanOrEqual)
+        }
+    }
+}
+
+fn decision_criterion_comparator_to_wire(
+    value: &DomainDecisionCriterionComparator,
+) -> v2::DecisionCriterionComparator {
+    match value {
+        DomainDecisionCriterionComparator::LessThan => v2::DecisionCriterionComparator::LessThan,
+        DomainDecisionCriterionComparator::LessThanOrEqual => {
+            v2::DecisionCriterionComparator::LessThanOrEqual
+        }
+        DomainDecisionCriterionComparator::GreaterThan => {
+            v2::DecisionCriterionComparator::GreaterThan
+        }
+        DomainDecisionCriterionComparator::GreaterThanOrEqual => {
+            v2::DecisionCriterionComparator::GreaterThanOrEqual
+        }
     }
 }

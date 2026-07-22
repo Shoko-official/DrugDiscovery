@@ -1,8 +1,9 @@
 use bioworld_contracts::{
     DecisionContractError, MAX_TENANT_ID_BYTES,
     v2::{
-        DecisionEvent, DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord,
-        EvidenceSnapshotRef, OodDetectorRef, OodStatus, Recommendation,
+        DecisionCriterion, DecisionCriterionComparator, DecisionEvent, DecisionPredictionInterval,
+        DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
+        Recommendation,
     },
 };
 use bioworld_event_store_contracts::{
@@ -25,7 +26,8 @@ const LEGACY_PAYLOAD_WITH_OOD_STATUS_ONLY: &str = r#"{"aggregate_version":"18446
 const HISTORICAL_OUT_OF_DOMAIN_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_status":"out_of_domain","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 const LEGACY_PAYLOAD_WITH_OOD_PROVENANCE: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 const M33_CANONICAL_PAYLOAD_WITHOUT_POSITIONS: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
-const CURRENT_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const M34_CANONICAL_PAYLOAD_WITHOUT_CRITERION: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const CURRENT_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_criterion":{"comparator":"less_than_or_equal","criterion_evidence":{"id":"ES-CRITERION-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"criterion_id":"potency_policy","criterion_version":"2026.07","threshold_decimal":"0.75"},"decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
 
 fn prediction_interval() -> DecisionPredictionInterval {
     DecisionPredictionInterval {
@@ -64,6 +66,19 @@ fn prediction_position(
         interval: Some(interval),
         prediction_evidence: Some(EvidenceSnapshotRef {
             id: evidence_id.to_owned(),
+            sha256: VALID_SHA256.to_owned(),
+        }),
+    }
+}
+
+fn decision_criterion() -> DecisionCriterion {
+    DecisionCriterion {
+        criterion_id: "potency_policy".to_owned(),
+        criterion_version: "2026.07".to_owned(),
+        comparator: DecisionCriterionComparator::LessThanOrEqual as i32,
+        threshold_decimal: "0.75".to_owned(),
+        criterion_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CRITERION-001".to_owned(),
             sha256: VALID_SHA256.to_owned(),
         }),
     }
@@ -112,7 +127,16 @@ fn complete_event() -> DecisionEvent {
                     "ES-PRED-A",
                 ),
             ],
+            decision_criterion: Some(decision_criterion()),
         }),
+    }
+}
+
+fn json_node_count(value: &serde_json::Value) -> usize {
+    1 + match value {
+        serde_json::Value::Array(values) => values.iter().map(json_node_count).sum(),
+        serde_json::Value::Object(values) => values.values().map(json_node_count).sum(),
+        _ => 0,
     }
 }
 
@@ -405,8 +429,21 @@ fn projects_canonical_payload_and_round_trips_without_loss() {
         })
     );
     assert_eq!(
+        row.payload["decision_criterion"],
+        json!({
+            "criterion_id": "potency_policy",
+            "criterion_version": "2026.07",
+            "comparator": "less_than_or_equal",
+            "threshold_decimal": "0.75",
+            "criterion_evidence": {
+                "id": "ES-CRITERION-001",
+                "sha256": VALID_SHA256
+            }
+        })
+    );
+    assert_eq!(
         row.payload_sha256,
-        "1d8a4aa0f60fb75fcca44744b07c0c85e2e81974ed95d7eb7926c029ab47f655"
+        "692da3fee27b32d4d7b24132dd6fd96bdb14280783a2ca18ea49dbce4d505d9f"
     );
     assert_eq!(
         String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap(),
@@ -477,6 +514,37 @@ fn projects_prediction_positions_in_recorded_order() {
 }
 
 #[test]
+fn projects_and_reconstructs_every_decision_criterion_comparator() {
+    for (comparator, canonical) in [
+        (DecisionCriterionComparator::LessThan, "less_than"),
+        (
+            DecisionCriterionComparator::LessThanOrEqual,
+            "less_than_or_equal",
+        ),
+        (DecisionCriterionComparator::GreaterThan, "greater_than"),
+        (
+            DecisionCriterionComparator::GreaterThanOrEqual,
+            "greater_than_or_equal",
+        ),
+    ] {
+        let mut event = complete_event();
+        event
+            .decision
+            .as_mut()
+            .unwrap()
+            .decision_criterion
+            .as_mut()
+            .unwrap()
+            .comparator = comparator as i32;
+
+        let row = project_decision_event(event.clone(), metadata()).unwrap();
+
+        assert_eq!(row.payload["decision_criterion"]["comparator"], canonical,);
+        assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
+    }
+}
+
+#[test]
 fn maximum_prediction_positions_and_rationales_fit_the_canonical_node_envelope() {
     let mut event = complete_event();
     let decision = event.decision.as_mut().unwrap();
@@ -494,6 +562,7 @@ fn maximum_prediction_positions_and_rationales_fit_the_canonical_node_envelope()
     let payload = serde_jcs::to_string(&row.payload).unwrap();
 
     assert_eq!(MAX_CANONICAL_DECISION_PAYLOAD_NODES, 128);
+    assert_eq!(json_node_count(&row.payload), 127);
     assert!(parse_stored_decision_payload(&payload).is_ok());
 }
 
@@ -946,6 +1015,16 @@ fn canonical_hash_is_independent_of_json_object_key_order() {
                 "Primary threshold was not met."
             ],
             "recommendation":"stop_program",
+            "decision_criterion":{
+                "threshold_decimal":"0.75",
+                "criterion_version":"2026.07",
+                "criterion_id":"potency_policy",
+                "criterion_evidence":{
+                    "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "id":"ES-CRITERION-001"
+                },
+                "comparator":"less_than_or_equal"
+            },
             "evidence":{
                 "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "id":"ES-001"
@@ -1236,6 +1315,30 @@ fn historical_m33_payload_without_prediction_positions_reconstructs_without_muta
 }
 
 #[test]
+fn historical_m34_payload_without_decision_criterion_reconstructs_without_mutation() {
+    const M34_PAYLOAD_SHA256: &str =
+        "1d8a4aa0f60fb75fcca44744b07c0c85e2e81974ed95d7eb7926c029ab47f655";
+
+    let row = row_with_literal_payload(M34_CANONICAL_PAYLOAD_WITHOUT_CRITERION, M34_PAYLOAD_SHA256);
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(M34_CANONICAL_PAYLOAD_WITHOUT_CRITERION)
+        ),
+        M34_PAYLOAD_SHA256
+    );
+    let original = row.clone();
+
+    let reconstructed = reconstruct_decision_event(&row).unwrap();
+    let decision = reconstructed.decision.unwrap();
+
+    assert!(decision.prediction_interval.is_some());
+    assert_eq!(decision.prediction_positions.len(), 2);
+    assert!(decision.decision_criterion.is_none());
+    assert_eq!(row, original);
+}
+
+#[test]
 fn rejects_unqualified_ood_status_before_persistence_with_redacted_errors() {
     for (invalid, missing) in [
         (None, true),
@@ -1327,6 +1430,23 @@ fn rejects_missing_prediction_positions_before_persistence_with_a_fixed_error() 
     assert_eq!(
         error.to_string(),
         "new decision events require prediction positions"
+    );
+}
+
+#[test]
+fn rejects_missing_decision_criterion_before_persistence_with_a_fixed_error() {
+    let mut event = complete_event();
+    event.decision.as_mut().unwrap().decision_criterion = None;
+
+    let error = project_decision_event(event, metadata()).unwrap_err();
+
+    assert!(matches!(
+        &error,
+        EventProjectionError::MissingDecisionCriterion
+    ));
+    assert_eq!(
+        error.to_string(),
+        "new decision events require a decision criterion"
     );
 }
 

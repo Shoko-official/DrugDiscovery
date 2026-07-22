@@ -217,6 +217,10 @@ mod tests {
             bundled_decision_record().prediction_positions
         );
         assert_eq!(
+            decoded.decision_criterion,
+            bundled_decision_record().decision_criterion
+        );
+        assert_eq!(
             decoded
                 .prediction_positions
                 .iter()

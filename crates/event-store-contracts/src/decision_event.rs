@@ -84,6 +84,8 @@ pub enum EventProjectionError {
     MissingPredictionInterval,
     #[error("new decision events require prediction positions")]
     MissingPredictionPositions,
+    #[error("new decision events require a decision criterion")]
+    MissingDecisionCriterion,
     #[error("out-of-domain decisions must abstain")]
     OutOfDomainRequiresAbstain,
     #[error("event_id must be a canonical UUID")]
@@ -136,6 +138,8 @@ struct CanonicalDecisionPayload {
     ood_detector: Option<CanonicalOodDetector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prediction_interval: Option<CanonicalPredictionInterval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_criterion: Option<CanonicalDecisionCriterion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prediction_positions: Vec<CanonicalPredictionPosition>,
     evidence: CanonicalEvidence,
@@ -180,6 +184,16 @@ struct CanonicalPredictionPosition {
     dependency_group_id: String,
     interval: CanonicalPredictionInterval,
     prediction_evidence: CanonicalEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalDecisionCriterion {
+    criterion_id: String,
+    criterion_version: String,
+    comparator: CanonicalDecisionCriterionComparator,
+    threshold_decimal: String,
+    criterion_evidence: CanonicalEvidence,
 }
 
 impl CanonicalEvidence {
@@ -235,6 +249,33 @@ impl CanonicalPredictionInterval {
     }
 }
 
+impl CanonicalDecisionCriterion {
+    fn from_wire(value: &v2::DecisionCriterion) -> Result<Self, DecisionContractError> {
+        let criterion_evidence = value
+            .criterion_evidence
+            .as_ref()
+            .ok_or(DecisionContractError::MissingDecisionCriterionEvidence)?;
+
+        Ok(Self {
+            criterion_id: value.criterion_id.clone(),
+            criterion_version: value.criterion_version.clone(),
+            comparator: CanonicalDecisionCriterionComparator::try_from(value.comparator)?,
+            threshold_decimal: value.threshold_decimal.clone(),
+            criterion_evidence: CanonicalEvidence::from_wire(criterion_evidence),
+        })
+    }
+
+    fn into_wire(self) -> v2::DecisionCriterion {
+        v2::DecisionCriterion {
+            criterion_id: self.criterion_id,
+            criterion_version: self.criterion_version,
+            comparator: self.comparator.to_wire() as i32,
+            threshold_decimal: self.threshold_decimal,
+            criterion_evidence: Some(self.criterion_evidence.into_wire()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CanonicalRecommendation {
@@ -255,6 +296,15 @@ enum CanonicalOodStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CanonicalDecisionCriterionComparator {
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
 pub fn project_decision_event(
     event: DecisionEvent,
     metadata: DecisionEventMetadata,
@@ -272,6 +322,9 @@ pub fn project_decision_event(
     }
     if decision.prediction_positions.is_empty() {
         return Err(EventProjectionError::MissingPredictionPositions);
+    }
+    if decision.decision_criterion.is_none() {
+        return Err(EventProjectionError::MissingDecisionCriterion);
     }
     let boundary = VersionedDecisionRecord::try_from(decision)?;
     let decision = v2::DecisionRecord::from(&boundary);
@@ -383,6 +436,11 @@ impl CanonicalDecisionPayload {
                 .as_ref()
                 .map(CanonicalPredictionInterval::from_wire)
                 .transpose()?,
+            decision_criterion: value
+                .decision_criterion
+                .as_ref()
+                .map(CanonicalDecisionCriterion::from_wire)
+                .transpose()?,
             prediction_positions: value
                 .prediction_positions
                 .iter()
@@ -444,6 +502,9 @@ impl CanonicalDecisionPayload {
                     prediction_evidence: Some(position.prediction_evidence.into_wire()),
                 })
                 .collect(),
+            decision_criterion: self
+                .decision_criterion
+                .map(CanonicalDecisionCriterion::into_wire),
         }
     }
 }
@@ -522,6 +583,35 @@ impl CanonicalOodStatus {
             Self::Borderline => v2::OodStatus::Borderline,
             Self::OutOfDomain => v2::OodStatus::OutOfDomain,
             Self::Unknown => v2::OodStatus::Unknown,
+        }
+    }
+}
+
+impl TryFrom<i32> for CanonicalDecisionCriterionComparator {
+    type Error = DecisionContractError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match v2::DecisionCriterionComparator::try_from(value)
+            .map_err(|_| DecisionContractError::UnknownDecisionCriterionComparator(value))?
+        {
+            v2::DecisionCriterionComparator::Unspecified => {
+                Err(DecisionContractError::UnspecifiedDecisionCriterionComparator)
+            }
+            v2::DecisionCriterionComparator::LessThan => Ok(Self::LessThan),
+            v2::DecisionCriterionComparator::LessThanOrEqual => Ok(Self::LessThanOrEqual),
+            v2::DecisionCriterionComparator::GreaterThan => Ok(Self::GreaterThan),
+            v2::DecisionCriterionComparator::GreaterThanOrEqual => Ok(Self::GreaterThanOrEqual),
+        }
+    }
+}
+
+impl CanonicalDecisionCriterionComparator {
+    fn to_wire(self) -> v2::DecisionCriterionComparator {
+        match self {
+            Self::LessThan => v2::DecisionCriterionComparator::LessThan,
+            Self::LessThanOrEqual => v2::DecisionCriterionComparator::LessThanOrEqual,
+            Self::GreaterThan => v2::DecisionCriterionComparator::GreaterThan,
+            Self::GreaterThanOrEqual => v2::DecisionCriterionComparator::GreaterThanOrEqual,
         }
     }
 }

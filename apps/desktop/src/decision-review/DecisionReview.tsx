@@ -45,6 +45,25 @@ export type PredictionPositionMetadata = {
   };
 };
 
+export type DecisionCriterionComparator =
+  | "less_than"
+  | "less_than_or_equal"
+  | "greater_than"
+  | "greater_than_or_equal";
+
+export type DecisionCriterionMetadata = {
+  criterionId: string;
+  criterionVersion: string;
+  comparator: DecisionCriterionComparator;
+  thresholdDecimal: string;
+  target: string;
+  unit: string;
+  criterionEvidence: {
+    id: string;
+    sha256: string;
+  };
+};
+
 export type DecisionSummary = {
   decisionId: string;
   couId: string;
@@ -53,6 +72,7 @@ export type DecisionSummary = {
   domainAssessment: DomainAssessment;
   oodDetector?: OodDetectorMetadata | null;
   predictionInterval?: PredictionIntervalMetadata | null;
+  decisionCriterion?: DecisionCriterionMetadata | null;
   predictionPositions?: readonly PredictionPositionMetadata[];
   rationale: readonly string[];
   evidence: {
@@ -95,6 +115,26 @@ const assessmentLabels: Record<DomainAssessment, string> = {
   borderline: "Borderline",
   out_of_domain: "Out of domain",
   unknown: "Unknown",
+};
+
+const decisionCriterionLabels: Record<
+  DecisionCriterionComparator,
+  string
+> = {
+  less_than: "Less than (<)",
+  less_than_or_equal: "Less than or equal to (≤)",
+  greater_than: "Greater than (>)",
+  greater_than_or_equal: "Greater than or equal to (≥)",
+};
+
+const decisionCriterionSymbols: Record<
+  DecisionCriterionComparator,
+  string
+> = {
+  less_than: "<",
+  less_than_or_equal: "≤",
+  greater_than: ">",
+  greater_than_or_equal: "≥",
 };
 
 const sourcePresentation: Record<
@@ -288,6 +328,85 @@ function PredictionIntervalSection({
   );
 }
 
+function DecisionCriterionSection({
+  criterion,
+}: {
+  criterion?: DecisionCriterionMetadata | null;
+}): React.JSX.Element {
+  return (
+    <section
+      className="decision-criterion"
+      aria-labelledby="decision-criterion-title"
+    >
+      <header className="decision-criterion__header">
+        <div>
+          <p className="section-label">Recorded boundary</p>
+          <h3 id="decision-criterion-title">Decision criterion</h3>
+        </div>
+        <span className="status status--neutral">
+          {criterion ? "Recorded threshold" : "Historical criterion unavailable"}
+        </span>
+      </header>
+      {criterion ? (
+        <>
+          <dl className="decision-criterion__facts">
+            <div className="decision-criterion__expression">
+              <dt>Recorded expression</dt>
+              <dd className="technical-value">
+                {`${criterion.target} ${decisionCriterionSymbols[criterion.comparator]} ${criterion.thresholdDecimal} ${criterion.unit}`}
+              </dd>
+            </div>
+            <div>
+              <dt>Comparator</dt>
+              <dd>{decisionCriterionLabels[criterion.comparator]}</dd>
+            </div>
+            <div>
+              <dt>Threshold</dt>
+              <dd className="technical-value">{criterion.thresholdDecimal}</dd>
+            </div>
+            <div>
+              <dt>Target</dt>
+              <dd className="technical-value">{criterion.target}</dd>
+            </div>
+            <div>
+              <dt>Unit</dt>
+              <dd className="technical-value">{criterion.unit}</dd>
+            </div>
+            <div>
+              <dt>Criterion ID</dt>
+              <dd className="technical-value">{criterion.criterionId}</dd>
+            </div>
+            <div>
+              <dt>Criterion version</dt>
+              <dd className="technical-value">{criterion.criterionVersion}</dd>
+            </div>
+            <div>
+              <dt>Criterion evidence ID</dt>
+              <dd className="technical-value">
+                {criterion.criterionEvidence.id}
+              </dd>
+            </div>
+            <div>
+              <dt>Criterion evidence SHA-256</dt>
+              <dd className="technical-value">
+                {criterion.criterionEvidence.sha256}
+              </dd>
+            </div>
+          </dl>
+          <p className="decision-criterion__note">
+            Values are displayed as recorded. No threshold result is calculated.
+            Criterion evidence content is not included in this review.
+          </p>
+        </>
+      ) : (
+        <p className="decision-criterion__note">
+          This historical decision does not include recorded criterion metadata.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function PredictionPositionsSection({
   positions,
 }: {
@@ -464,6 +583,8 @@ function ReadyState({
         </section>
 
         <PredictionIntervalSection interval={decision.predictionInterval} />
+
+        <DecisionCriterionSection criterion={decision.decisionCriterion} />
 
         <PredictionPositionsSection positions={decision.predictionPositions} />
 

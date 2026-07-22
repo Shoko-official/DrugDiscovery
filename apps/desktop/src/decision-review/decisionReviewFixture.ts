@@ -1,5 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  DecisionCriterionComparator,
+  DecisionCriterionSchema,
   DecisionPredictionIntervalSchema,
   DecisionPredictionPositionSchema,
   DecisionRecordSchema,
@@ -28,6 +30,12 @@ const calibrationEvidence = create(EvidenceSnapshotRefSchema, {
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 });
 
+const criterionEvidence = create(EvidenceSnapshotRefSchema, {
+  id: "ES-CRITERION-001",
+  sha256:
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+});
+
 function predictionIntervalWithBounds(
   lowerDecimal: string,
   upperDecimal: string,
@@ -47,6 +55,13 @@ function predictionIntervalWithBounds(
 }
 
 const predictionInterval = predictionIntervalWithBounds("0.25", "1.5");
+const decisionCriterion = create(DecisionCriterionSchema, {
+  criterionId: "potency_policy",
+  criterionVersion: "2026.07",
+  comparator: DecisionCriterionComparator.LESS_THAN_OR_EQUAL,
+  thresholdDecimal: "0.75",
+  criterionEvidence,
+});
 const predictionPositions = [
   create(DecisionPredictionPositionSchema, {
     sourceId: "model-z",
@@ -84,6 +99,7 @@ const decision = create(DecisionRecordSchema, {
   oodDetector,
   predictionInterval,
   predictionPositions,
+  decisionCriterion,
 });
 
 export const decisionPreviewFixture = {
