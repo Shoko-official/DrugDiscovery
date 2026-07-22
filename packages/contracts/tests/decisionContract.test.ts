@@ -2,6 +2,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import {
   DecisionService,
+  DecisionPredictionIntervalSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -24,6 +25,41 @@ const preM31DecisionWire = Uint8Array.from([
   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102,
 ]);
 const m31DecisionWire = Uint8Array.from([...preM31DecisionWire, 64, 3]);
+const frozenOodProvenanceWire = Uint8Array.from([
+  ...preM31DecisionWire,
+  64,
+  2,
+  74,
+  28,
+  10,
+  11,
+  109,
+  97,
+  104,
+  97,
+  108,
+  97,
+  110,
+  111,
+  98,
+  105,
+  115,
+  18,
+  13,
+  109,
+  111,
+  100,
+  101,
+  108,
+  45,
+  50,
+  48,
+  50,
+  54,
+  46,
+  48,
+  55,
+]);
 
 describe("generated decision contract", () => {
   it("round-trips a complete decision with a lossless aggregate version", () => {
@@ -35,6 +71,22 @@ describe("generated decision contract", () => {
       detectorId: "mahalanobis",
       detectorVersion: "model-2026.07",
     });
+    const calibrationEvidence = create(EvidenceSnapshotRefSchema, {
+      id: "ES-CAL-001",
+      sha256: validSha256,
+    });
+    const predictionInterval = create(DecisionPredictionIntervalSchema, {
+      target: "binding_affinity",
+      unit: "nM",
+      lowerDecimal: "0.25",
+      upperDecimal: "1.5",
+      nominalCoverageDecimal: "0.95",
+      intervalMethodId: "split_conformal",
+      intervalMethodVersion: "1.0",
+      calibrationMethodId: "held_out_calibration",
+      calibrationMethodVersion: "2026.07",
+      calibrationEvidence,
+    });
     const expected = create(DecisionRecordSchema, {
       decisionId: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
       couId: "COU-001",
@@ -45,6 +97,7 @@ describe("generated decision contract", () => {
       evidence,
       oodStatus: OodStatus.OUT_OF_DOMAIN,
       oodDetector,
+      predictionInterval,
     });
 
     const encoded = toBinary(DecisionRecordSchema, expected);
@@ -56,6 +109,7 @@ describe("generated decision contract", () => {
     expect(decoded.evidence).toEqual(evidence);
     expect(decoded.oodStatus).toBe(OodStatus.OUT_OF_DOMAIN);
     expect(decoded.oodDetector).toEqual(oodDetector);
+    expect(decoded.predictionInterval).toEqual(predictionInterval);
   });
 
   it("exports the complete recommendation and service surface", () => {
@@ -94,7 +148,23 @@ describe("generated decision contract", () => {
 
       expect(decoded.oodStatus).toBe(expectedOodStatus);
       expect(decoded.oodDetector).toBeUndefined();
+      expect(decoded.predictionInterval).toBeUndefined();
       expect(toBinary(DecisionRecordSchema, decoded)).toEqual(wire);
     },
   );
+
+  it("preserves frozen OOD provenance wire without interval backfill", () => {
+    const decoded = fromBinary(DecisionRecordSchema, frozenOodProvenanceWire);
+
+    expect(decoded.oodStatus).toBe(OodStatus.BORDERLINE);
+    expect(decoded.oodDetector).toEqual({
+      $typeName: "bioworld.v2.OodDetectorRef",
+      detectorId: "mahalanobis",
+      detectorVersion: "model-2026.07",
+    });
+    expect(decoded.predictionInterval).toBeUndefined();
+    expect(toBinary(DecisionRecordSchema, decoded)).toEqual(
+      frozenOodProvenanceWire,
+    );
+  });
 });

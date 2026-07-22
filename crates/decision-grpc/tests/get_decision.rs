@@ -12,8 +12,8 @@ use std::{
 use bioworld_contracts::{
     MAX_DECISION_WIRE_BYTES, MAX_TENANT_ID_BYTES,
     v2::{
-        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
-        Recommendation,
+        DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+        OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_decision_grpc::{
@@ -79,6 +79,24 @@ fn executor(result: Result<DecisionRecord, GetDecisionRequestExecutionError>) ->
     )
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn record(aggregate_version: u64) -> DecisionRecord {
     DecisionRecord {
@@ -97,6 +115,7 @@ fn record(aggregate_version: u64) -> DecisionRecord {
             detector_id: "grpc-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -134,6 +153,10 @@ fn passes_the_exact_scope_and_typed_query_once() {
     assert_eq!(
         response.get_ref().ood_status,
         Some(OodStatus::Borderline as i32)
+    );
+    assert_eq!(
+        response.get_ref().prediction_interval,
+        Some(prediction_interval())
     );
     assert!(response.metadata().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 1);

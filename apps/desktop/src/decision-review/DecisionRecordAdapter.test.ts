@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  DecisionPredictionIntervalSchema,
   DecisionRecordSchema,
   EvidenceSnapshotRefSchema,
   OodDetectorRefSchema,
@@ -15,6 +16,26 @@ import {
 
 const validSha256 =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+function completePredictionInterval() {
+  const calibrationEvidence = create(EvidenceSnapshotRefSchema, {
+    id: "ES-CAL-001",
+    sha256: validSha256,
+  });
+
+  return create(DecisionPredictionIntervalSchema, {
+    target: "binding_affinity",
+    unit: "nM",
+    lowerDecimal: "0.25",
+    upperDecimal: "1.5",
+    nominalCoverageDecimal: "0.95",
+    intervalMethodId: "split_conformal",
+    intervalMethodVersion: "1.0",
+    calibrationMethodId: "held_out_calibration",
+    calibrationMethodVersion: "2026.07",
+    calibrationEvidence,
+  });
+}
 
 function completeRecord(recommendation = Recommendation.ABSTAIN) {
   const evidence = create(EvidenceSnapshotRefSchema, {
@@ -63,6 +84,7 @@ describe("toDecisionSummary", () => {
       recommendation: "stop_program",
       domainAssessment: "unknown",
       oodDetector: null,
+      predictionInterval: null,
       rationale: ["Evidence coverage is incomplete."],
       evidence: {
         id: "ES-001",
@@ -117,6 +139,101 @@ describe("toDecisionSummary", () => {
 
   it("maps absent historical OOD detector metadata to null", () => {
     expect(toDecisionSummary(completeRecord()).oodDetector).toBeNull();
+  });
+
+  it("maps an exact recorded prediction interval", () => {
+    const record = completeRecord();
+    record.predictionInterval = completePredictionInterval();
+
+    expect(toDecisionSummary(record).predictionInterval).toEqual({
+      target: "binding_affinity",
+      unit: "nM",
+      lowerDecimal: "0.25",
+      upperDecimal: "1.5",
+      nominalCoverageDecimal: "0.95",
+      intervalMethodId: "split_conformal",
+      intervalMethodVersion: "1.0",
+      calibrationMethodId: "held_out_calibration",
+      calibrationMethodVersion: "2026.07",
+      calibrationEvidence: {
+        id: "ES-CAL-001",
+        sha256: validSha256,
+      },
+    });
+  });
+
+  it("maps absent historical prediction interval metadata to null", () => {
+    expect(toDecisionSummary(completeRecord()).predictionInterval).toBeNull();
+  });
+
+  it("rejects a prediction interval without calibration evidence", () => {
+    const record = completeRecord();
+    record.predictionInterval = completePredictionInterval();
+    record.predictionInterval.calibrationEvidence = undefined;
+
+    expectAdapterError(
+      record,
+      "missing_prediction_interval_calibration_evidence",
+    );
+  });
+
+  it("rejects invalid prediction interval calibration evidence", () => {
+    const record = completeRecord();
+    record.predictionInterval = completePredictionInterval();
+    record.predictionInterval.calibrationEvidence!.sha256 = "invalid";
+
+    expectAdapterError(
+      record,
+      "invalid_prediction_interval_calibration_evidence",
+    );
+  });
+
+  it.each([
+    [
+      "noncanonical lower bound",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.lowerDecimal = "01";
+      },
+    ],
+    [
+      "inverted bounds",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.lowerDecimal = "2";
+        interval.upperDecimal = "1";
+      },
+    ],
+    [
+      "inverted negative bounds",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.lowerDecimal = "-2";
+        interval.upperDecimal = "-100";
+      },
+    ],
+    [
+      "invalid coverage",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.nominalCoverageDecimal = "1";
+      },
+    ],
+    [
+      "blank method",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.intervalMethodId = " ";
+      },
+    ],
+    [
+      "oversized identifier",
+      (interval: ReturnType<typeof completePredictionInterval>) => {
+        interval.target = "x".repeat(201);
+      },
+    ],
+  ])("rejects a prediction interval with %s", (_case, invalidate) => {
+    const record = completeRecord();
+    const interval = completePredictionInterval();
+    invalidate(interval);
+    record.predictionInterval = interval;
+
+    expectAdapterError(record, "invalid_prediction_interval");
   });
 
   it.each([

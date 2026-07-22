@@ -1,8 +1,8 @@
 use bioworld_contracts::{
     DecisionContractError, MAX_TENANT_ID_BYTES,
     v2::{
-        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
-        Recommendation,
+        DecisionEvent, DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef,
+        OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_event_store_contracts::{
@@ -10,7 +10,7 @@ use bioworld_event_store_contracts::{
     EventProjectionError, MAX_CANONICAL_DECISION_PAYLOAD_BYTES,
     MAX_CANONICAL_DECISION_PAYLOAD_DEPTH, MAX_CANONICAL_DECISION_PAYLOAD_NODES,
     MAX_EVENT_SIGNATURE_DEPTH, MAX_EVENT_SIGNATURE_JSON_BYTES, MAX_EVENT_SIGNATURE_NODES,
-    MAX_STORED_EVENT_PAYLOAD_BYTES, MAX_STORED_EVENT_SIGNATURE_BYTES,
+    MAX_STORED_EVENT_PAYLOAD_BYTES, MAX_STORED_EVENT_SIGNATURE_BYTES, ScientificEventRow,
     parse_stored_decision_payload, parse_stored_event_signature, project_decision_event,
     reconstruct_decision_event,
 };
@@ -20,6 +20,29 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const LEGACY_PAYLOAD_WITHOUT_OOD_STATUS: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const LEGACY_PAYLOAD_WITH_OOD_STATUS_ONLY: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_status":"unknown","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const HISTORICAL_OUT_OF_DOMAIN_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_status":"out_of_domain","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const LEGACY_PAYLOAD_WITH_OOD_PROVENANCE: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+const CURRENT_CANONICAL_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"ood_detector":{"detector_id":"mahalanobis","detector_version":"model-2026.07"},"ood_status":"borderline","prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"stop_program"}"#;
+
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: VALID_SHA256.to_owned(),
+        }),
+    }
+}
 
 #[allow(deprecated)]
 fn complete_event() -> DecisionEvent {
@@ -45,6 +68,7 @@ fn complete_event() -> DecisionEvent {
                 detector_id: "mahalanobis".to_owned(),
                 detector_version: "model-2026.07".to_owned(),
             }),
+            prediction_interval: Some(prediction_interval()),
         }),
     }
 }
@@ -66,6 +90,29 @@ fn metadata() -> DecisionEventMetadata {
         }),
     )
     .unwrap()
+}
+
+fn row_with_literal_payload(payload: &str, payload_sha256: &str) -> ScientificEventRow {
+    ScientificEventRow {
+        event_id: Uuid::parse_str("01910d47-6f80-7a31-8c29-1d5c4f6b7012").unwrap(),
+        event_type: DECISION_EVENT_TYPE.to_owned(),
+        schema_version: DECISION_SCHEMA_VERSION.to_owned(),
+        aggregate_type: DECISION_AGGREGATE_TYPE.to_owned(),
+        aggregate_id: "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99".to_owned(),
+        aggregate_version: u64::MAX,
+        occurred_at: occurred_at(),
+        tenant_id: "tenant-001".to_owned(),
+        payload: serde_json::from_str(payload).unwrap(),
+        payload_sha256: payload_sha256.to_owned(),
+        signature: json!({
+            "algorithm": "Ed25519",
+            "key_id": "test-key",
+            "value": "test-signature"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    }
 }
 
 fn nested_signature(depth: usize) -> serde_json::Value {
@@ -297,8 +344,30 @@ fn projects_canonical_payload_and_round_trips_without_loss() {
         })
     );
     assert_eq!(
+        row.payload["prediction_interval"],
+        json!({
+            "target": "binding_affinity",
+            "unit": "nM",
+            "lower_decimal": "0.25",
+            "upper_decimal": "1.5",
+            "nominal_coverage_decimal": "0.95",
+            "interval_method_id": "split_conformal",
+            "interval_method_version": "1.0",
+            "calibration_method_id": "held_out_calibration",
+            "calibration_method_version": "2026.07",
+            "calibration_evidence": {
+                "id": "ES-CAL-001",
+                "sha256": VALID_SHA256
+            }
+        })
+    );
+    assert_eq!(
         row.payload_sha256,
-        "84953de14e4b3d44762b8768108633b0a39855c772274594f87bf3bb94461e68"
+        "9c3a2a6e704371ecda6d1ec56c59606c868c3dabea3ed82bc5ca48b6cf1375e3"
+    );
+    assert_eq!(
+        String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap(),
+        CURRENT_CANONICAL_PAYLOAD
     );
     assert_eq!(reconstruct_decision_event(&row).unwrap(), event);
 }
@@ -761,6 +830,21 @@ fn canonical_hash_is_independent_of_json_object_key_order() {
                 "detector_id":"mahalanobis",
                 "detector_version":"model-2026.07"
             },
+            "prediction_interval":{
+                "unit":"nM",
+                "upper_decimal":"1.5",
+                "target":"binding_affinity",
+                "nominal_coverage_decimal":"0.95",
+                "lower_decimal":"0.25",
+                "interval_method_version":"1.0",
+                "interval_method_id":"split_conformal",
+                "calibration_method_version":"2026.07",
+                "calibration_method_id":"held_out_calibration",
+                "calibration_evidence":{
+                    "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "id":"ES-CAL-001"
+                }
+            },
             "cou_id":"COU-001",
             "decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99",
             "aggregate_version":"18446744073709551615"
@@ -842,7 +926,7 @@ fn round_trips_every_supported_ood_status() {
         let canonical_payload =
             String::from_utf8(serde_jcs::to_vec(&row.payload).unwrap()).unwrap();
         let expected_payload = format!(
-            r#"{{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"ood_detector":{{"detector_id":"mahalanobis","detector_version":"model-2026.07"}},"ood_status":"{canonical_ood_status}","rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"{canonical_recommendation}"}}"#
+            r#"{{"aggregate_version":"18446744073709551615","cou_id":"COU-001","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3f4d99","evidence":{{"id":"ES-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"ood_detector":{{"detector_id":"mahalanobis","detector_version":"model-2026.07"}},"ood_status":"{canonical_ood_status}","prediction_interval":{{"calibration_evidence":{{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"}},"rationale":["Primary threshold was not met.","Confirmatory evidence was absent.","Primary threshold was not met."],"recommendation":"{canonical_recommendation}"}}"#
         );
 
         assert_eq!(canonical_payload, expected_payload);
@@ -855,15 +939,12 @@ fn historical_payload_without_ood_status_reconstructs_as_unknown_without_rehashi
     const HISTORICAL_PAYLOAD_SHA256: &str =
         "4b133dc1df588e8e5149d1011d53c43c2284ada02597a7d28978a7b1f9cb94f9";
 
-    let mut row = projected_row();
-    row.payload.as_object_mut().unwrap().remove("ood_status");
-    row.payload.as_object_mut().unwrap().remove("ood_detector");
-    let historical_bytes = serde_jcs::to_vec(&row.payload).unwrap();
+    let row =
+        row_with_literal_payload(LEGACY_PAYLOAD_WITHOUT_OOD_STATUS, HISTORICAL_PAYLOAD_SHA256);
     assert_eq!(
-        format!("{:x}", Sha256::digest(&historical_bytes)),
+        format!("{:x}", Sha256::digest(LEGACY_PAYLOAD_WITHOUT_OOD_STATUS)),
         HISTORICAL_PAYLOAD_SHA256
     );
-    row.payload_sha256 = HISTORICAL_PAYLOAD_SHA256.to_owned();
 
     let reconstructed = reconstruct_decision_event(&row).unwrap();
 
@@ -871,25 +952,22 @@ fn historical_payload_without_ood_status_reconstructs_as_unknown_without_rehashi
         reconstructed.decision.as_ref().unwrap().ood_status,
         Some(OodStatus::Unknown as i32)
     );
-    assert!(reconstructed.decision.unwrap().ood_detector.is_none());
+    let decision = reconstructed.decision.unwrap();
+    assert!(decision.ood_detector.is_none());
+    assert!(decision.prediction_interval.is_none());
     assert_eq!(row.payload_sha256, HISTORICAL_PAYLOAD_SHA256);
 }
 
 #[test]
-fn m31_payload_without_detector_reconstructs_without_mutation() {
-    const M31_PAYLOAD_SHA256: &str =
+fn historical_payload_without_detector_reconstructs_without_mutation() {
+    const LEGACY_PAYLOAD_SHA256: &str =
         "46bf4726814bddfc9d1005766bf2b68fd11932b41306ac85d8676ab23ac995e1";
 
-    let mut row = projected_row();
-    let payload = row.payload.as_object_mut().unwrap();
-    payload.remove("ood_detector");
-    payload.insert("ood_status".to_owned(), json!("unknown"));
-    let historical_bytes = serde_jcs::to_vec(&row.payload).unwrap();
+    let row = row_with_literal_payload(LEGACY_PAYLOAD_WITH_OOD_STATUS_ONLY, LEGACY_PAYLOAD_SHA256);
     assert_eq!(
-        format!("{:x}", Sha256::digest(&historical_bytes)),
-        M31_PAYLOAD_SHA256
+        format!("{:x}", Sha256::digest(LEGACY_PAYLOAD_WITH_OOD_STATUS_ONLY)),
+        LEGACY_PAYLOAD_SHA256
     );
-    row.payload_sha256 = M31_PAYLOAD_SHA256.to_owned();
     let original = row.clone();
 
     let reconstructed = reconstruct_decision_event(&row).unwrap();
@@ -897,6 +975,7 @@ fn m31_payload_without_detector_reconstructs_without_mutation() {
 
     assert_eq!(decision.ood_status, Some(OodStatus::Unknown as i32));
     assert!(decision.ood_detector.is_none());
+    assert!(decision.prediction_interval.is_none());
     assert_eq!(row, original);
 }
 
@@ -905,16 +984,17 @@ fn historical_out_of_domain_non_abstain_event_remains_readable_without_mutation(
     const HISTORICAL_PAYLOAD_SHA256: &str =
         "a07bc96f7a3abc5836df7141f935baa477a1d006de94eb1415d7b37170e3a85d";
 
-    let mut row = projected_row();
-    let payload = row.payload.as_object_mut().unwrap();
-    payload.remove("ood_detector");
-    payload.insert("ood_status".to_owned(), json!("out_of_domain"));
-    let historical_bytes = serde_jcs::to_vec(&row.payload).unwrap();
+    let row = row_with_literal_payload(
+        HISTORICAL_OUT_OF_DOMAIN_CANONICAL_PAYLOAD,
+        HISTORICAL_PAYLOAD_SHA256,
+    );
     assert_eq!(
-        format!("{:x}", Sha256::digest(&historical_bytes)),
+        format!(
+            "{:x}",
+            Sha256::digest(HISTORICAL_OUT_OF_DOMAIN_CANONICAL_PAYLOAD)
+        ),
         HISTORICAL_PAYLOAD_SHA256
     );
-    row.payload_sha256 = HISTORICAL_PAYLOAD_SHA256.to_owned();
     let original = row.clone();
 
     let reconstructed = reconstruct_decision_event(&row).unwrap();
@@ -923,6 +1003,34 @@ fn historical_out_of_domain_non_abstain_event_remains_readable_without_mutation(
     assert_eq!(decision.ood_status, Some(OodStatus::OutOfDomain as i32));
     assert_eq!(decision.recommendation, Recommendation::StopProgram as i32);
     assert!(decision.ood_detector.is_none());
+    assert!(decision.prediction_interval.is_none());
+    assert_eq!(row, original);
+}
+
+#[test]
+fn historical_payload_without_prediction_interval_reconstructs_without_mutation() {
+    const LEGACY_PAYLOAD_SHA256: &str =
+        "84953de14e4b3d44762b8768108633b0a39855c772274594f87bf3bb94461e68";
+
+    let row = row_with_literal_payload(LEGACY_PAYLOAD_WITH_OOD_PROVENANCE, LEGACY_PAYLOAD_SHA256);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(LEGACY_PAYLOAD_WITH_OOD_PROVENANCE)),
+        LEGACY_PAYLOAD_SHA256
+    );
+    let original = row.clone();
+
+    let reconstructed = reconstruct_decision_event(&row).unwrap();
+    let decision = reconstructed.decision.unwrap();
+
+    assert_eq!(decision.ood_status, Some(OodStatus::Borderline as i32));
+    assert_eq!(
+        decision.ood_detector,
+        Some(OodDetectorRef {
+            detector_id: "mahalanobis".to_owned(),
+            detector_version: "model-2026.07".to_owned(),
+        })
+    );
+    assert!(decision.prediction_interval.is_none());
     assert_eq!(row, original);
 }
 
@@ -980,6 +1088,81 @@ fn rejects_missing_or_invalid_ood_detector_before_persistence() {
             assert!(!rendered.contains(detector_version));
         }
     }
+}
+
+#[test]
+fn rejects_missing_prediction_interval_before_persistence_with_a_fixed_error() {
+    let mut event = complete_event();
+    event.decision.as_mut().unwrap().prediction_interval = None;
+
+    let error = project_decision_event(event, metadata()).unwrap_err();
+
+    assert!(matches!(
+        &error,
+        EventProjectionError::MissingPredictionInterval
+    ));
+    assert_eq!(
+        error.to_string(),
+        "new decision events require a prediction interval"
+    );
+}
+
+#[test]
+fn rejects_incomplete_prediction_interval_before_persistence() {
+    let mut missing_evidence = complete_event();
+    missing_evidence
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_interval
+        .as_mut()
+        .unwrap()
+        .calibration_evidence = None;
+    assert!(matches!(
+        project_decision_event(missing_evidence, metadata()),
+        Err(EventProjectionError::InvalidDecision(
+            DecisionContractError::MissingPredictionIntervalCalibrationEvidence
+        ))
+    ));
+
+    let mut invalid_decimal = complete_event();
+    invalid_decimal
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_interval
+        .as_mut()
+        .unwrap()
+        .lower_decimal = "01".to_owned();
+    let error = project_decision_event(invalid_decimal, metadata()).unwrap_err();
+    assert!(matches!(
+        &error,
+        EventProjectionError::InvalidDecision(DecisionContractError::InvalidDomain(_))
+    ));
+    assert_eq!(
+        error.to_string(),
+        "decision contract is invalid: prediction interval lower bound is invalid"
+    );
+
+    let mut inverted_bounds = complete_event();
+    let interval = inverted_bounds
+        .decision
+        .as_mut()
+        .unwrap()
+        .prediction_interval
+        .as_mut()
+        .unwrap();
+    interval.lower_decimal = "2".to_owned();
+    interval.upper_decimal = "1".to_owned();
+    let error = project_decision_event(inverted_bounds, metadata()).unwrap_err();
+    assert!(matches!(
+        &error,
+        EventProjectionError::InvalidDecision(DecisionContractError::InvalidDomain(_))
+    ));
+    assert_eq!(
+        error.to_string(),
+        "decision contract is invalid: prediction interval lower bound exceeds upper bound"
+    );
 }
 
 #[test]

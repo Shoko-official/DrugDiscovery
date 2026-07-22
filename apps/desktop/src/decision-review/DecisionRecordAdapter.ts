@@ -6,6 +6,7 @@ import {
 import type {
   DecisionSummary,
   DomainAssessment,
+  PredictionIntervalMetadata,
   Recommendation,
 } from "./DecisionReview";
 
@@ -17,6 +18,9 @@ export type DecisionRecordAdapterErrorCode =
   | "missing_cou_id"
   | "missing_evidence"
   | "missing_evidence_id"
+  | "missing_prediction_interval_calibration_evidence"
+  | "invalid_prediction_interval"
+  | "invalid_prediction_interval_calibration_evidence"
   | "missing_rationale"
   | "unspecified_ood_status"
   | "unspecified_recommendation"
@@ -37,6 +41,13 @@ const lowercaseSha256 = /^[0-9a-f]{64}$/;
 const maxUint64 = 18_446_744_073_709_551_615n;
 const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const canonicalDecimal =
+  /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$/;
+const maxDecisionIdentifierChars = 200;
+const maxDecisionIdentifierBytes = 800;
+const maxPredictionIntervalIdentifierBytes = 200;
+const maxPredictionIntervalDecimalBytes = 64;
+const utf8Encoder = new TextEncoder();
 
 type ResolvedEvidence =
   | { kind: "nested"; id: string; sha256: string }
@@ -83,6 +94,143 @@ function validateEvidenceDigest(evidence: ResolvedEvidence): void {
       "Nested evidence digest must be a lowercase SHA-256",
     );
   }
+}
+
+function boundedOpaqueValueIsValid(value: string): boolean {
+  return (
+    value.length > 0 &&
+    utf8Encoder.encode(value).byteLength <=
+      maxPredictionIntervalIdentifierBytes &&
+    value.trim() === value &&
+    !value.includes("\0")
+  );
+}
+
+function decisionIdentifierIsValid(value: string): boolean {
+  return (
+    value.length > 0 &&
+    [...value].length <= maxDecisionIdentifierChars &&
+    utf8Encoder.encode(value).byteLength <= maxDecisionIdentifierBytes &&
+    value.trim() === value &&
+    !value.includes("\0")
+  );
+}
+
+function canonicalDecimalIsValid(value: string): boolean {
+  return (
+    value.length <= maxPredictionIntervalDecimalBytes &&
+    value !== "-0" &&
+    canonicalDecimal.test(value)
+  );
+}
+
+function compareDecimalMagnitudes(left: string, right: string): number {
+  const [leftInteger, leftFraction = ""] = left.split(".");
+  const [rightInteger, rightFraction = ""] = right.split(".");
+  if (leftInteger.length !== rightInteger.length) {
+    return Math.sign(leftInteger.length - rightInteger.length);
+  }
+  if (leftInteger < rightInteger) {
+    return -1;
+  }
+  if (leftInteger > rightInteger) {
+    return 1;
+  }
+  const width = Math.max(leftFraction.length, rightFraction.length);
+  const paddedLeftFraction = leftFraction.padEnd(width, "0");
+  const paddedRightFraction = rightFraction.padEnd(width, "0");
+  if (paddedLeftFraction < paddedRightFraction) {
+    return -1;
+  }
+  if (paddedLeftFraction > paddedRightFraction) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareCanonicalDecimals(left: string, right: string): number {
+  const leftNegative = left.startsWith("-");
+  const rightNegative = right.startsWith("-");
+  if (leftNegative !== rightNegative) {
+    return leftNegative ? -1 : 1;
+  }
+
+  const order = compareDecimalMagnitudes(
+    leftNegative ? left.slice(1) : left,
+    rightNegative ? right.slice(1) : right,
+  );
+  return leftNegative ? -order : order;
+}
+
+function resolvePredictionInterval(
+  record: DecisionRecord,
+): PredictionIntervalMetadata | null {
+  const interval = record.predictionInterval;
+  if (!interval) {
+    return null;
+  }
+
+  const identifiers = [
+    interval.target,
+    interval.unit,
+    interval.intervalMethodId,
+    interval.intervalMethodVersion,
+    interval.calibrationMethodId,
+    interval.calibrationMethodVersion,
+  ];
+  if (identifiers.some((value) => !boundedOpaqueValueIsValid(value))) {
+    throw new DecisionRecordAdapterError(
+      "invalid_prediction_interval",
+      "Prediction interval metadata is invalid",
+    );
+  }
+
+  if (
+    !canonicalDecimalIsValid(interval.lowerDecimal) ||
+    !canonicalDecimalIsValid(interval.upperDecimal) ||
+    !canonicalDecimalIsValid(interval.nominalCoverageDecimal) ||
+    compareCanonicalDecimals(interval.lowerDecimal, interval.upperDecimal) > 0 ||
+    compareCanonicalDecimals(interval.nominalCoverageDecimal, "0") <= 0 ||
+    compareCanonicalDecimals(interval.nominalCoverageDecimal, "1") >= 0
+  ) {
+    throw new DecisionRecordAdapterError(
+      "invalid_prediction_interval",
+      "Prediction interval metadata is invalid",
+    );
+  }
+
+  const calibrationEvidence = interval.calibrationEvidence;
+  if (!calibrationEvidence) {
+    throw new DecisionRecordAdapterError(
+      "missing_prediction_interval_calibration_evidence",
+      "Prediction interval calibration evidence is required",
+    );
+  }
+  if (
+    !decisionIdentifierIsValid(calibrationEvidence.id) ||
+    !lowercaseSha256.test(calibrationEvidence.sha256)
+  ) {
+    throw new DecisionRecordAdapterError(
+      "invalid_prediction_interval_calibration_evidence",
+      "Prediction interval calibration evidence is invalid",
+    );
+  }
+
+  return {
+    target: interval.target,
+    unit: interval.unit,
+    lowerDecimal: interval.lowerDecimal,
+    upperDecimal: interval.upperDecimal,
+    nominalCoverageDecimal: interval.nominalCoverageDecimal,
+    intervalMethodId: interval.intervalMethodId,
+    intervalMethodVersion: interval.intervalMethodVersion,
+    calibrationMethodId: interval.calibrationMethodId,
+    calibrationMethodVersion: interval.calibrationMethodVersion,
+    calibrationEvidence: {
+      id: calibrationEvidence.id,
+      sha256: calibrationEvidence.sha256,
+    },
+  };
 }
 
 function toRecommendation(value: WireRecommendation): Recommendation {
@@ -169,6 +317,7 @@ export function toDecisionSummary(
         detectorVersion: record.oodDetector.detectorVersion,
       }
     : null;
+  const predictionInterval = resolvePredictionInterval(record);
   validateEvidenceDigest(evidence);
   const rationale = record.rationale.filter(
     (entry) => entry.trim().length > 0,
@@ -187,6 +336,7 @@ export function toDecisionSummary(
     recommendation,
     domainAssessment,
     oodDetector,
+    predictionInterval,
     rationale,
     evidence: {
       id: evidence.id,

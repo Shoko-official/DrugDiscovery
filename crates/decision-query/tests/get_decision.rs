@@ -11,8 +11,8 @@ use std::{
 use bioworld_contracts::{
     VersionedDecisionRecord,
     v2::{
-        DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
-        Recommendation,
+        DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+        OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_decision_query::{
@@ -127,6 +127,24 @@ struct BorrowingSource {
     calls: usize,
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 impl LatestDecisionSource for BorrowingSource {
     fn read_latest(&mut self, _query: GetDecisionQuery) -> LatestDecisionFuture<'_> {
         Box::pin(async move {
@@ -154,6 +172,7 @@ fn record(decision_id: String, aggregate_version: u64) -> DecisionRecord {
             detector_id: "query-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -181,6 +200,7 @@ fn executes_a_canonical_request_once_and_returns_a_canonical_record() {
     assert_eq!(actual, expected);
     assert_eq!(actual.aggregate_version, u64::MAX);
     assert_eq!(actual.ood_status, Some(OodStatus::OutOfDomain as i32));
+    assert_eq!(actual.prediction_interval, Some(prediction_interval()));
     assert_eq!(actual.evidence_snapshot_id, "ES-QUERY-001");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let observed_decision_id = observed_query

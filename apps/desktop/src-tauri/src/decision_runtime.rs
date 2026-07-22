@@ -43,5 +43,20 @@ pub(crate) fn bundled_decision_record() -> v2::DecisionRecord {
             detector_id: "mahalanobis".to_owned(),
             detector_version: "model-2026.07".to_owned(),
         }),
+        prediction_interval: Some(v2::DecisionPredictionInterval {
+            target: "binding_affinity".to_owned(),
+            unit: "nM".to_owned(),
+            lower_decimal: "0.25".to_owned(),
+            upper_decimal: "1.5".to_owned(),
+            nominal_coverage_decimal: "0.95".to_owned(),
+            interval_method_id: "split_conformal".to_owned(),
+            interval_method_version: "1.0".to_owned(),
+            calibration_method_id: "held_out_calibration".to_owned(),
+            calibration_method_version: "2026.07".to_owned(),
+            calibration_evidence: Some(v2::EvidenceSnapshotRef {
+                id: "ES-CAL-001".to_owned(),
+                sha256: VALID_SHA256.to_owned(),
+            }),
+        }),
     }
 }

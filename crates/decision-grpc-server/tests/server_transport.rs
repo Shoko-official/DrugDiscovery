@@ -12,8 +12,8 @@ use std::{
 
 use bioworld_contracts::MAX_DECISION_WIRE_BYTES;
 use bioworld_contracts::v2::{
-    DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest, OodDetectorRef, OodStatus,
-    Recommendation, decision_service_client::DecisionServiceClient,
+    DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef, GetDecisionRequest,
+    OodDetectorRef, OodStatus, Recommendation, decision_service_client::DecisionServiceClient,
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantFuture, DecisionGrpcService, DecisionGrpcServiceConfig,
@@ -244,6 +244,24 @@ fn blocking_service(
     )
 }
 
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
+}
+
 #[allow(deprecated)]
 fn record() -> DecisionRecord {
     DecisionRecord {
@@ -262,6 +280,7 @@ fn record() -> DecisionRecord {
             detector_id: "transport-domain-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(prediction_interval()),
     }
 }
 
@@ -367,6 +386,7 @@ async fn serves_get_decision_over_trusted_tls() {
         .unwrap()
         .unwrap();
 
+    assert_eq!(response.prediction_interval, Some(prediction_interval()));
     assert_eq!(response, record());
     assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
     assert_eq!(

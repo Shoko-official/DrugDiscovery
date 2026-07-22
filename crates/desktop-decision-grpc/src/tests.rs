@@ -252,6 +252,22 @@ fn decision_record() -> v2::DecisionRecord {
             detector_id: "desktop-service-detector".to_owned(),
             detector_version: "2026.07".to_owned(),
         }),
+        prediction_interval: Some(v2::DecisionPredictionInterval {
+            target: "binding_affinity".to_owned(),
+            unit: "nM".to_owned(),
+            lower_decimal: "0.25".to_owned(),
+            upper_decimal: "1.5".to_owned(),
+            nominal_coverage_decimal: "0.95".to_owned(),
+            interval_method_id: "split_conformal".to_owned(),
+            interval_method_version: "1.0".to_owned(),
+            calibration_method_id: "held_out_calibration".to_owned(),
+            calibration_method_version: "2026.07".to_owned(),
+            calibration_evidence: Some(v2::EvidenceSnapshotRef {
+                id: "ES-CAL-001".to_owned(),
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
+            }),
+        }),
     }
 }
 
@@ -403,7 +419,7 @@ fn dropping_the_source_future_cancels_reader_work() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reads_authenticated_decision_through_real_client_source_over_tls() {
+async fn reads_authenticated_decision_with_interval_through_real_client_source_over_tls() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let auth_calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::new(Mutex::new(Vec::new()));
@@ -431,8 +447,10 @@ async fn reads_authenticated_decision_through_real_client_source_over_tls() {
         .unwrap()
         .unwrap();
     let (record, provenance) = sourced.into_parts();
+    let expected = decision_record();
 
-    assert_eq!(record, decision_record());
+    assert_eq!(record.prediction_interval, expected.prediction_interval);
+    assert_eq!(record, expected);
     assert_eq!(provenance, DecisionProvenance::DecisionService);
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
     assert_eq!(auth_calls.load(Ordering::SeqCst), 1);

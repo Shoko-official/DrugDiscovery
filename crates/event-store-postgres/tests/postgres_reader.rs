@@ -3,8 +3,8 @@ use std::future::Future;
 use bioworld_contracts::{
     VersionedDecisionRecord,
     v2::{
-        DecisionEvent, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
-        Recommendation,
+        DecisionEvent, DecisionPredictionInterval, DecisionRecord, EvidenceSnapshotRef,
+        OodDetectorRef, OodStatus, Recommendation,
     },
 };
 use bioworld_decision_query::{
@@ -46,6 +46,24 @@ fn occurred_at_value(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .expect("fixed timestamp must parse")
         .with_timezone(&Utc)
+}
+
+fn prediction_interval() -> DecisionPredictionInterval {
+    DecisionPredictionInterval {
+        target: "binding_affinity".to_owned(),
+        unit: "nM".to_owned(),
+        lower_decimal: "0.25".to_owned(),
+        upper_decimal: "1.5".to_owned(),
+        nominal_coverage_decimal: "0.95".to_owned(),
+        interval_method_id: "split_conformal".to_owned(),
+        interval_method_version: "1.0".to_owned(),
+        calibration_method_id: "held_out_calibration".to_owned(),
+        calibration_method_version: "2026.07".to_owned(),
+        calibration_evidence: Some(EvidenceSnapshotRef {
+            id: "ES-CAL-001".to_owned(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
+    }
 }
 
 #[allow(deprecated)]
@@ -97,6 +115,7 @@ fn decision_event_at_version_with_ood_status(
                 detector_id: "mahalanobis".to_owned(),
                 detector_version: "model-2026.07".to_owned(),
             }),
+            prediction_interval: Some(prediction_interval()),
         }),
     }
 }
@@ -108,7 +127,7 @@ async fn preserves_every_qualified_ood_status_through_postgresql_write_and_read(
     };
     let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
     let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
-    let tenant_id = "tenant-m31-ood-status";
+    let tenant_id = "tenant-qualified-ood-status";
 
     for (index, (ood_status, canonical_ood_status)) in [
         (OodStatus::InDomain, "in_domain"),
@@ -153,14 +172,14 @@ async fn preserves_every_qualified_ood_status_through_postgresql_write_and_read(
 }
 
 #[tokio::test]
-async fn reads_an_exact_m31_event_without_detector() {
+async fn reads_an_exact_historical_event_without_detector() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
     let (mut writer, writer_task) = connect(POSTGRES_WRITER_USER, passwords.writer).await;
     let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
-    let tenant_id = "tenant-m32-m31-read";
-    let row = historical_m31_row(tenant_id);
+    let tenant_id = "tenant-historical-ood-read";
+    let row = historical_ood_status_row(tenant_id);
     let event_id = row.event_id;
 
     insert_scientific_event_row(&mut writer, row).await;
@@ -169,12 +188,15 @@ async fn reads_an_exact_m31_event_without_detector() {
     let stored = PostgresDecisionEventReader::new(&mut reader)
         .get(tenant_id, event_id)
         .await
-        .expect("reader must accept the M31 event")
-        .expect("M31 event must exist");
-    let decision = stored.decision.expect("M31 event must contain a decision");
+        .expect("reader must accept the historical event")
+        .expect("historical event must exist");
+    let decision = stored
+        .decision
+        .expect("historical event must contain a decision");
 
     assert_eq!(decision.ood_status, Some(OodStatus::Unknown as i32));
     assert!(decision.ood_detector.is_none());
+    assert!(decision.prediction_interval.is_none());
     assert_eq!(decision.recommendation, Recommendation::StopProgram as i32);
     assert!(tenant_context_is_absent(&reader).await);
     writer_task.abort();
@@ -453,6 +475,13 @@ async fn returns_the_only_version_one_event_for_a_decision_stream() {
         .expect("reader must load the only stream event");
 
     assert_eq!(actual, Some(expected));
+    assert_eq!(
+        actual
+            .as_ref()
+            .and_then(|event| event.decision.as_ref())
+            .and_then(|decision| decision.prediction_interval.clone()),
+        Some(prediction_interval())
+    );
     assert!(tenant_context_is_absent(&reader).await);
     writer_task.abort();
     reader_task.abort();
@@ -618,7 +647,7 @@ fn metadata_at(tenant_id: &str, event_occurred_at: DateTime<Utc>) -> DecisionEve
     .expect("fixed metadata must be valid")
 }
 
-fn historical_m31_row(tenant_id: &str) -> ScientificEventRow {
+fn historical_ood_status_row(tenant_id: &str) -> ScientificEventRow {
     ScientificEventRow {
         event_id: Uuid::parse_str("01910d47-6f80-7a31-8c29-1d5c4f6b7012")
             .expect("fixed event identifier must parse"),
@@ -649,7 +678,7 @@ fn historical_m31_row(tenant_id: &str) -> ScientificEventRow {
             .to_owned(),
         signature: json!({
             "algorithm": "Ed25519",
-            "key_id": "m31-test",
+            "key_id": "historical-ood-test",
             "value": "test-signature"
         })
         .as_object()

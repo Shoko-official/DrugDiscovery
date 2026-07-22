@@ -186,6 +186,39 @@ mod tests {
     }
 
     #[test]
+    fn bundled_runtime_preserves_prediction_interval_and_provenance() {
+        let runtime = bundled_runtime();
+        let payload = tauri::async_runtime::block_on(read_current_decision_from(&runtime))
+            .unwrap()
+            .unwrap();
+        let decoded = v2::DecisionRecord::decode(payload.protobuf.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded.prediction_interval,
+            Some(v2::DecisionPredictionInterval {
+                target: "binding_affinity".to_owned(),
+                unit: "nM".to_owned(),
+                lower_decimal: "0.25".to_owned(),
+                upper_decimal: "1.5".to_owned(),
+                nominal_coverage_decimal: "0.95".to_owned(),
+                interval_method_id: "split_conformal".to_owned(),
+                interval_method_version: "1.0".to_owned(),
+                calibration_method_id: "held_out_calibration".to_owned(),
+                calibration_method_version: "2026.07".to_owned(),
+                calibration_evidence: Some(v2::EvidenceSnapshotRef {
+                    id: "ES-CAL-001".to_owned(),
+                    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                }),
+            }),
+        );
+        assert_eq!(
+            serde_json::to_value(payload.source).unwrap(),
+            "bundled_sample"
+        );
+    }
+
+    #[test]
     fn maximum_uint64_version_remains_exact_in_protobuf_payload() {
         let mut record = bundled_decision_record();
         record.aggregate_version = u64::MAX;

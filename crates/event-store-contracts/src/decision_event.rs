@@ -80,6 +80,8 @@ pub enum EventProjectionError {
     UnqualifiedOodStatus,
     #[error("new decision events require an OOD detector reference")]
     MissingOodDetector,
+    #[error("new decision events require a prediction interval")]
+    MissingPredictionInterval,
     #[error("out-of-domain decisions must abstain")]
     OutOfDomainRequiresAbstain,
     #[error("event_id must be a canonical UUID")]
@@ -130,6 +132,8 @@ struct CanonicalDecisionPayload {
     ood_status: CanonicalOodStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ood_detector: Option<CanonicalOodDetector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prediction_interval: Option<CanonicalPredictionInterval>,
     evidence: CanonicalEvidence,
     rationale: Vec<String>,
     aggregate_version: String,
@@ -147,6 +151,21 @@ struct CanonicalEvidence {
 struct CanonicalOodDetector {
     detector_id: String,
     detector_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalPredictionInterval {
+    target: String,
+    unit: String,
+    lower_decimal: String,
+    upper_decimal: String,
+    nominal_coverage_decimal: String,
+    interval_method_id: String,
+    interval_method_version: String,
+    calibration_method_id: String,
+    calibration_method_version: String,
+    calibration_evidence: CanonicalEvidence,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -181,6 +200,9 @@ pub fn project_decision_event(
         return Err(DecisionContractError::InvalidDecisionId.into());
     }
     validate_new_ood_metadata(&decision)?;
+    if decision.prediction_interval.is_none() {
+        return Err(EventProjectionError::MissingPredictionInterval);
+    }
     let boundary = VersionedDecisionRecord::try_from(decision)?;
     let decision = v2::DecisionRecord::from(&boundary);
     if decision.ood_status == Some(v2::OodStatus::OutOfDomain as i32)
@@ -286,6 +308,33 @@ impl CanonicalDecisionPayload {
                     detector_id: detector.detector_id.clone(),
                     detector_version: detector.detector_version.clone(),
                 }),
+            prediction_interval: value
+                .prediction_interval
+                .as_ref()
+                .map(
+                    |interval| -> Result<CanonicalPredictionInterval, EventProjectionError> {
+                        let calibration_evidence = interval.calibration_evidence.as_ref().ok_or(
+                            DecisionContractError::MissingPredictionIntervalCalibrationEvidence,
+                        )?;
+
+                        Ok(CanonicalPredictionInterval {
+                            target: interval.target.clone(),
+                            unit: interval.unit.clone(),
+                            lower_decimal: interval.lower_decimal.clone(),
+                            upper_decimal: interval.upper_decimal.clone(),
+                            nominal_coverage_decimal: interval.nominal_coverage_decimal.clone(),
+                            interval_method_id: interval.interval_method_id.clone(),
+                            interval_method_version: interval.interval_method_version.clone(),
+                            calibration_method_id: interval.calibration_method_id.clone(),
+                            calibration_method_version: interval.calibration_method_version.clone(),
+                            calibration_evidence: CanonicalEvidence {
+                                id: calibration_evidence.id.clone(),
+                                sha256: calibration_evidence.sha256.clone(),
+                            },
+                        })
+                    },
+                )
+                .transpose()?,
             evidence: CanonicalEvidence {
                 id: evidence.id.clone(),
                 sha256: evidence.sha256.clone(),
@@ -314,6 +363,23 @@ impl CanonicalDecisionPayload {
             ood_detector: self.ood_detector.map(|detector| v2::OodDetectorRef {
                 detector_id: detector.detector_id,
                 detector_version: detector.detector_version,
+            }),
+            prediction_interval: self.prediction_interval.map(|interval| {
+                v2::DecisionPredictionInterval {
+                    target: interval.target,
+                    unit: interval.unit,
+                    lower_decimal: interval.lower_decimal,
+                    upper_decimal: interval.upper_decimal,
+                    nominal_coverage_decimal: interval.nominal_coverage_decimal,
+                    interval_method_id: interval.interval_method_id,
+                    interval_method_version: interval.interval_method_version,
+                    calibration_method_id: interval.calibration_method_id,
+                    calibration_method_version: interval.calibration_method_version,
+                    calibration_evidence: Some(EvidenceSnapshotRef {
+                        id: interval.calibration_evidence.id,
+                        sha256: interval.calibration_evidence.sha256,
+                    }),
+                }
             }),
         }
     }
