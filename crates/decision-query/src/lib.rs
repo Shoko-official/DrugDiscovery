@@ -6,6 +6,43 @@ use bioworld_contracts::{VersionedDecisionRecord, v2};
 use thiserror::Error;
 use uuid::Uuid;
 
+fn parse_canonical_decision_id(value: &str) -> Option<Uuid> {
+    let decision_id = Uuid::parse_str(value).ok()?;
+    (decision_id.to_string() == value).then_some(decision_id)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WatchDecisionQuery {
+    decision_id: Uuid,
+}
+
+impl WatchDecisionQuery {
+    pub fn new(decision_id: Uuid) -> Self {
+        Self { decision_id }
+    }
+
+    pub fn decision_id(self) -> Uuid {
+        self.decision_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum WatchDecisionRequestError {
+    #[error("watch decision request identifier is invalid")]
+    InvalidDecisionId,
+}
+
+impl TryFrom<v2::WatchDecisionRequest> for WatchDecisionQuery {
+    type Error = WatchDecisionRequestError;
+
+    fn try_from(request: v2::WatchDecisionRequest) -> Result<Self, Self::Error> {
+        let decision_id = parse_canonical_decision_id(&request.decision_id)
+            .ok_or(WatchDecisionRequestError::InvalidDecisionId)?;
+
+        Ok(Self::new(decision_id))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GetDecisionQuery {
     decision_id: Uuid,
@@ -31,11 +68,8 @@ impl TryFrom<v2::GetDecisionRequest> for GetDecisionQuery {
     type Error = GetDecisionRequestError;
 
     fn try_from(request: v2::GetDecisionRequest) -> Result<Self, Self::Error> {
-        let decision_id = Uuid::parse_str(&request.decision_id)
-            .map_err(|_| GetDecisionRequestError::InvalidDecisionId)?;
-        if decision_id.to_string() != request.decision_id {
-            return Err(GetDecisionRequestError::InvalidDecisionId);
-        }
+        let decision_id = parse_canonical_decision_id(&request.decision_id)
+            .ok_or(GetDecisionRequestError::InvalidDecisionId)?;
 
         Ok(Self::new(decision_id))
     }
