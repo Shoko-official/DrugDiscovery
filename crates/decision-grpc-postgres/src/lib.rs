@@ -4,8 +4,12 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use bioworld_decision_grpc::{
     TenantScope, TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
+    TenantScopedWatchDecisionExecutor,
 };
-use bioworld_decision_query::{GetDecision, GetDecisionQuery, GetDecisionRequestExecutionError};
+use bioworld_decision_query::{
+    DecisionReplay, DecisionReplayPageSize, GetDecision, GetDecisionQuery,
+    GetDecisionRequestExecutionError, WatchDecisionQuery,
+};
 use bioworld_event_store_postgres::{PostgresDecisionEventReader, PostgresLatestDecisionSource};
 use tokio_postgres::Client;
 
@@ -78,17 +82,19 @@ pub trait PostgresReaderLeaseProvider: Send + Sync {
     fn acquire(&self) -> AcquirePostgresReaderFuture<'_, Self::Lease<'_>>;
 }
 
-pub struct PostgresGetDecisionExecutor<P> {
+pub struct PostgresDecisionExecutor<P> {
     provider: P,
 }
 
-impl<P> PostgresGetDecisionExecutor<P> {
+pub type PostgresGetDecisionExecutor<P> = PostgresDecisionExecutor<P>;
+
+impl<P> PostgresDecisionExecutor<P> {
     pub fn new(provider: P) -> Self {
         Self { provider }
     }
 }
 
-impl<P> TenantScopedGetDecisionExecutor for PostgresGetDecisionExecutor<P>
+impl<P> TenantScopedGetDecisionExecutor for PostgresDecisionExecutor<P>
 where
     P: PostgresReaderLeaseProvider,
 {
@@ -126,6 +132,26 @@ where
                 result
             }
         })
+    }
+}
+
+impl<P> TenantScopedWatchDecisionExecutor for PostgresDecisionExecutor<P>
+where
+    P: PostgresReaderLeaseProvider + Clone + 'static,
+{
+    type Source = PostgresDecisionReplaySource<P>;
+
+    fn execute_watch_decision(
+        &self,
+        scope: TenantScope,
+        query: WatchDecisionQuery,
+        page_size: DecisionReplayPageSize,
+    ) -> DecisionReplay<Self::Source> {
+        DecisionReplay::new(
+            PostgresDecisionReplaySource::new(self.provider.clone(), scope),
+            query,
+            page_size,
+        )
     }
 }
 
