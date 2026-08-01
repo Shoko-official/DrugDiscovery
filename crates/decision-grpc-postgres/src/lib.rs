@@ -10,11 +10,13 @@ use bioworld_event_store_postgres::{PostgresDecisionEventReader, PostgresLatestD
 use tokio_postgres::Client;
 
 mod pool;
+mod replay;
 
 pub use pool::{
     InvalidPostgresReaderPoolConfig, PooledPostgresReaderLease, PostgresReaderPool,
     PostgresReaderPoolConfig,
 };
+pub use replay::PostgresDecisionReplaySource;
 
 const ROLLBACK_READER_SESSION: &str = "ROLLBACK";
 const TENANT_CONTEXT_IS_ABSENT: &str =

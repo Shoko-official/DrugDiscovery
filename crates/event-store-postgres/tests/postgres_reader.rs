@@ -890,7 +890,7 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
 }
 
 #[tokio::test]
-async fn caps_pages_at_sixteen_events_and_excludes_other_decision_streams() {
+async fn caps_pages_at_sixteen_events_transfers_the_buffer_and_excludes_other_streams() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -930,9 +930,12 @@ async fn caps_pages_at_sixteen_events_and_excludes_other_decision_streams() {
         .get_stream_page(tenant_id, target_decision_id, page_size, None)
         .await
         .expect("maximum first page must load");
-    assert_eq!(first.events(), &expected[..16]);
-    let continuation = first
-        .continuation()
+    let original_buffer = first.events().as_ptr();
+    let (first_events, continuation) = first.into_parts();
+    assert_eq!(first_events, expected[..16]);
+    assert_eq!(first_events.as_ptr(), original_buffer);
+    let continuation = continuation
+        .as_ref()
         .expect("seventeenth event must require continuation");
 
     let second = PostgresDecisionEventReader::new(&mut reader)

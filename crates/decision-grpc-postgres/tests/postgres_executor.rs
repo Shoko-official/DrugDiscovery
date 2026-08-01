@@ -9,6 +9,7 @@ use std::{
 };
 
 use aws_lc_rs::{
+    digest::{SHA256, digest},
     rand::SystemRandom,
     rsa::{KeyPair, KeySize, PublicKeyComponents},
     signature::{KeyPair as _, RSA_PKCS1_SHA256},
@@ -16,7 +17,7 @@ use aws_lc_rs::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
     DecisionPredictionInterval, DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef,
-    GetDecisionRequest, OodStatus, Recommendation,
+    GetDecisionRequest, OodStatus, Recommendation, WatchDecisionRequest,
     decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
@@ -29,9 +30,13 @@ use bioworld_decision_grpc_jwt::{
 };
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
-    PooledPostgresReaderLease, PostgresGetDecisionExecutor, PostgresReaderLease,
-    PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider, PostgresReaderPool,
-    PostgresReaderPoolConfig,
+    PooledPostgresReaderLease, PostgresDecisionReplaySource, PostgresGetDecisionExecutor,
+    PostgresReaderLease, PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider,
+    PostgresReaderPool, PostgresReaderPoolConfig,
+};
+use bioworld_decision_query::{
+    DecisionReplay, DecisionReplayError, DecisionReplayPageSize, DecisionReplaySource,
+    DecisionReplaySourceError, WatchDecisionQuery,
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
@@ -67,6 +72,15 @@ const SERVICE_TENANT_B: &str = "tenant-grpc-service-b";
 const JWT_SERVICE_TENANT_A: &str = "tenant-jwt-service-a";
 const JWT_SERVICE_TENANT_B: &str = "tenant-jwt-service-b";
 const SERVICE_TIMEOUT_TENANT: &str = "tenant-grpc-service-timeout";
+const REPLAY_TENANT_A: &str = "tenant-grpc-replay-a";
+const REPLAY_TENANT_B: &str = "tenant-grpc-replay-b";
+const REPLAY_HORIZON_TENANT: &str = "tenant-grpc-replay-horizon";
+const REPLAY_ROTATION_TENANT: &str = "tenant-grpc-replay-rotation";
+const REPLAY_CORRUPT_TENANT: &str = "tenant-grpc-replay-corrupt";
+const REPLAY_CLEANUP_TENANT: &str = "tenant-grpc-replay-cleanup";
+const REPLAY_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fa701";
+const REPLAY_HIDDEN_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fa702";
+const REPLAY_MISSING_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fa703";
 const JWT_ISSUER: &str = "https://identity.bioworld.test";
 const JWT_AUDIENCE: &str = "https://decision.bioworld.test";
 const JWT_REQUIRED_SCOPE: &str = "decision:read";
@@ -481,6 +495,27 @@ fn production_reader_pool(
 }
 
 async fn seed_event(writer: &mut Client, fixture: &EventFixture) {
+    seed_raw_event(
+        writer,
+        fixture.event_id,
+        fixture.tenant_id,
+        &fixture.record.decision_id,
+        fixture.record.aggregate_version,
+        fixture.payload,
+        fixture.payload_sha256,
+    )
+    .await;
+}
+
+async fn seed_raw_event(
+    writer: &mut Client,
+    event_id: &str,
+    tenant_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+    payload: &str,
+    payload_sha256: &str,
+) {
     let transaction = writer
         .transaction()
         .await
@@ -488,28 +523,28 @@ async fn seed_event(writer: &mut Client, fixture: &EventFixture) {
     let context_is_exact: bool = transaction
         .query_one(
             "SELECT pg_catalog.set_config('bioworld.tenant_id', $1, true) = $1",
-            &[&fixture.tenant_id],
+            &[&tenant_id],
         )
         .await
         .expect("fixture tenant context must be set")
         .get(0);
     assert!(context_is_exact);
 
-    let aggregate_version = fixture.record.aggregate_version.to_string();
+    let aggregate_version = aggregate_version.to_string();
     transaction
         .execute(
             INSERT_EVENT,
             &[
-                &fixture.event_id,
+                &event_id,
                 &DECISION_EVENT_TYPE,
                 &DECISION_SCHEMA_VERSION,
                 &DECISION_AGGREGATE_TYPE,
-                &fixture.record.decision_id.as_str(),
+                &decision_id,
                 &aggregate_version.as_str(),
                 &OCCURRED_AT,
-                &fixture.tenant_id,
-                &fixture.payload,
-                &fixture.payload_sha256,
+                &tenant_id,
+                &payload,
+                &payload_sha256,
                 &SIGNATURE,
             ],
         )
@@ -519,6 +554,45 @@ async fn seed_event(writer: &mut Client, fixture: &EventFixture) {
         .commit()
         .await
         .expect("fixture transaction must commit");
+}
+
+fn replay_payload(decision_id: &str, aggregate_version: u64, cou_id: &str) -> (String, String) {
+    let payload = TENANT_A_PAYLOAD
+        .replace(SHARED_DECISION_ID, decision_id)
+        .replace(
+            r#""aggregate_version":"18446744073709551615""#,
+            &format!(r#""aggregate_version":"{aggregate_version}""#),
+        )
+        .replace("COU-GRPC-PG-A", cou_id)
+        .replace("Tenant A decision.", cou_id);
+    let payload_sha256 = digest(&SHA256, payload.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    (payload, payload_sha256)
+}
+
+async fn seed_replay_event(
+    writer: &mut Client,
+    event_id: &str,
+    tenant_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+    cou_id: &str,
+) {
+    let (payload, payload_sha256) = replay_payload(decision_id, aggregate_version, cou_id);
+    seed_raw_event(
+        writer,
+        event_id,
+        tenant_id,
+        decision_id,
+        aggregate_version,
+        &payload,
+        &payload_sha256,
+    )
+    .await;
 }
 
 async fn tenant_context_is_absent(client: &Client) -> bool {
@@ -738,6 +812,39 @@ fn request(decision_id: &str) -> Request<GetDecisionRequest> {
     Request::new(GetDecisionRequest {
         decision_id: decision_id.to_owned(),
     })
+}
+
+fn watch_request(decision_id: &str) -> WatchDecisionRequest {
+    WatchDecisionRequest {
+        decision_id: decision_id.to_owned(),
+    }
+}
+
+fn watch_query(decision_id: &str) -> WatchDecisionQuery {
+    WatchDecisionQuery::try_from(watch_request(decision_id))
+        .expect("fixed replay query must be valid")
+}
+
+fn replay_page_size(value: usize) -> DecisionReplayPageSize {
+    DecisionReplayPageSize::try_from(value).expect("fixed replay page size must be valid")
+}
+
+async fn next_replay_cou_id<S>(replay: &mut DecisionReplay<S>) -> String
+where
+    S: DecisionReplaySource,
+{
+    let page = replay
+        .next_page()
+        .await
+        .expect("replay page must succeed")
+        .expect("replay page must exist");
+    assert_eq!(page.events().len(), 1);
+    page.events()[0]
+        .decision
+        .as_ref()
+        .expect("replay event must contain a decision")
+        .cou_id
+        .clone()
 }
 
 fn authenticated_request(
@@ -1712,4 +1819,603 @@ async fn finish_failure_discards_the_session_and_overrides_the_application_resul
     );
     assert_eq!(pool.active(), 0);
     assert_eq!(pool.available(), 0);
+}
+
+#[tokio::test]
+async fn replay_uses_one_clean_lease_per_page_and_freezes_its_horizon() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba711",
+        REPLAY_HORIZON_TENANT,
+        REPLAY_DECISION_ID,
+        1,
+        "COU-REPLAY-H1",
+    )
+    .await;
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba712",
+        REPLAY_HORIZON_TENANT,
+        REPLAY_DECISION_ID,
+        2,
+        "COU-REPLAY-H2",
+    )
+    .await;
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_HORIZON_TENANT));
+    let mut replay = DecisionReplay::try_from_request(
+        source,
+        watch_request(REPLAY_DECISION_ID),
+        replay_page_size(1),
+    )
+    .expect("fixed replay request must be valid");
+
+    let first = replay
+        .next_page()
+        .await
+        .expect("first replay page must succeed")
+        .expect("first replay page must exist");
+    assert_eq!(first.events().len(), 1);
+    assert_eq!(
+        first.events()[0].event_id,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba711"
+    );
+    assert_eq!(
+        first.events()[0]
+            .decision
+            .as_ref()
+            .expect("replay event must contain a decision")
+            .aggregate_version,
+        1
+    );
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(pool.available(), 1);
+    pool.assert_available_sessions_are_clean(1).await;
+
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba713",
+        REPLAY_HORIZON_TENANT,
+        REPLAY_DECISION_ID,
+        3,
+        "COU-REPLAY-H3",
+    )
+    .await;
+
+    let second = replay
+        .next_page()
+        .await
+        .expect("second replay page must succeed")
+        .expect("second replay page must exist");
+    assert_eq!(second.events().len(), 1);
+    assert_eq!(
+        second.events()[0]
+            .decision
+            .as_ref()
+            .expect("replay event must contain a decision")
+            .aggregate_version,
+        2
+    );
+    assert!(
+        replay
+            .next_page()
+            .await
+            .expect("completed replay must remain successful")
+            .is_none()
+    );
+    assert_eq!(pool.acquisitions(), 2);
+
+    let fresh_source =
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_HORIZON_TENANT));
+    let mut fresh = DecisionReplay::try_from_request(
+        fresh_source,
+        watch_request(REPLAY_DECISION_ID),
+        replay_page_size(16),
+    )
+    .expect("fixed replay request must be valid");
+    let fresh_page = fresh
+        .next_page()
+        .await
+        .expect("fresh replay page must succeed")
+        .expect("fresh replay page must exist");
+    let fresh_versions = fresh_page
+        .events()
+        .iter()
+        .map(|event| {
+            event
+                .decision
+                .as_ref()
+                .expect("replay event must contain a decision")
+                .aggregate_version
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fresh_versions, vec![1, 2, 3]);
+    assert!(
+        fresh
+            .next_page()
+            .await
+            .expect("completed replay must remain successful")
+            .is_none()
+    );
+    assert_eq!(pool.acquisitions(), 3);
+    assert_eq!(pool.maximum_active(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![
+            PostgresReaderLeaseDisposition::Reuse,
+            PostgresReaderLeaseDisposition::Reuse,
+            PostgresReaderLeaseDisposition::Reuse,
+        ]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    drop(fresh);
+    drop(replay);
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn replay_continuation_resumes_on_a_different_physical_session() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba751",
+        REPLAY_ROTATION_TENANT,
+        REPLAY_DECISION_ID,
+        1,
+        "COU-REPLAY-R1",
+    )
+    .await;
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba752",
+        REPLAY_ROTATION_TENANT,
+        REPLAY_DECISION_ID,
+        2,
+        "COU-REPLAY-R2",
+    )
+    .await;
+
+    let first_reader = connect(POSTGRES_READER_USER, passwords.reader.clone()).await;
+    let first_backend: i32 = first_reader
+        .client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("first replay backend identity must be queryable")
+        .get(0);
+    let second_reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let second_backend: i32 = second_reader
+        .client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("second replay backend identity must be queryable")
+        .get(0);
+    assert_ne!(first_backend, second_backend);
+
+    let pool = TestReaderPool::new(vec![first_reader, second_reader]);
+    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_ROTATION_TENANT));
+    let mut replay =
+        DecisionReplay::new(source, watch_query(REPLAY_DECISION_ID), replay_page_size(1));
+
+    assert_eq!(next_replay_cou_id(&mut replay).await, "COU-REPLAY-R1");
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(pool.available(), 2);
+    assert_eq!(next_replay_cou_id(&mut replay).await, "COU-REPLAY-R2");
+    assert_eq!(pool.acquisitions(), 2);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(pool.available(), 2);
+    assert!(
+        replay
+            .next_page()
+            .await
+            .expect("rotated replay completion must succeed")
+            .is_none()
+    );
+    assert_eq!(pool.acquisitions(), 2);
+    assert_eq!(pool.maximum_active(), 1);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![
+            PostgresReaderLeaseDisposition::Reuse,
+            PostgresReaderLeaseDisposition::Reuse,
+        ]
+    );
+    pool.assert_available_sessions_are_clean(2).await;
+
+    drop(replay);
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    for (tenant_id, event_suffix, cou_prefix) in [
+        (REPLAY_TENANT_A, "a", "COU-REPLAY-A"),
+        (REPLAY_TENANT_B, "b", "COU-REPLAY-B"),
+    ] {
+        seed_replay_event(
+            &mut writer.client,
+            &format!("01910d47-6f80-7a31-8c29-1d5c4f6ba72{event_suffix}"),
+            tenant_id,
+            REPLAY_DECISION_ID,
+            1,
+            &format!("{cou_prefix}-1"),
+        )
+        .await;
+        seed_replay_event(
+            &mut writer.client,
+            &format!("01910d47-6f80-7a31-8c29-1d5c4f6ba73{event_suffix}"),
+            tenant_id,
+            REPLAY_DECISION_ID,
+            2,
+            &format!("{cou_prefix}-2"),
+        )
+        .await;
+    }
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba74a",
+        REPLAY_TENANT_A,
+        REPLAY_HIDDEN_DECISION_ID,
+        1,
+        "COU-REPLAY-HIDDEN",
+    )
+    .await;
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let query = watch_query(REPLAY_DECISION_ID);
+    let mut tenant_a = DecisionReplay::new(
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A)),
+        query,
+        replay_page_size(1),
+    );
+    let mut tenant_b = DecisionReplay::new(
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        query,
+        replay_page_size(1),
+    );
+
+    assert_eq!(next_replay_cou_id(&mut tenant_a).await, "COU-REPLAY-A-1");
+    assert_eq!(pool.active(), 0);
+    assert_eq!(next_replay_cou_id(&mut tenant_b).await, "COU-REPLAY-B-1");
+    assert_eq!(pool.active(), 0);
+    assert_eq!(next_replay_cou_id(&mut tenant_a).await, "COU-REPLAY-A-2");
+    assert_eq!(pool.active(), 0);
+    assert_eq!(next_replay_cou_id(&mut tenant_b).await, "COU-REPLAY-B-2");
+    assert_eq!(pool.active(), 0);
+    assert!(
+        tenant_a
+            .next_page()
+            .await
+            .expect("tenant A replay completion must succeed")
+            .is_none()
+    );
+    assert!(
+        tenant_b
+            .next_page()
+            .await
+            .expect("tenant B replay completion must succeed")
+            .is_none()
+    );
+    assert_eq!(pool.acquisitions(), 4);
+
+    let mut tenant_a_source =
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A));
+    let tenant_a_page = tenant_a_source
+        .read_page(query, replay_page_size(1), None)
+        .await
+        .expect("tenant A replay page must succeed");
+    let (_, tenant_a_continuation) = tenant_a_page.into_parts();
+    let tenant_a_continuation =
+        tenant_a_continuation.expect("tenant A replay must expose a continuation");
+    assert_eq!(pool.active(), 0);
+    let mut tenant_b_source =
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B));
+    let cross_scope = tenant_b_source
+        .read_page(query, replay_page_size(1), Some(&tenant_a_continuation))
+        .await;
+    assert!(matches!(
+        cross_scope,
+        Err(DecisionReplaySourceError::StoredStateRejected)
+    ));
+    assert_eq!(pool.active(), 0);
+
+    let mut hidden = DecisionReplay::new(
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        watch_query(REPLAY_HIDDEN_DECISION_ID),
+        replay_page_size(1),
+    );
+    let hidden_result = hidden.next_page().await;
+    assert!(matches!(hidden_result, Ok(None)));
+    assert_eq!(pool.active(), 0);
+    let mut missing = DecisionReplay::new(
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        watch_query(REPLAY_MISSING_DECISION_ID),
+        replay_page_size(1),
+    );
+    let missing_result = missing.next_page().await;
+    assert!(matches!(missing_result, Ok(None)));
+    assert_eq!(pool.active(), 0);
+
+    assert_eq!(pool.acquisitions(), 8);
+    assert_eq!(pool.maximum_active(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse; 8]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn replay_rejects_a_corrupt_page_atomically_and_returns_a_clean_lease() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba741",
+        REPLAY_CORRUPT_TENANT,
+        REPLAY_DECISION_ID,
+        1,
+        "COU-REPLAY-VALID",
+    )
+    .await;
+    let corrupt_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba742";
+    let corrupt_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let (corrupt_payload, _) = replay_payload(REPLAY_DECISION_ID, 2, "COU-REPLAY-CORRUPT");
+    seed_raw_event(
+        &mut writer.client,
+        corrupt_event_id,
+        REPLAY_CORRUPT_TENANT,
+        REPLAY_DECISION_ID,
+        2,
+        &corrupt_payload,
+        corrupt_hash,
+    )
+    .await;
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_CORRUPT_TENANT));
+    let mut replay = DecisionReplay::try_from_request(
+        source,
+        watch_request(REPLAY_DECISION_ID),
+        replay_page_size(2),
+    )
+    .expect("fixed replay request must be valid");
+
+    let error = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("one corrupt event must reject the complete page"),
+    };
+    assert_eq!(error, DecisionReplayError::StoredStateRejected);
+    let rendered = format!("{error:?} {error}");
+    for sensitive in [
+        REPLAY_CORRUPT_TENANT,
+        REPLAY_DECISION_ID,
+        corrupt_event_id,
+        corrupt_hash,
+        "COU-REPLAY-CORRUPT",
+    ] {
+        assert!(!rendered.contains(sensitive));
+    }
+    let repeated = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("rejected replay must remain terminal"),
+    };
+    assert_eq!(repeated, DecisionReplayError::StoredStateRejected);
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    drop(replay);
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn replay_cleanup_and_finish_failures_override_page_results() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let residual_tenant = "residual-sensitive-replay-tenant";
+    let residual_reader = connect(POSTGRES_READER_USER, passwords.reader.clone()).await;
+    let configured: String = residual_reader
+        .client
+        .query_one(
+            "SELECT pg_catalog.set_config('bioworld.tenant_id', $1, false)",
+            &[&residual_tenant],
+        )
+        .await
+        .expect("residual replay tenant fixture must be configured")
+        .get(0);
+    assert_eq!(configured, residual_tenant);
+    let residual_pool = TestReaderPool::new(vec![residual_reader]);
+    let mut residual_source =
+        PostgresDecisionReplaySource::new(residual_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+
+    let residual_result = residual_source
+        .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
+        .await;
+    assert!(matches!(
+        residual_result,
+        Err(DecisionReplaySourceError::Unavailable)
+    ));
+    assert_eq!(
+        residual_pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Discard]
+    );
+    assert_eq!(
+        residual_pool.dispositions(),
+        vec![PostgresReaderLeaseDisposition::Discard]
+    );
+    assert_eq!(residual_pool.active(), 0);
+    assert_eq!(residual_pool.available(), 0);
+
+    let finish_reader = connect(POSTGRES_READER_USER, passwords.reader.clone()).await;
+    let finish_pool = TestReaderPool::new(vec![finish_reader]);
+    finish_pool.fail_next_finish();
+    let mut finish_source =
+        PostgresDecisionReplaySource::new(finish_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+
+    let finish_result = finish_source
+        .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
+        .await;
+    assert!(matches!(
+        finish_result,
+        Err(DecisionReplaySourceError::Unavailable)
+    ));
+    assert_eq!(
+        finish_pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(
+        finish_pool.dispositions(),
+        vec![PostgresReaderLeaseDisposition::Discard]
+    );
+    assert_eq!(finish_pool.active(), 0);
+    assert_eq!(finish_pool.available(), 0);
+
+    let mut closed_reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    closed_reader.disconnect().await;
+    let closed_pool = TestReaderPool::new(vec![closed_reader]);
+    let mut closed_source =
+        PostgresDecisionReplaySource::new(closed_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+
+    let closed_result = closed_source
+        .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
+        .await;
+    assert!(matches!(
+        closed_result,
+        Err(DecisionReplaySourceError::Unavailable)
+    ));
+    assert_eq!(
+        closed_pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Discard]
+    );
+    assert_eq!(
+        closed_pool.dispositions(),
+        vec![PostgresReaderLeaseDisposition::Discard]
+    );
+    assert_eq!(closed_pool.active(), 0);
+    assert_eq!(closed_pool.available(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_replay_acquisition_discards_its_lease_and_recovers_capacity() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let pool = production_reader_pool(passwords.reader, 1, Duration::from_secs(1));
+    let mut baseline = pool
+        .acquire()
+        .await
+        .expect("baseline replay lease must be acquired");
+    let baseline_backend: i32 = baseline
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("baseline replay backend identity must be queryable")
+        .get(0);
+    baseline
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("baseline replay lease must return to the pool");
+
+    let acquired = Arc::new(AtomicUsize::new(0));
+    let source = PostgresDecisionReplaySource::new(
+        DelayFirstProductionLease {
+            pool: pool.clone(),
+            acquired: Arc::clone(&acquired),
+        },
+        scope(REPLAY_CLEANUP_TENANT),
+    );
+    let mut replay = DecisionReplay::try_from_request(
+        source,
+        watch_request(REPLAY_DECISION_ID),
+        replay_page_size(1),
+    )
+    .expect("fixed replay request must be valid");
+    let task = tokio::spawn(async move { replay.next_page().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while acquired.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replay acquisition must reach the cancellation point");
+
+    task.abort();
+    let cancellation = task
+        .await
+        .expect_err("cancelled replay acquisition must stop its task");
+    assert!(cancellation.is_cancelled());
+
+    let mut replacement = pool
+        .acquire()
+        .await
+        .expect("cancelled replay capacity must be replaced");
+    let replacement_backend: i32 = replacement
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("replacement replay backend identity must be queryable")
+        .get(0);
+    assert_ne!(replacement_backend, baseline_backend);
+    replacement
+        .finish(PostgresReaderLeaseDisposition::Reuse)
+        .expect("replacement replay lease must return to the pool");
+
+    let recovered_source =
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+    let mut recovered = DecisionReplay::try_from_request(
+        recovered_source,
+        watch_request(REPLAY_DECISION_ID),
+        replay_page_size(1),
+    )
+    .expect("fixed replay request must be valid");
+    let missing = recovered
+        .next_page()
+        .await
+        .expect("recovered replay read must succeed");
+    assert!(missing.is_none());
+
+    let mut clean = pool
+        .acquire()
+        .await
+        .expect("clean replay lease must return");
+    assert!(tenant_context_is_absent(clean.client()).await);
+    clean
+        .finish(PostgresReaderLeaseDisposition::Discard)
+        .expect("clean replay lease must be discarded");
+    pool.close();
 }

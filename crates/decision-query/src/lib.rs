@@ -1,12 +1,20 @@
 #![deny(unsafe_code)]
 
+mod replay;
+
 use std::{future::Future, pin::Pin};
 
 use bioworld_contracts::{VersionedDecisionRecord, v2};
 use thiserror::Error;
 use uuid::Uuid;
 
-fn parse_canonical_decision_id(value: &str) -> Option<Uuid> {
+pub use replay::{
+    DecisionReplay, DecisionReplayError, DecisionReplayPage, DecisionReplayPageSize,
+    DecisionReplaySource, DecisionReplaySourceError, DecisionReplaySourceFuture,
+    DecisionReplaySourcePage, InvalidDecisionReplayPageSize, MAX_DECISION_REPLAY_PAGE_EVENTS,
+};
+
+fn parse_canonical_uuid(value: &str) -> Option<Uuid> {
     let decision_id = Uuid::parse_str(value).ok()?;
     (decision_id.to_string() == value).then_some(decision_id)
 }
@@ -36,7 +44,7 @@ impl TryFrom<v2::WatchDecisionRequest> for WatchDecisionQuery {
     type Error = WatchDecisionRequestError;
 
     fn try_from(request: v2::WatchDecisionRequest) -> Result<Self, Self::Error> {
-        let decision_id = parse_canonical_decision_id(&request.decision_id)
+        let decision_id = parse_canonical_uuid(&request.decision_id)
             .ok_or(WatchDecisionRequestError::InvalidDecisionId)?;
 
         Ok(Self::new(decision_id))
@@ -68,7 +76,7 @@ impl TryFrom<v2::GetDecisionRequest> for GetDecisionQuery {
     type Error = GetDecisionRequestError;
 
     fn try_from(request: v2::GetDecisionRequest) -> Result<Self, Self::Error> {
-        let decision_id = parse_canonical_decision_id(&request.decision_id)
+        let decision_id = parse_canonical_uuid(&request.decision_id)
             .ok_or(GetDecisionRequestError::InvalidDecisionId)?;
 
         Ok(Self::new(decision_id))
