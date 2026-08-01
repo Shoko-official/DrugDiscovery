@@ -226,6 +226,10 @@ impl DecisionStreamPage {
     pub fn continuation(&self) -> Option<&DecisionStreamContinuation> {
         self.continuation.as_ref()
     }
+
+    pub fn into_parts(self) -> (Vec<DecisionEvent>, Option<DecisionStreamContinuation>) {
+        (self.events, self.continuation)
+    }
 }
 
 pub struct PostgresDecisionEventReader<'client> {

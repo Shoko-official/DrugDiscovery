@@ -6,13 +6,18 @@ use std::{
     },
 };
 
-use bioworld_contracts::v2::GetDecisionRequest;
+use bioworld_contracts::v2::{GetDecisionRequest, WatchDecisionRequest};
 use bioworld_decision_grpc::{TenantScope, get_decision};
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
-    PostgresGetDecisionExecutor, PostgresReaderLease, PostgresReaderLeaseDisposition,
-    PostgresReaderLeaseProvider,
+    PostgresDecisionReplaySource, PostgresGetDecisionExecutor, PostgresReaderLease,
+    PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider,
 };
+use bioworld_decision_query::{
+    DecisionReplayPageSize, DecisionReplaySource, DecisionReplaySourceError,
+    MAX_DECISION_REPLAY_PAGE_EVENTS, WatchDecisionQuery,
+};
+use bioworld_event_store_postgres::{DecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS};
 use tokio_postgres::Client;
 use tonic::{Code, Request, Status};
 
@@ -66,6 +71,19 @@ fn assert_public_status(status: &Status, code: Code, message: &str) {
     assert!(status.metadata().is_empty());
 }
 
+#[test]
+fn replay_page_limit_matches_the_postgres_stream_limit() {
+    assert_eq!(
+        MAX_DECISION_REPLAY_PAGE_EVENTS,
+        MAX_DECISION_STREAM_PAGE_EVENTS
+    );
+
+    for value in 1..=MAX_DECISION_REPLAY_PAGE_EVENTS {
+        DecisionReplayPageSize::try_from(value).expect("application page size must be valid");
+        DecisionStreamPageSize::try_from(value).expect("storage page size must be valid");
+    }
+}
+
 #[tokio::test]
 async fn invalid_requests_do_not_acquire_a_reader_lease() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -99,6 +117,35 @@ async fn acquisition_failures_are_fixed_and_redacted() {
         Code::Unavailable,
         "decision service is unavailable",
     );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn replay_acquisition_failures_are_fixed_and_redacted() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut source = PostgresDecisionReplaySource::new(
+        RejectingProvider {
+            calls: Arc::clone(&calls),
+        },
+        scope(),
+    );
+    let query = WatchDecisionQuery::try_from(WatchDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    })
+    .expect("fixed replay query must be valid");
+
+    let result = source
+        .read_page(
+            query,
+            DecisionReplayPageSize::try_from(1).expect("fixed replay page size must be valid"),
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(DecisionReplaySourceError::Unavailable)
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
