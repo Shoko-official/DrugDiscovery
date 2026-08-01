@@ -135,6 +135,10 @@ where
         }
     }
 
+    pub fn page_size(&self) -> DecisionReplayPageSize {
+        self.page_size
+    }
+
     pub fn try_from_request(
         source: S,
         request: v2::WatchDecisionRequest,

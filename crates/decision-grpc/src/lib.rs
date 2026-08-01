@@ -12,6 +12,7 @@ use bioworld_decision_query::{
 use tonic::{Request, Response, Status};
 
 mod service;
+mod watch;
 
 pub use service::{
     AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,
@@ -19,6 +20,7 @@ pub use service::{
     MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS, MAX_DECISION_GRPC_REQUEST_TIMEOUT,
     TenantAuthenticationContext, TenantAuthenticator,
 };
+pub use watch::{MAX_DECISION_EVENT_WIRE_BYTES, TenantScopedWatchDecisionExecutor, watch_decision};
 
 pub struct TenantScope(Box<str>);
 
