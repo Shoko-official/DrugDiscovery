@@ -7,11 +7,14 @@ use std::{
 };
 
 use bioworld_contracts::v2::{GetDecisionRequest, WatchDecisionRequest};
-use bioworld_decision_grpc::{TenantScope, get_decision};
+use bioworld_decision_grpc::{
+    TenantScope, TenantScopedGetDecisionExecutor, TenantScopedWatchDecisionExecutor, get_decision,
+    watch_decision,
+};
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
-    PostgresDecisionReplaySource, PostgresGetDecisionExecutor, PostgresReaderLease,
-    PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider,
+    PostgresDecisionExecutor, PostgresDecisionReplaySource, PostgresGetDecisionExecutor,
+    PostgresReaderLease, PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider,
 };
 use bioworld_decision_query::{
     DecisionReplayPageSize, DecisionReplaySource, DecisionReplaySourceError,
@@ -19,7 +22,7 @@ use bioworld_decision_query::{
 };
 use bioworld_event_store_postgres::{DecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS};
 use tokio_postgres::Client;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Status, codegen::tokio_stream::StreamExt};
 
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
 
@@ -38,6 +41,7 @@ impl PostgresReaderLease for UnreachableLease {
     }
 }
 
+#[derive(Clone)]
 struct RejectingProvider {
     calls: Arc<AtomicUsize>,
 }
@@ -64,6 +68,12 @@ fn request(decision_id: &str) -> Request<GetDecisionRequest> {
     })
 }
 
+fn watch_request(decision_id: &str) -> Request<WatchDecisionRequest> {
+    Request::new(WatchDecisionRequest {
+        decision_id: decision_id.to_owned(),
+    })
+}
+
 fn assert_public_status(status: &Status, code: Code, message: &str) {
     assert_eq!(status.code(), code);
     assert_eq!(status.message(), message);
@@ -82,6 +92,72 @@ fn replay_page_limit_matches_the_postgres_stream_limit() {
         DecisionReplayPageSize::try_from(value).expect("application page size must be valid");
         DecisionStreamPageSize::try_from(value).expect("storage page size must be valid");
     }
+}
+
+#[tokio::test]
+async fn canonical_and_compatible_executors_adapt_watch_requests_lazily() {
+    fn assert_ports<T: TenantScopedGetDecisionExecutor + TenantScopedWatchDecisionExecutor>() {}
+    fn as_compatible_alias<P>(
+        executor: PostgresDecisionExecutor<P>,
+    ) -> PostgresGetDecisionExecutor<P> {
+        executor
+    }
+
+    assert_ports::<PostgresDecisionExecutor<RejectingProvider>>();
+    assert_ports::<PostgresGetDecisionExecutor<RejectingProvider>>();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = as_compatible_alias(PostgresDecisionExecutor::new(RejectingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let query = WatchDecisionQuery::try_from(WatchDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    })
+    .expect("fixed watch query must be valid");
+    let page_size =
+        DecisionReplayPageSize::try_from(16).expect("fixed replay page size must be valid");
+    let replay = executor.execute_watch_decision(scope(), query, page_size);
+
+    assert_eq!(replay.page_size(), page_size);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(replay);
+
+    let submitted = "sensitive-invalid-watch-decision-id";
+
+    let status = match watch_decision(&executor, scope(), watch_request(submitted)) {
+        Ok(_) => panic!("invalid Watch request must be rejected synchronously"),
+        Err(status) => status,
+    };
+
+    assert_public_status(
+        &status,
+        Code::InvalidArgument,
+        "decision request is invalid",
+    );
+    assert!(!format!("{status:?} {status}").contains(submitted));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let response = watch_decision(&executor, scope(), watch_request(DECISION_ID))
+        .expect("valid Watch request must create a response stream");
+    assert!(response.metadata().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let mut stream = response.into_inner();
+    let status = stream
+        .next()
+        .await
+        .expect("failed replay acquisition must emit one status")
+        .expect_err("failed replay acquisition must not expose an event");
+
+    assert_public_status(
+        &status,
+        Code::Unavailable,
+        "decision service is unavailable",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

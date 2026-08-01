@@ -23,16 +23,16 @@ use bioworld_contracts::v2::{
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
     DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantScope,
-    get_decision,
+    get_decision, watch_decision,
 };
 use bioworld_decision_grpc_jwt::{
     BIOWORLD_TENANT_CLAIM, JwtTenantAuthenticator, JwtTenantAuthenticatorConfig,
 };
 use bioworld_decision_grpc_postgres::{
     AcquirePostgresReaderError, AcquirePostgresReaderFuture, FinishPostgresReaderLeaseError,
-    PooledPostgresReaderLease, PostgresDecisionReplaySource, PostgresGetDecisionExecutor,
-    PostgresReaderLease, PostgresReaderLeaseDisposition, PostgresReaderLeaseProvider,
-    PostgresReaderPool, PostgresReaderPoolConfig,
+    PooledPostgresReaderLease, PostgresDecisionExecutor, PostgresDecisionReplaySource,
+    PostgresGetDecisionExecutor, PostgresReaderLease, PostgresReaderLeaseDisposition,
+    PostgresReaderLeaseProvider, PostgresReaderPool, PostgresReaderPoolConfig,
 };
 use bioworld_decision_query::{
     DecisionReplay, DecisionReplayError, DecisionReplayPageSize, DecisionReplaySource,
@@ -44,7 +44,7 @@ use bioworld_event_store_contracts::{
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Status, codegen::tokio_stream::StreamExt};
 
 const POSTGRES_HOST: &str = "127.0.0.1";
 const POSTGRES_PORT: u16 = 5432;
@@ -1819,6 +1819,129 @@ async fn finish_failure_discards_the_session_and_overrides_the_application_resul
     );
     assert_eq!(pool.active(), 0);
     assert_eq!(pool.available(), 0);
+}
+
+#[tokio::test]
+async fn watch_executor_streams_exact_tenant_history_with_one_clean_lease_per_page() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let tenant_a = "tenant-grpc-watch-executor-a";
+    let tenant_b = "tenant-grpc-watch-executor-b";
+    let decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3fa801";
+    let other_decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3fa802";
+    let first_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba801";
+    let second_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba802";
+    let hidden_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba803";
+    let other_decision_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba804";
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    for (event_id, tenant_id, seeded_decision_id, version, cou_id) in [
+        (
+            first_event_id,
+            tenant_a,
+            decision_id,
+            1,
+            "COU-WATCH-EXECUTOR-A1",
+        ),
+        (
+            second_event_id,
+            tenant_a,
+            decision_id,
+            2,
+            "COU-WATCH-EXECUTOR-A2",
+        ),
+        (
+            hidden_event_id,
+            tenant_b,
+            decision_id,
+            1,
+            "COU-WATCH-EXECUTOR-B1",
+        ),
+        (
+            other_decision_event_id,
+            tenant_a,
+            other_decision_id,
+            1,
+            "COU-WATCH-EXECUTOR-A3",
+        ),
+    ] {
+        seed_replay_event(
+            &mut writer.client,
+            event_id,
+            tenant_id,
+            seeded_decision_id,
+            version,
+            cou_id,
+        )
+        .await;
+    }
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let executor = PostgresDecisionExecutor::new(pool.clone());
+    let response = watch_decision(
+        &executor,
+        scope(tenant_a),
+        Request::new(watch_request(decision_id)),
+    )
+    .expect("valid watch request must return a replay stream");
+
+    assert_eq!(pool.acquisitions(), 0);
+    assert_eq!(pool.active(), 0);
+    let mut stream = response.into_inner();
+    let first = stream
+        .next()
+        .await
+        .expect("first tenant event must exist")
+        .expect("first tenant event must succeed");
+    assert_eq!(first.event_id, first_event_id);
+    assert_eq!(
+        first
+            .decision
+            .as_ref()
+            .expect("first replay event must contain a decision")
+            .cou_id,
+        "COU-WATCH-EXECUTOR-A1"
+    );
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(pool.available(), 1);
+    pool.assert_available_sessions_are_clean(1).await;
+
+    let second = stream
+        .next()
+        .await
+        .expect("second tenant event must exist")
+        .expect("second tenant event must succeed");
+    assert_eq!(second.event_id, second_event_id);
+    assert_eq!(
+        second
+            .decision
+            .as_ref()
+            .expect("second replay event must contain a decision")
+            .cou_id,
+        "COU-WATCH-EXECUTOR-A2"
+    );
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
+
+    assert_eq!(pool.acquisitions(), 2);
+    assert_eq!(pool.maximum_active(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(pool.available(), 1);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![
+            PostgresReaderLeaseDisposition::Reuse,
+            PostgresReaderLeaseDisposition::Reuse,
+        ]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    drop(stream);
+    pool.shutdown();
+    writer.discard();
 }
 
 #[tokio::test]
