@@ -156,6 +156,27 @@ fn accepts_only_bounded_decision_replay_page_sizes() {
 }
 
 #[test]
+fn exposes_the_exact_configured_page_size_without_reading_the_source() {
+    let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
+
+    for configured_size in [1, 16] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = ScriptedSource {
+            calls: Arc::clone(&calls),
+            responses: VecDeque::new(),
+        };
+        let replay = DecisionReplay::new(
+            source,
+            WatchDecisionQuery::new(decision_id),
+            page_size(configured_size),
+        );
+
+        assert_eq!(replay.page_size().get(), configured_size);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
 fn returns_an_exact_valid_final_page_then_stays_complete_without_more_source_reads() {
     let decision_id = Uuid::parse_str("018f5a72-9c4b-7d31-8f6a-26f08f3f4d99").unwrap();
     let original = event(
