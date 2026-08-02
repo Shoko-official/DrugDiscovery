@@ -23,7 +23,9 @@ use bioworld_contracts::v2::{
     decision_service_client::DecisionServiceClient,
 };
 use bioworld_decision_grpc_jwt::BIOWORLD_TENANT_CLAIM;
-use bioworld_decision_server::{DecisionServerConfig, DecisionServerRuntime};
+use bioworld_decision_server::{
+    DecisionServerConfig, DecisionServerRuntime, DecisionServerServeError,
+};
 use bioworld_event_store_contracts::{
     DecisionEventMetadata, decision_event_signature_message, decision_event_signature_value,
 };
@@ -70,7 +72,12 @@ const WATCH_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fb702";
 const WATCH_FIRST_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd702";
 const WATCH_SECOND_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd703";
 const WATCH_OTHER_TENANT_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd704";
+const EXPIRING_WATCH_TENANT: &str = "tenant-runtime-expiring-watch";
+const EXPIRING_WATCH_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fb703";
+const EXPIRING_WATCH_FIRST_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd705";
+const BACKPRESSURED_STREAM_WINDOW: u32 = 1;
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TRUST_EXPIRY_TEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 struct IntegrationInputs {
     writer_password: Zeroizing<String>,
@@ -87,6 +94,7 @@ struct IntegrationEventKeys {
     tenant_a: Ed25519KeyPair,
     watch_tenant_a: Ed25519KeyPair,
     watch_tenant_b: Ed25519KeyPair,
+    expiring_watch: Ed25519KeyPair,
 }
 
 impl IntegrationEventKeys {
@@ -95,6 +103,7 @@ impl IntegrationEventKeys {
             tenant_a: generate_event_key(),
             watch_tenant_a: generate_event_key(),
             watch_tenant_b: generate_event_key(),
+            expiring_watch: generate_event_key(),
         }
     }
 
@@ -103,11 +112,12 @@ impl IntegrationEventKeys {
             TENANT_A => &self.tenant_a,
             WATCH_TENANT_A => &self.watch_tenant_a,
             WATCH_TENANT_B => &self.watch_tenant_b,
+            EXPIRING_WATCH_TENANT => &self.expiring_watch,
             _ => panic!("integration event tenant must have an explicit signing key"),
         }
     }
 
-    fn snapshot(&self, now: u64) -> Vec<u8> {
+    fn snapshot_valid_until(&self, now: u64, valid_until: u64) -> Vec<u8> {
         let entry = |tenant_id: &str, key: &Ed25519KeyPair| {
             json!({
                 "tenant_id": tenant_id,
@@ -121,11 +131,12 @@ impl IntegrationEventKeys {
         };
         serde_json::to_vec(&json!({
             "version": "1",
-            "valid_until": now + 600,
+            "valid_until": valid_until,
             "keys": [
                 entry(TENANT_A, &self.tenant_a),
                 entry(WATCH_TENANT_A, &self.watch_tenant_a),
-                entry(WATCH_TENANT_B, &self.watch_tenant_b)
+                entry(WATCH_TENANT_B, &self.watch_tenant_b),
+                entry(EXPIRING_WATCH_TENANT, &self.expiring_watch)
             ]
         }))
         .expect("event verification snapshot serialization must succeed")
@@ -488,6 +499,14 @@ fn watch_decision_record(aggregate_version: u64, rationale: &str) -> DecisionRec
     record
 }
 
+fn expiring_watch_decision_record(aggregate_version: u64) -> DecisionRecord {
+    let mut record = decision_record();
+    record.decision_id = EXPIRING_WATCH_DECISION_ID.to_owned();
+    record.aggregate_version = aggregate_version;
+    record.rationale = vec!["Trust-bounded integration fixture.".to_owned()];
+    record
+}
+
 async fn seed_decision(
     writer: &mut Client,
     expected: &DecisionRecord,
@@ -562,12 +581,49 @@ fn runtime_config_with_watch(
     now: u64,
     watch_enabled: bool,
 ) -> DecisionServerConfig {
+    runtime_config_with_options(
+        files,
+        server_identity,
+        signing_key,
+        event_keys,
+        inputs,
+        now,
+        RuntimeConfigOptions {
+            watch_enabled,
+            jwks_valid_until: now + 600,
+            event_verification_valid_until: now + 600,
+            service_request_timeout_seconds: 5,
+            shutdown_grace_seconds: 10,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeConfigOptions {
+    watch_enabled: bool,
+    jwks_valid_until: u64,
+    event_verification_valid_until: u64,
+    service_request_timeout_seconds: u64,
+    shutdown_grace_seconds: u64,
+}
+
+fn runtime_config_with_options(
+    files: &TemporaryDirectory,
+    server_identity: (&[u8], &[u8]),
+    signing_key: &IntegrationJwtKey,
+    event_keys: &IntegrationEventKeys,
+    inputs: &IntegrationInputs,
+    now: u64,
+    options: RuntimeConfigOptions,
+) -> DecisionServerConfig {
     let (certificate_pem, private_key_pem) = server_identity;
     let certificate_file = files.write_public("server-cert.pem", certificate_pem);
     let private_key_file = files.write_private("server-key.pem", private_key_pem);
     let jwks_file = files.write_public("jwks.json", &signing_key.jwks);
-    let event_keys_file =
-        files.write_public("event-verification-keys.json", &event_keys.snapshot(now));
+    let event_keys_file = files.write_public(
+        "event-verification-keys.json",
+        &event_keys.snapshot_valid_until(now, options.event_verification_valid_until),
+    );
     let password_file = files.write_private("postgres-password", inputs.reader_password.as_bytes());
     let mut control = json!({
         "listen": {
@@ -583,7 +639,7 @@ fn runtime_config_with_watch(
             "audience": JWT_AUDIENCE,
             "required_scope": JWT_REQUIRED_SCOPE,
             "jwks_file": path_text(&jwks_file),
-            "jwks_valid_until": now + 600,
+            "jwks_valid_until": options.jwks_valid_until,
             "max_concurrent_verifications": 2,
             "max_concurrent_verifications_per_peer": 1
         },
@@ -602,7 +658,7 @@ fn runtime_config_with_watch(
         },
         "service": {
             "max_in_flight": 2,
-            "request_timeout_seconds": 5
+            "request_timeout_seconds": options.service_request_timeout_seconds
         },
         "transport": {
             "max_active_connections": 2,
@@ -612,10 +668,10 @@ fn runtime_config_with_watch(
             "request_timeout_seconds": 5,
             "max_connection_age_seconds": 60,
             "connection_age_grace_seconds": 5,
-            "shutdown_grace_seconds": 10
+            "shutdown_grace_seconds": options.shutdown_grace_seconds
         }
     });
-    if watch_enabled {
+    if options.watch_enabled {
         control["service"]["watch"] = json!({
             "max_in_flight": 1,
             "max_in_flight_per_tenant": 1
@@ -633,6 +689,22 @@ async fn guarded<T>(future: impl Future<Output = T>) -> T {
         .expect("runtime integration operation timed out")
 }
 
+async fn guarded_trust_expiry<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(TRUST_EXPIRY_TEST_TIMEOUT, future)
+        .await
+        .expect("trust expiry integration operation timed out")
+}
+
+async fn wait_until_after_unix_timestamp(timestamp: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must follow Unix epoch");
+    let remaining = Duration::from_secs(timestamp)
+        .saturating_add(Duration::from_secs(1))
+        .saturating_sub(now);
+    tokio::time::sleep(remaining).await;
+}
+
 async fn trusted_channel(address: std::net::SocketAddr, certificate_pem: Vec<u8>) -> Channel {
     guarded(
         Endpoint::from_shared(format!("https://{address}"))
@@ -643,6 +715,27 @@ async fn trusted_channel(address: std::net::SocketAddr, certificate_pem: Vec<u8>
                     .domain_name("localhost"),
             )
             .expect("runtime client TLS must be valid")
+            .connect(),
+    )
+    .await
+    .expect("runtime client must establish trusted TLS")
+}
+
+async fn trusted_channel_with_stream_window(
+    address: std::net::SocketAddr,
+    certificate_pem: Vec<u8>,
+    stream_window: u32,
+) -> Channel {
+    guarded(
+        Endpoint::from_shared(format!("https://{address}"))
+            .expect("runtime endpoint must be valid")
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(certificate_pem))
+                    .domain_name("localhost"),
+            )
+            .expect("runtime client TLS must be valid")
+            .initial_stream_window_size(stream_window)
             .connect(),
     )
     .await
@@ -903,4 +996,155 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
         .await
         .expect("runtime serving task must join")
         .expect("Watch-enabled runtime must stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn earliest_trust_expiry_stops_an_idle_server_cleanly() {
+    let Some(inputs) = integration_inputs() else {
+        return;
+    };
+    let event_keys = IntegrationEventKeys::generate();
+    let signing_key = IntegrationJwtKey::generate();
+    let CertifiedKey {
+        cert,
+        signing_key: server_key,
+    } = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("ephemeral server TLS identity must be generated");
+    let certificate_pem = cert.pem().into_bytes();
+    let private_key_pem = Zeroizing::new(server_key.serialize_pem().into_bytes());
+    let now = unix_timestamp();
+    let files = TemporaryDirectory::create();
+    let config = runtime_config_with_options(
+        &files,
+        (&certificate_pem, &private_key_pem),
+        &signing_key,
+        &event_keys,
+        &inputs,
+        now,
+        RuntimeConfigOptions {
+            watch_enabled: false,
+            jwks_valid_until: now + 120,
+            event_verification_valid_until: now + 12,
+            service_request_timeout_seconds: 5,
+            shutdown_grace_seconds: 10,
+        },
+    );
+    let runtime = guarded(DecisionServerRuntime::prepare(config))
+        .await
+        .expect("idle trust-bounded runtime must prepare through PostgreSQL TLS preflight");
+    let readiness_valid_until = runtime
+        .readiness_valid_until()
+        .expect("idle runtime must provide a bounded readiness lease");
+    assert_eq!(readiness_valid_until, now + 11);
+    let address = runtime.local_addr();
+    let server_task = tokio::spawn(runtime.serve(std::future::pending()));
+
+    let serve_result = guarded_trust_expiry(server_task)
+        .await
+        .expect("idle trust-bounded runtime serving task must join");
+    assert_eq!(serve_result, Err(DecisionServerServeError::TrustExpired));
+    assert!(
+        guarded(tokio::net::TcpStream::connect(address))
+            .await
+            .is_err(),
+        "trust expiry must close the idle listener"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn earliest_trust_expiry_stops_server_and_forces_an_unconsumed_watch() {
+    let Some(inputs) = integration_inputs() else {
+        return;
+    };
+    let mut writer =
+        connect_writer(inputs.writer_password.as_bytes(), &inputs.postgres_ca_file).await;
+    let event_keys = IntegrationEventKeys::generate();
+    let first = expiring_watch_decision_record(1);
+    seed_event(
+        &mut writer.client,
+        EXPIRING_WATCH_TENANT,
+        EXPIRING_WATCH_FIRST_EVENT_ID,
+        &first,
+        &event_keys,
+    )
+    .await;
+
+    let signing_key = IntegrationJwtKey::generate();
+    let CertifiedKey {
+        cert,
+        signing_key: server_key,
+    } = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("ephemeral server TLS identity must be generated");
+    let certificate_pem = cert.pem().into_bytes();
+    let private_key_pem = Zeroizing::new(server_key.serialize_pem().into_bytes());
+    let now = unix_timestamp();
+    let files = TemporaryDirectory::create();
+    let config = runtime_config_with_options(
+        &files,
+        (&certificate_pem, &private_key_pem),
+        &signing_key,
+        &event_keys,
+        &inputs,
+        now,
+        RuntimeConfigOptions {
+            watch_enabled: true,
+            jwks_valid_until: now + 120,
+            event_verification_valid_until: now + 12,
+            service_request_timeout_seconds: 20,
+            shutdown_grace_seconds: 25,
+        },
+    );
+    let runtime = guarded(DecisionServerRuntime::prepare(config))
+        .await
+        .expect("trust-bounded runtime must prepare through PostgreSQL TLS preflight");
+    let readiness_valid_until = runtime
+        .readiness_valid_until()
+        .expect("prepared verification trust must provide a bounded readiness lease");
+    assert_eq!(readiness_valid_until, now + 11);
+    let address = runtime.local_addr();
+    let server_task = tokio::spawn(runtime.serve(std::future::pending()));
+    let channel =
+        trusted_channel_with_stream_window(address, certificate_pem, BACKPRESSURED_STREAM_WINDOW)
+            .await;
+    let mut client = DecisionServiceClient::new(channel);
+    let token = signing_key.token(now, EXPIRING_WATCH_TENANT);
+    let open_watch = guarded(client.watch_decision(authenticated_request(
+        WatchDecisionRequest {
+            decision_id: EXPIRING_WATCH_DECISION_ID.to_owned(),
+        },
+        token.as_str(),
+        WATCH_TENANT_A,
+    )))
+    .await
+    .expect("valid tenant must open the trust-bounded Watch")
+    .into_inner();
+    let saturated = guarded(client.watch_decision(authenticated_request(
+        WatchDecisionRequest {
+            decision_id: EXPIRING_WATCH_DECISION_ID.to_owned(),
+        },
+        token.as_str(),
+        WATCH_TENANT_A,
+    )))
+    .await
+    .expect_err("unconsumed Watch must retain its bounded worker capacity");
+    assert_eq!(saturated.code(), Code::ResourceExhausted);
+    assert_eq!(saturated.message(), "decision service is at capacity");
+
+    guarded_trust_expiry(wait_until_after_unix_timestamp(readiness_valid_until)).await;
+    let serve_result = guarded_trust_expiry(server_task)
+        .await
+        .expect("trust-bounded runtime serving task must join");
+    assert_eq!(
+        serve_result,
+        Err(DecisionServerServeError::ShutdownDeadlineExceeded)
+    );
+    assert!(
+        guarded(tokio::net::TcpStream::connect(address))
+            .await
+            .is_err(),
+        "forced trust-expiry shutdown must close the prepared listener"
+    );
+
+    drop(open_watch);
+    drop(client);
 }

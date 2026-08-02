@@ -633,6 +633,23 @@ fn rejects_issuer_without_an_https_authority() {
 }
 
 #[test]
+fn validated_config_preserves_jwks_snapshot_expiration() {
+    const JWKS_VALID_UNTIL: u64 = 4_102_444_800;
+
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        JWKS_VALID_UNTIL,
+        2,
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(config.jwks_valid_until(), JWKS_VALID_UNTIL);
+}
+
+#[test]
 fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
     let now = now();
     let invalid_configs = [

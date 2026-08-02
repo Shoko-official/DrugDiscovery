@@ -455,6 +455,24 @@ fn rejects_invalid_snapshots_and_noncanonical_envelopes_without_reflection() {
 }
 
 #[test]
+fn exposes_exact_immutable_snapshot_expiration_without_changing_redacted_debug() {
+    let now = 1_800_000_000;
+    let clock = TestClock::new(now);
+    let verifier = DecisionEventVerifier::try_from_snapshot_with_clock(
+        &snapshot(&key_pair(), now, "trusted"),
+        clock.clone(),
+    )
+    .unwrap();
+    let cloned = verifier.clone();
+
+    clock.set(now + 30);
+
+    assert_eq!(verifier.snapshot_valid_until(), now + 60);
+    assert_eq!(cloned.snapshot_valid_until(), now + 60);
+    assert_eq!(format!("{verifier:?}"), "DecisionEventVerifier");
+}
+
+#[test]
 fn enforces_snapshot_lifetime_key_windows_and_clock_availability() {
     let now = 1_800_000_000;
     let key_pair = key_pair();

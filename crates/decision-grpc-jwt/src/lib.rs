@@ -91,6 +91,11 @@ impl JwtTenantAuthenticatorConfig {
             max_concurrent_verifications_per_peer,
         })
     }
+
+    /// Returns the immutable JWKS snapshot expiration as Unix seconds.
+    pub fn jwks_valid_until(&self) -> u64 {
+        self.jwks_valid_until
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
