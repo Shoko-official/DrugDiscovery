@@ -11,6 +11,7 @@ bioworld-decision-grpc-jwt = { path = "../../crates/decision-grpc-jwt" }
 bioworld-decision-grpc-postgres = { path = "../../crates/decision-grpc-postgres" }
 bioworld-decision-grpc-server = { path = "../../crates/decision-grpc-server" }
 bioworld-decision-query = { path = "../../crates/decision-query" }
+bioworld-event-store-contracts = { path = "../../crates/event-store-contracts" }
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
@@ -33,7 +34,6 @@ windows.workspace = true
 aws-lc-rs.workspace = true
 base64.workspace = true
 bioworld-contracts = { path = "../../crates/contracts" }
-bioworld-event-store-contracts = { path = "../../crates/event-store-contracts" }
 bioworld-event-store-postgres = { path = "../../crates/event-store-postgres" }
 chrono.workspace = true
 rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "zeroize"] }

@@ -4,6 +4,7 @@ use bioworld_decision_query::{
     DecisionReplaySourceFuture, DecisionReplaySourcePage, MAX_DECISION_REPLAY_PAGE_EVENTS,
     WatchDecisionQuery,
 };
+use bioworld_event_store_contracts::DecisionEventVerifier;
 use bioworld_event_store_postgres::{
     DecisionStreamContinuation, DecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS,
     PostgresDecisionEventReader, ReadDecisionEventError, ReadDecisionStreamPageError,
@@ -19,11 +20,16 @@ const _: () = assert!(MAX_DECISION_REPLAY_PAGE_EVENTS == MAX_DECISION_STREAM_PAG
 pub struct PostgresDecisionReplaySource<P> {
     provider: P,
     scope: TenantScope,
+    verifier: DecisionEventVerifier,
 }
 
 impl<P> PostgresDecisionReplaySource<P> {
-    pub fn new(provider: P, scope: TenantScope) -> Self {
-        Self { provider, scope }
+    pub fn new(provider: P, scope: TenantScope, verifier: DecisionEventVerifier) -> Self {
+        Self {
+            provider,
+            scope,
+            verifier,
+        }
     }
 }
 
@@ -50,7 +56,8 @@ where
             let mut lease = ReaderLeaseGuard::new(lease);
 
             let result = {
-                let mut reader = PostgresDecisionEventReader::new(lease.client());
+                let mut reader =
+                    PostgresDecisionEventReader::new(lease.client(), self.verifier.clone());
                 reader
                     .get_stream_page(
                         self.scope.tenant_id(),
@@ -93,6 +100,7 @@ fn map_stream_error(error: ReadDecisionStreamPageError) -> DecisionReplaySourceE
             | ReadDecisionEventError::ReaderIdentityRejected
             | ReadDecisionEventError::TenantContextRejected
             | ReadDecisionEventError::ReadOnlyTransactionRejected
+            | ReadDecisionEventError::TrustUnavailable
             | ReadDecisionEventError::AccessDenied
             | ReadDecisionEventError::RetryableTransaction
             | ReadDecisionEventError::ConnectionUnavailable
@@ -126,6 +134,7 @@ mod tests {
             ReadDecisionEventError::ReaderIdentityRejected,
             ReadDecisionEventError::TenantContextRejected,
             ReadDecisionEventError::ReadOnlyTransactionRejected,
+            ReadDecisionEventError::TrustUnavailable,
             ReadDecisionEventError::AccessDenied,
             ReadDecisionEventError::RetryableTransaction,
             ReadDecisionEventError::ConnectionUnavailable,

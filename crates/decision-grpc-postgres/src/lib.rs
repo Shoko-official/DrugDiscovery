@@ -10,6 +10,7 @@ use bioworld_decision_query::{
     DecisionReplay, DecisionReplayPageSize, GetDecision, GetDecisionQuery,
     GetDecisionRequestExecutionError, WatchDecisionQuery,
 };
+use bioworld_event_store_contracts::DecisionEventVerifier;
 use bioworld_event_store_postgres::{PostgresDecisionEventReader, PostgresLatestDecisionSource};
 use tokio_postgres::Client;
 
@@ -84,13 +85,14 @@ pub trait PostgresReaderLeaseProvider: Send + Sync {
 
 pub struct PostgresDecisionExecutor<P> {
     provider: P,
+    verifier: DecisionEventVerifier,
 }
 
 pub type PostgresGetDecisionExecutor<P> = PostgresDecisionExecutor<P>;
 
 impl<P> PostgresDecisionExecutor<P> {
-    pub fn new(provider: P) -> Self {
-        Self { provider }
+    pub fn new(provider: P, verifier: DecisionEventVerifier) -> Self {
+        Self { provider, verifier }
     }
 }
 
@@ -112,7 +114,8 @@ where
             let mut lease = ReaderLeaseGuard::new(lease);
 
             let result = {
-                let reader = PostgresDecisionEventReader::new(lease.client());
+                let reader =
+                    PostgresDecisionEventReader::new(lease.client(), self.verifier.clone());
                 match PostgresLatestDecisionSource::try_new(reader, scope.tenant_id()) {
                     Ok(source) => GetDecision::new(source).execute_validated(query).await,
                     Err(_) => Err(GetDecisionRequestExecutionError::SourceUnavailable),
@@ -148,7 +151,7 @@ where
         page_size: DecisionReplayPageSize,
     ) -> DecisionReplay<Self::Source> {
         DecisionReplay::new(
-            PostgresDecisionReplaySource::new(self.provider.clone(), scope),
+            PostgresDecisionReplaySource::new(self.provider.clone(), scope, self.verifier.clone()),
             query,
             page_size,
         )

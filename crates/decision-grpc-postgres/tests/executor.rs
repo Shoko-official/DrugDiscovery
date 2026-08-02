@@ -6,6 +6,8 @@ use std::{
     },
 };
 
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{GetDecisionRequest, WatchDecisionRequest};
 use bioworld_decision_grpc::{
     TenantScope, TenantScopedGetDecisionExecutor, TenantScopedWatchDecisionExecutor, get_decision,
@@ -20,11 +22,44 @@ use bioworld_decision_query::{
     DecisionReplayPageSize, DecisionReplaySource, DecisionReplaySourceError,
     MAX_DECISION_REPLAY_PAGE_EVENTS, WatchDecisionQuery,
 };
+use bioworld_event_store_contracts::{DecisionEventVerificationClock, DecisionEventVerifier};
 use bioworld_event_store_postgres::{DecisionStreamPageSize, MAX_DECISION_STREAM_PAGE_EVENTS};
+use serde_json::json;
 use tokio_postgres::Client;
 use tonic::{Code, Request, Status, codegen::tokio_stream::StreamExt};
 
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
+const TEST_NOW: u64 = 1_800_000_000;
+
+#[derive(Clone, Copy)]
+struct TestClock;
+
+impl DecisionEventVerificationClock for TestClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        Some(TEST_NOW)
+    }
+}
+
+fn verifier() -> DecisionEventVerifier {
+    let key = Ed25519KeyPair::from_seed_unchecked(&[53_u8; 32])
+        .expect("deterministic Ed25519 seed must be valid");
+    let snapshot = serde_json::to_vec(&json!({
+        "version": "1",
+        "valid_until": TEST_NOW + 60,
+        "keys": [{
+            "tenant_id": "trusted-tenant",
+            "key_id": "grpc-executor-test",
+            "algorithm": "Ed25519",
+            "public_key": URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+            "not_before": 1,
+            "not_after": 4_102_444_800_u64,
+            "status": "trusted"
+        }]
+    }))
+    .expect("fixture verifier snapshot must serialize");
+    DecisionEventVerifier::try_from_snapshot_with_clock(&snapshot, TestClock)
+        .expect("fixture verifier snapshot must be valid")
+}
 
 struct UnreachableLease;
 
@@ -107,9 +142,12 @@ async fn canonical_and_compatible_executors_adapt_watch_requests_lazily() {
     assert_ports::<PostgresGetDecisionExecutor<RejectingProvider>>();
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let executor = as_compatible_alias(PostgresDecisionExecutor::new(RejectingProvider {
-        calls: Arc::clone(&calls),
-    }));
+    let executor = as_compatible_alias(PostgresDecisionExecutor::new(
+        RejectingProvider {
+            calls: Arc::clone(&calls),
+        },
+        verifier(),
+    ));
     let query = WatchDecisionQuery::try_from(WatchDecisionRequest {
         decision_id: DECISION_ID.to_owned(),
     })
@@ -163,9 +201,12 @@ async fn canonical_and_compatible_executors_adapt_watch_requests_lazily() {
 #[tokio::test]
 async fn invalid_requests_do_not_acquire_a_reader_lease() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let executor = PostgresGetDecisionExecutor::new(RejectingProvider {
-        calls: Arc::clone(&calls),
-    });
+    let executor = PostgresGetDecisionExecutor::new(
+        RejectingProvider {
+            calls: Arc::clone(&calls),
+        },
+        verifier(),
+    );
 
     let result = get_decision(&executor, scope(), request("sensitive-invalid-decision-id")).await;
     let status = result.expect_err("invalid request must fail");
@@ -181,9 +222,12 @@ async fn invalid_requests_do_not_acquire_a_reader_lease() {
 #[tokio::test]
 async fn acquisition_failures_are_fixed_and_redacted() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let executor = PostgresGetDecisionExecutor::new(RejectingProvider {
-        calls: Arc::clone(&calls),
-    });
+    let executor = PostgresGetDecisionExecutor::new(
+        RejectingProvider {
+            calls: Arc::clone(&calls),
+        },
+        verifier(),
+    );
 
     let result = get_decision(&executor, scope(), request(DECISION_ID)).await;
     let status = result.expect_err("failed acquisition must fail");
@@ -204,6 +248,7 @@ async fn replay_acquisition_failures_are_fixed_and_redacted() {
             calls: Arc::clone(&calls),
         },
         scope(),
+        verifier(),
     );
     let query = WatchDecisionQuery::try_from(WatchDecisionRequest {
         decision_id: DECISION_ID.to_owned(),
@@ -250,9 +295,12 @@ fn executor_and_futures_support_concurrent_service_use() {
 
     assert_send_sync::<PostgresGetDecisionExecutor<RejectingProvider>>();
 
-    let executor = PostgresGetDecisionExecutor::new(RejectingProvider {
-        calls: Arc::new(AtomicUsize::new(0)),
-    });
+    let executor = PostgresGetDecisionExecutor::new(
+        RejectingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        verifier(),
+    );
     let tenant_a = get_decision(&executor, scope(), request(DECISION_ID));
     let tenant_b = get_decision(&executor, scope(), request(DECISION_ID));
 

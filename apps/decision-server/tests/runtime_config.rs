@@ -37,6 +37,9 @@ fn valid_control_value() -> Value {
             "max_concurrent_verifications": 32,
             "max_concurrent_verifications_per_peer": 8
         },
+        "event_verification": {
+            "keys_file": sensitive_path("event-verification-keys.json")
+        },
         "postgres": {
             "host": "database.example.test",
             "port": 5432,
@@ -302,6 +305,39 @@ fn rejects_duplicate_sensitive_file_locations() {
 }
 
 #[test]
+fn requires_a_distinct_event_verification_key_file() {
+    let mut missing = valid_control_value();
+    missing
+        .as_object_mut()
+        .expect("control must be an object")
+        .remove("event_verification");
+    assert!(
+        DecisionServerConfig::try_from_json(
+            &serde_json::to_vec(&missing).expect("test control serialization")
+        )
+        .is_err()
+    );
+
+    let mut unknown = valid_control_value();
+    unknown["event_verification"]["reload_seconds"] = json!(60);
+    assert!(
+        DecisionServerConfig::try_from_json(
+            &serde_json::to_vec(&unknown).expect("test control serialization")
+        )
+        .is_err()
+    );
+
+    let mut aliased = valid_control_value();
+    aliased["event_verification"]["keys_file"] = aliased["jwt"]["jwks_file"].clone();
+    assert!(
+        DecisionServerConfig::try_from_json(
+            &serde_json::to_vec(&aliased).expect("test control serialization")
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn rejects_connection_syntax_in_the_database_host() {
     let mut control = valid_control_value();
     control["postgres"]["host"] = json!("database.example.test:5432");
@@ -387,12 +423,14 @@ async fn rejects_hard_linked_sensitive_inputs_before_identity_parsing() {
     let private_key = directory.0.join("server-key.pem");
     fs::hard_link(&certificate, &private_key).expect("sensitive hard link");
     let jwks = directory.write("jwks.json", b"{}");
+    let event_keys = directory.write("event-verification-keys.json", b"{}");
     let password = directory.write("postgres-password", b"password");
     let ca = directory.write("postgres-ca.pem", b"not a CA");
     let mut control = valid_control_value();
     control["server_tls"]["certificate_chain_file"] = json!(certificate.to_string_lossy());
     control["server_tls"]["private_key_file"] = json!(private_key.to_string_lossy());
     control["jwt"]["jwks_file"] = json!(jwks.to_string_lossy());
+    control["event_verification"]["keys_file"] = json!(event_keys.to_string_lossy());
     control["postgres"]["password_file"] = json!(password.to_string_lossy());
     control["postgres"]["ca_file"] = json!(ca.to_string_lossy());
     let config = DecisionServerConfig::try_from_json(
