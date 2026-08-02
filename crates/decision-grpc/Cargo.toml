@@ -14,4 +14,4 @@ tonic.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }

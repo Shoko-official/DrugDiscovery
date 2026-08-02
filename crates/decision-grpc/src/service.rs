@@ -10,7 +10,7 @@ use bioworld_contracts::{
         decision_service_server::{DecisionService, DecisionServiceServer},
     },
 };
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, time::Instant};
 use tonic::{Extensions, Request, Response, Status, metadata::MetadataMap};
 
 use crate::{TenantScope, TenantScopedGetDecisionExecutor, get_decision};
@@ -26,6 +26,49 @@ pub struct TenantAuthenticationContext<'request> {
     metadata: &'request MetadataMap,
     extensions: &'request Extensions,
 }
+
+/// Verified tenant scope paired with its absolute monotonic authority boundary.
+pub struct TenantAuthority {
+    scope: TenantScope,
+    valid_until: Instant,
+}
+
+impl TenantAuthority {
+    /// Constructs authority from a verified tenant identifier and future deadline.
+    pub fn try_new(
+        tenant_id: String,
+        valid_until: Instant,
+    ) -> Result<Self, InvalidTenantAuthority> {
+        if valid_until <= Instant::now() {
+            return Err(InvalidTenantAuthority);
+        }
+        let scope = TenantScope::try_from_trusted_tenant_id(tenant_id)
+            .map_err(|_| InvalidTenantAuthority)?;
+
+        Ok(Self { scope, valid_until })
+    }
+
+    fn into_parts(self) -> (TenantScope, Instant) {
+        (self.scope, self.valid_until)
+    }
+}
+
+impl fmt::Debug for TenantAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TenantAuthority")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidTenantAuthority;
+
+impl fmt::Display for InvalidTenantAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("tenant authority is invalid")
+    }
+}
+
+impl Error for InvalidTenantAuthority {}
 
 impl<'request> TenantAuthenticationContext<'request> {
     pub fn metadata(&self) -> &'request MetadataMap {
@@ -102,15 +145,16 @@ impl fmt::Display for AuthenticateTenantError {
 impl Error for AuthenticateTenantError {}
 
 pub type AuthenticateTenantFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<String, AuthenticateTenantError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<TenantAuthority, AuthenticateTenantError>> + Send + 'a>>;
 
-/// Authenticates a request and returns the tenant bound to its verified principal.
+/// Authenticates a request and returns bounded authority for its verified principal.
 ///
 /// Implementations must derive the tenant from a successfully verified identity.
 /// Client-provided tenant selectors in metadata or messages must never establish or
 /// override tenant authority. The method must return without blocking, and the
-/// returned future must be cancellation-safe because the service can drop it when
-/// the request deadline expires or the client disconnects.
+/// returned authority must not outlive any credential or verification-key boundary.
+/// The future must be cancellation-safe because the service can drop it when the
+/// request deadline expires or the client disconnects.
 pub trait TenantAuthenticator: Send + Sync {
     fn authenticate_tenant<'a>(
         &'a self,
@@ -198,22 +242,45 @@ where
         let _permit = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("decision service is at capacity"))?;
-        tokio::time::timeout(self.request_timeout, async {
-            let tenant_id = self
-                .authenticator
-                .authenticate_tenant(TenantAuthenticationContext {
-                    metadata: request.metadata(),
-                    extensions: request.extensions(),
-                })
-                .await
-                .map_err(AuthenticateTenantError::status)?;
-            let scope = TenantScope::try_from_trusted_tenant_id(tenant_id)
-                .map_err(|_| Status::unauthenticated("authentication is required"))?;
-
-            get_decision(&self.executor, scope, request).await
-        })
-        .await
-        .map_err(|_| Status::deadline_exceeded(DECISION_GRPC_REQUEST_DEADLINE_MESSAGE))?
+        let service_deadline = Instant::now() + self.request_timeout;
+        let authority = {
+            let authentication =
+                self.authenticator
+                    .authenticate_tenant(TenantAuthenticationContext {
+                        metadata: request.metadata(),
+                        extensions: request.extensions(),
+                    });
+            tokio::pin!(authentication);
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(service_deadline) => {
+                    return Err(Status::deadline_exceeded(DECISION_GRPC_REQUEST_DEADLINE_MESSAGE));
+                }
+                result = &mut authentication => {
+                    result.map_err(AuthenticateTenantError::status)?
+                }
+            }
+        };
+        let (scope, authority_deadline) = authority.into_parts();
+        let execution = get_decision(&self.executor, scope, request);
+        tokio::pin!(execution);
+        if authority_deadline < service_deadline {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(authority_deadline) => {
+                    Err(Status::unauthenticated("authentication is required"))
+                }
+                result = &mut execution => result,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(service_deadline) => {
+                    Err(Status::deadline_exceeded(DECISION_GRPC_REQUEST_DEADLINE_MESSAGE))
+                }
+                result = &mut execution => result,
+            }
+        }
     }
 
     async fn propose_decision(

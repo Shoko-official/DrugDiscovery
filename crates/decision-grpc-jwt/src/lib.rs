@@ -6,13 +6,13 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, TenantAuthenticationContext,
-    TenantAuthenticator,
+    TenantAuthenticator, TenantAuthority,
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
@@ -192,15 +192,18 @@ impl TenantAuthenticator for JwtTenantAuthenticator {
             Ok(runtime) => runtime,
             Err(_) => return Box::pin(async { Err(AuthenticateTenantError::unavailable()) }),
         };
+        let authority_started_at = tokio::time::Instant::now();
 
         Box::pin(async move {
-            AbortOnDropTask::new(runtime.spawn_blocking(move || {
+            let verified = AbortOnDropTask::new(runtime.spawn_blocking(move || {
                 let _permit = permit;
-                verifier.verify(&token)
+                verifier.verify(&token, authority_started_at)
             }))
             .join()
             .await
-            .unwrap_or_else(|_| Err(AuthenticateTenantError::unavailable()))
+            .unwrap_or_else(|_| Err(AuthenticateTenantError::unavailable()))?;
+            TenantAuthority::try_new(verified.tenant_id, verified.valid_until)
+                .map_err(|_| verified.expiry_error)
         })
     }
 }
@@ -240,7 +243,11 @@ struct JwtVerifier {
 }
 
 impl JwtVerifier {
-    fn verify(&self, token: &str) -> Result<String, AuthenticateTenantError> {
+    fn verify(
+        &self,
+        token: &str,
+        authority_started_at: tokio::time::Instant,
+    ) -> Result<VerifiedAuthority, AuthenticateTenantError> {
         let now = self
             .clock
             .unix_timestamp()
@@ -289,14 +296,54 @@ impl JwtVerifier {
             .map_err(|_| AuthenticateTenantError::rejected())?
             .claims;
 
-        self.validate_claims(claims, now)
+        let verified = self.validate_claims(claims, now)?;
+        let completion_now = self
+            .clock
+            .unix_timestamp()
+            .ok_or_else(AuthenticateTenantError::unavailable)?;
+        if self.config.jwks_valid_until <= completion_now {
+            return Err(AuthenticateTenantError::unavailable());
+        }
+        if verified.expiration <= completion_now {
+            return Err(AuthenticateTenantError::rejected());
+        }
+        let authority_expiration = verified.expiration.min(self.config.jwks_valid_until);
+        let expiry_status = || {
+            if self.config.jwks_valid_until <= verified.expiration {
+                AuthenticateTenantError::unavailable()
+            } else {
+                AuthenticateTenantError::rejected()
+            }
+        };
+        // Unix timestamps have one-second precision, so reserve one second to
+        // keep monotonic authority within the verified wall-clock boundary.
+        let deadline_at = |sampled_at: tokio::time::Instant, sampled_now: u64| {
+            let valid_for = authority_expiration
+                .saturating_sub(sampled_now)
+                .saturating_sub(1);
+            if valid_for == 0 {
+                return Err(expiry_status());
+            }
+            sampled_at
+                .checked_add(Duration::from_secs(valid_for))
+                .ok_or_else(AuthenticateTenantError::unavailable)
+        };
+        let valid_until = deadline_at(authority_started_at, now)?
+            .min(deadline_at(authority_started_at, completion_now)?);
+        let expiry_error = expiry_status();
+
+        Ok(VerifiedAuthority {
+            tenant_id: verified.tenant_id,
+            valid_until,
+            expiry_error,
+        })
     }
 
     fn validate_claims(
         &self,
         claims: AccessTokenClaims,
         now: u64,
-    ) -> Result<String, AuthenticateTenantError> {
+    ) -> Result<VerifiedTenant, AuthenticateTenantError> {
         if claims.issuer != self.config.issuer.as_ref()
             || !claims.audience.contains(self.config.audience.as_ref())
             || !valid_claim_value(&claims.subject)
@@ -319,8 +366,22 @@ impl JwtVerifier {
             return Err(AuthenticateTenantError::rejected());
         }
 
-        Ok(claims.tenant_id)
+        Ok(VerifiedTenant {
+            tenant_id: claims.tenant_id,
+            expiration: claims.expiration,
+        })
     }
+}
+
+struct VerifiedTenant {
+    tenant_id: String,
+    expiration: u64,
+}
+
+struct VerifiedAuthority {
+    tenant_id: String,
+    valid_until: tokio::time::Instant,
+    expiry_error: AuthenticateTenantError,
 }
 
 #[derive(Deserialize)]

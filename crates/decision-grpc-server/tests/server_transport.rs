@@ -18,8 +18,8 @@ use bioworld_contracts::v2::{
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantFuture, DecisionGrpcService, DecisionGrpcServiceConfig,
-    TenantAuthenticationContext, TenantAuthenticator, TenantScope, TenantScopedGetDecisionExecutor,
-    TenantScopedGetDecisionFuture,
+    TenantAuthenticationContext, TenantAuthenticator, TenantAuthority, TenantScope,
+    TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_grpc_server::{
     DecisionGrpcBind, DecisionGrpcServer, DecisionGrpcServerConfig, DecisionGrpcServerLimits,
@@ -105,7 +105,13 @@ impl TenantAuthenticator for CountingAuthenticator {
         _context: TenantAuthenticationContext<'a>,
     ) -> AuthenticateTenantFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok("trusted-tenant".to_owned()) })
+        Box::pin(async {
+            Ok(TenantAuthority::try_new(
+                "trusted-tenant".to_owned(),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .expect("fixed tenant authority must be valid"))
+        })
     }
 }
 
