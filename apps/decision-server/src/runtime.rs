@@ -1,6 +1,14 @@
 use std::{
-    collections::HashSet, error::Error, fmt, future::Future, net::SocketAddr, sync::Arc,
-    time::Duration,
+    collections::HashSet,
+    error::Error,
+    fmt,
+    future::Future,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bioworld_decision_grpc::{DecisionGrpcService, TenantScope, TenantScopedGetDecisionExecutor};
@@ -35,6 +43,9 @@ const MAX_POSTGRES_PASSWORD_BYTES: usize = 1_024;
 const POSTGRES_READER_ROLE: &str = "bioworld_reader";
 const POSTGRES_APPLICATION_NAME: &str = "bioworld-decision-server";
 const PREFLIGHT_TENANT_ID: &str = "bioworld-startup-probe";
+const TRUST_DEADLINE_SAFETY_MARGIN: Duration = Duration::from_secs(1);
+const TRUST_READINESS_MARGIN: Duration = Duration::from_secs(1);
+const TRUST_WALL_CLOCK_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 type RuntimeExecutor = PostgresDecisionExecutor<PostgresReaderPool>;
 type RuntimeService = DecisionGrpcService<JwtTenantAuthenticator, RuntimeExecutor>;
@@ -44,6 +55,7 @@ pub struct DecisionServerRuntime {
     server: DecisionGrpcServer,
     service: RuntimeService,
     pool: PoolCloseGuard,
+    trust_deadline: RuntimeTrustDeadline,
 }
 
 impl DecisionServerRuntime {
@@ -111,10 +123,16 @@ impl DecisionServerRuntime {
         let server_identity = DecisionGrpcTlsIdentity::try_from_pem(certificate_chain, private_key)
             .map_err(|_| DecisionServerStartupError::ServerIdentityRejected)?;
 
+        let jwks_valid_until = jwt.jwks_valid_until();
         let authenticator = JwtTenantAuthenticator::try_from_jwks(jwt, &jwks)
             .map_err(|_| DecisionServerStartupError::IdentityConfigurationRejected)?;
         let event_verifier = DecisionEventVerifier::try_from_snapshot(&event_verification_keys)
             .map_err(|_| DecisionServerStartupError::EventVerificationConfigurationRejected)?;
+        let trust_deadline = RuntimeTrustDeadline::try_from_unix_expirations(
+            jwks_valid_until,
+            event_verifier.snapshot_valid_until(),
+        )?;
+        trust_deadline.ensure_current()?;
 
         normalize_password(&mut password)?;
         let (postgres_config, postgres_tls) =
@@ -127,6 +145,7 @@ impl DecisionServerRuntime {
             preflight_reader(pool.pool(), event_verifier.clone()),
         )
         .await?;
+        trust_deadline.ensure_current()?;
 
         let executor = PostgresDecisionExecutor::new(pool.pool().clone(), event_verifier);
         let service = match watch {
@@ -143,14 +162,17 @@ impl DecisionServerRuntime {
             )),
         }
         .map_err(|_| DecisionServerStartupError::ServiceConfigurationRejected)?;
+        trust_deadline.ensure_current()?;
         let server = DecisionGrpcServer::bind(server, server_identity)
             .await
             .map_err(map_bind_error)?;
+        trust_deadline.ensure_current()?;
 
         Ok(Self {
             server,
             service,
             pool,
+            trust_deadline,
         })
     }
 
@@ -159,7 +181,15 @@ impl DecisionServerRuntime {
         self.server.local_addr()
     }
 
-    /// Serves until shutdown, drains bounded request work, then closes the reader pool.
+    /// Returns the observer-verifiable Unix expiration for a bounded readiness lease.
+    ///
+    /// A process controller must reject the lease at or after this value.
+    pub fn readiness_valid_until(&self) -> Result<u64, DecisionServerStartupError> {
+        self.trust_deadline.ensure_ready()?;
+        Ok(self.trust_deadline.unix_deadline.as_secs())
+    }
+
+    /// Serves until shutdown or trust expiry, drains bounded work, then closes the reader pool.
     pub async fn serve<F>(self, shutdown: F) -> Result<(), DecisionServerServeError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -168,10 +198,34 @@ impl DecisionServerRuntime {
             server,
             service,
             pool,
+            trust_deadline,
         } = self;
-        let result = server.serve(service, shutdown).await.map_err(Into::into);
+        if trust_deadline.is_expired() {
+            drop(pool);
+            return Err(DecisionServerServeError::TrustExpired);
+        }
+        let trust_expired = Arc::new(AtomicBool::new(false));
+        let expiry_observed = Arc::clone(&trust_expired);
+        let bounded_shutdown = async move {
+            tokio::select! {
+                biased;
+                _ = shutdown => {}
+                _ = trust_deadline.wait_until_expired() => {
+                    expiry_observed.store(true, Ordering::Release);
+                }
+            }
+        };
+        let result = server
+            .serve(service, bounded_shutdown)
+            .await
+            .map_err(DecisionServerServeError::from);
         drop(pool);
-        result
+        result?;
+        if trust_expired.load(Ordering::Acquire) {
+            Err(DecisionServerServeError::TrustExpired)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -200,6 +254,8 @@ pub enum DecisionServerStartupError {
     DatabaseUnavailable,
     /// The configured listener address was unavailable.
     ListenerUnavailable,
+    /// JWT or scientific-event verification trust expired before readiness.
+    TrustExpired,
 }
 
 impl fmt::Display for DecisionServerStartupError {
@@ -229,6 +285,7 @@ impl fmt::Display for DecisionServerStartupError {
             Self::ListenerUnavailable => {
                 formatter.write_str("decision server listener is unavailable")
             }
+            Self::TrustExpired => formatter.write_str("decision server verification trust expired"),
         }
     }
 }
@@ -244,6 +301,8 @@ pub enum DecisionServerServeError {
     ShutdownDeadlineExceeded,
     /// Service work cannot drain inside the shutdown budget.
     ServiceLimitsRejected,
+    /// JWT or scientific-event verification trust reached its bounded deadline.
+    TrustExpired,
 }
 
 impl fmt::Display for DecisionServerServeError {
@@ -256,6 +315,7 @@ impl fmt::Display for DecisionServerServeError {
             Self::ServiceLimitsRejected => {
                 formatter.write_str("decision server service limits are rejected")
             }
+            Self::TrustExpired => formatter.write_str("decision server verification trust expired"),
         }
     }
 }
@@ -271,6 +331,120 @@ impl From<ServeDecisionGrpcServerError> for DecisionServerServeError {
             }
             ServeDecisionGrpcServerError::ServiceLimitsRejected => Self::ServiceLimitsRejected,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeTrustDeadline {
+    monotonic_deadline: tokio::time::Instant,
+    unix_deadline: Duration,
+}
+
+impl RuntimeTrustDeadline {
+    fn try_from_unix_expirations(
+        jwks_valid_until: u64,
+        event_verification_valid_until: u64,
+    ) -> Result<Self, DecisionServerStartupError> {
+        let sampled_at = tokio::time::Instant::now();
+        let sampled_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DecisionServerStartupError::TrustExpired)?;
+        Self::try_from_sample(
+            jwks_valid_until,
+            event_verification_valid_until,
+            sampled_now,
+            sampled_at,
+        )
+    }
+
+    fn try_from_sample(
+        jwks_valid_until: u64,
+        event_verification_valid_until: u64,
+        sampled_now: Duration,
+        sampled_at: tokio::time::Instant,
+    ) -> Result<Self, DecisionServerStartupError> {
+        let unix_deadline =
+            Duration::from_secs(jwks_valid_until.min(event_verification_valid_until))
+                .checked_sub(TRUST_DEADLINE_SAFETY_MARGIN)
+                .ok_or(DecisionServerStartupError::TrustExpired)?;
+        let valid_for = unix_deadline
+            .checked_sub(sampled_now)
+            .filter(|duration| !duration.is_zero())
+            .ok_or(DecisionServerStartupError::TrustExpired)?;
+        sampled_at
+            .checked_add(valid_for)
+            .map(|monotonic_deadline| Self {
+                monotonic_deadline,
+                unix_deadline,
+            })
+            .ok_or(DecisionServerStartupError::TrustExpired)
+    }
+
+    fn ensure_current(self) -> Result<(), DecisionServerStartupError> {
+        if self.is_expired() {
+            Err(DecisionServerStartupError::TrustExpired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_ready(self) -> Result<(), DecisionServerStartupError> {
+        self.ensure_ready_at(
+            tokio::time::Instant::now(),
+            SystemTime::now().duration_since(UNIX_EPOCH).ok(),
+        )
+    }
+
+    fn ensure_ready_at(
+        self,
+        monotonic_now: tokio::time::Instant,
+        unix_now: Option<Duration>,
+    ) -> Result<(), DecisionServerStartupError> {
+        let remaining = self.remaining_at(monotonic_now, unix_now);
+        if remaining.is_some_and(|remaining| remaining > TRUST_READINESS_MARGIN) {
+            Ok(())
+        } else {
+            Err(DecisionServerStartupError::TrustExpired)
+        }
+    }
+
+    fn is_expired(self) -> bool {
+        self.remaining_at(
+            tokio::time::Instant::now(),
+            SystemTime::now().duration_since(UNIX_EPOCH).ok(),
+        )
+        .is_none_or(|remaining| remaining.is_zero())
+    }
+
+    fn remaining_at(
+        self,
+        monotonic_now: tokio::time::Instant,
+        unix_now: Option<Duration>,
+    ) -> Option<Duration> {
+        let unix_now = unix_now?;
+        Some(
+            self.monotonic_deadline
+                .saturating_duration_since(monotonic_now)
+                .min(self.unix_deadline.saturating_sub(unix_now)),
+        )
+    }
+
+    async fn wait_until_expired(self) {
+        loop {
+            if self.is_expired() {
+                return;
+            }
+            let next_wall_check = tokio::time::Instant::now()
+                .checked_add(TRUST_WALL_CLOCK_RECHECK_INTERVAL)
+                .unwrap_or(self.monotonic_deadline)
+                .min(self.monotonic_deadline);
+            tokio::time::sleep_until(next_wall_check).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn monotonic(self) -> tokio::time::Instant {
+        self.monotonic_deadline
     }
 }
 
@@ -470,8 +644,12 @@ mod tests {
     use std::{future, time::Duration};
 
     use rcgen::generate_simple_self_signed;
+    use tokio::time::Instant;
 
-    use super::{DecisionServerStartupError, parse_postgres_roots, preflight_with_deadline};
+    use super::{
+        DecisionServerStartupError, RuntimeTrustDeadline, parse_postgres_roots,
+        preflight_with_deadline,
+    };
 
     #[test]
     fn postgres_ca_input_is_strictly_certificate_pem() {
@@ -502,5 +680,113 @@ mod tests {
         .await;
 
         assert_eq!(result, Err(DecisionServerStartupError::DatabaseUnavailable));
+    }
+
+    #[test]
+    fn runtime_trust_uses_the_earliest_snapshot_and_a_monotonic_deadline() {
+        let sampled_at = Instant::now();
+        let sampled_now = Duration::from_secs(100);
+        let jwks_first = RuntimeTrustDeadline::try_from_sample(110, 120, sampled_now, sampled_at)
+            .expect("bounded JWKS validity must produce a deadline");
+        let events_first = RuntimeTrustDeadline::try_from_sample(120, 108, sampled_now, sampled_at)
+            .expect("bounded event verification validity must produce a deadline");
+
+        assert_eq!(jwks_first.monotonic(), sampled_at + Duration::from_secs(9));
+        assert_eq!(
+            events_first.monotonic(),
+            sampled_at + Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn runtime_trust_rejects_expiration_inside_its_precision_reserve() {
+        let sampled_at = Instant::now();
+
+        for valid_until in [99, 100, 101] {
+            assert_eq!(
+                RuntimeTrustDeadline::try_from_sample(
+                    valid_until,
+                    valid_until,
+                    Duration::from_secs(100),
+                    sampled_at,
+                )
+                .err()
+                .expect("stale trust must not produce a runtime deadline"),
+                DecisionServerStartupError::TrustExpired
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_trust_rejects_readiness_after_its_monotonic_deadline() {
+        let expired = RuntimeTrustDeadline {
+            monotonic_deadline: Instant::now() - Duration::from_millis(1),
+            unix_deadline: Duration::from_secs(u64::MAX),
+        };
+
+        assert_eq!(
+            expired.ensure_current(),
+            Err(DecisionServerStartupError::TrustExpired)
+        );
+    }
+
+    #[test]
+    fn runtime_trust_preserves_the_full_precision_safety_margin() {
+        let sampled_at = Instant::now();
+        let deadline = RuntimeTrustDeadline::try_from_sample(
+            110,
+            120,
+            Duration::from_millis(100_900),
+            sampled_at,
+        )
+        .expect("fractional wall time must produce a conservative deadline");
+
+        assert_eq!(
+            deadline.monotonic(),
+            sampled_at + Duration::from_millis(8_100)
+        );
+    }
+
+    #[test]
+    fn runtime_trust_uses_wall_time_only_to_shorten_the_monotonic_bound() {
+        let sampled_at = Instant::now();
+        let deadline =
+            RuntimeTrustDeadline::try_from_sample(120, 120, Duration::from_secs(100), sampled_at)
+                .expect("bounded trust must produce a deadline");
+
+        assert_eq!(
+            deadline.remaining_at(
+                sampled_at + Duration::from_secs(1),
+                Some(Duration::from_secs(119))
+            ),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            deadline.remaining_at(
+                sampled_at + Duration::from_secs(19),
+                Some(Duration::from_secs(1))
+            ),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn runtime_trust_requires_a_margin_before_readiness() {
+        let sampled_at = Instant::now();
+        let deadline =
+            RuntimeTrustDeadline::try_from_sample(103, 103, Duration::from_secs(100), sampled_at)
+                .expect("bounded trust must produce a deadline");
+
+        assert_eq!(
+            deadline.ensure_ready_at(
+                sampled_at + Duration::from_secs(1),
+                Some(Duration::from_secs(101)),
+            ),
+            Err(DecisionServerStartupError::TrustExpired)
+        );
+        assert_eq!(
+            deadline.ensure_ready_at(sampled_at, Some(Duration::from_secs(100))),
+            Ok(())
+        );
     }
 }

@@ -58,7 +58,13 @@ async fn run() -> Result<(), ProcessFailure> {
         }
     };
 
-    emit_stdout("decision_server ready").map_err(|_| ProcessFailure)?;
+    let readiness_valid_until = runtime
+        .readiness_valid_until()
+        .map_err(|_| ProcessFailure)?;
+    emit_stdout(&format!(
+        "decision_server ready_until={readiness_valid_until}"
+    ))
+    .map_err(|_| ProcessFailure)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let serving = runtime.serve(async move {
         let _ = shutdown_rx.await;

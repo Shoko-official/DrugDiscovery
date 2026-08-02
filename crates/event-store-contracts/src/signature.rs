@@ -161,6 +161,11 @@ impl DecisionEventVerifier {
         })
     }
 
+    /// Returns the validated immutable snapshot expiration as Unix seconds.
+    pub fn snapshot_valid_until(&self) -> u64 {
+        self.valid_until
+    }
+
     pub fn verify_and_reconstruct(
         &self,
         row: &ScientificEventRow,
