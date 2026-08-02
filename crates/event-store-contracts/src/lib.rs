@@ -18,4 +18,5 @@ pub use signature::{
     DecisionEventVerifier, InvalidDecisionEventVerifier,
     MAX_DECISION_EVENT_VERIFICATION_SNAPSHOT_BYTES, SystemDecisionEventVerificationClock,
     decision_event_signature_message, decision_event_signature_value,
+    stored_decision_event_signature_message,
 };

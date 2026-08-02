@@ -236,6 +236,17 @@ pub fn decision_event_signature_value(
     }))
 }
 
+pub fn stored_decision_event_signature_message(
+    row: &ScientificEventRow,
+    key_id: &str,
+) -> Result<Vec<u8>, EventProjectionError> {
+    if !valid_key_id(key_id) {
+        return Err(EventProjectionError::InvalidSignature);
+    }
+    reconstruct_decision_event(row)?;
+    signature_message(row, key_id).map_err(|_| EventProjectionError::InvalidSignature)
+}
+
 fn signature_message(
     row: &ScientificEventRow,
     key_id: &str,

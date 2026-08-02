@@ -17,7 +17,7 @@ use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
     DecisionEventVerificationClock, DecisionEventVerifier, ScientificEventRow,
     decision_event_signature_message, decision_event_signature_value, project_decision_event,
-    reconstruct_decision_event,
+    stored_decision_event_signature_message,
 };
 use bioworld_event_store_postgres::{
     AppendDecisionEventError, DecisionStreamPageSize, InvalidDecisionSourceScope,
@@ -1292,8 +1292,11 @@ fn historical_ood_status_row(tenant_id: &str) -> ScientificEventRow {
         .expect("fixed signature must be an object")
         .clone(),
     };
-    let event = reconstruct_decision_event(&row).expect("historical fixture must reconstruct");
-    row.signature = signature_value(&event, tenant_id, row.occurred_at)
+    let key = signing_key(tenant_id);
+    let message = stored_decision_event_signature_message(&row, TEST_KEY_ID)
+        .expect("historical fixture signature message must be valid");
+    row.signature = decision_event_signature_value(TEST_KEY_ID, key.sign(&message).as_ref())
+        .expect("historical fixture signature must be valid")
         .as_object()
         .expect("fixture signature must be an object")
         .clone();

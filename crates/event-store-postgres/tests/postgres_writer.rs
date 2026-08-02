@@ -452,8 +452,17 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
         "018f5a72-9c4b-7d31-8f6a-26f08f3f4d97",
     );
     invalid.event_id.make_ascii_uppercase();
+    let invalid_metadata = DecisionEventMetadata::try_new(
+        tenant_a.to_owned(),
+        occurred_at(),
+        decision_event_signature_value(TEST_KEY_ID, &[0_u8; 64])
+            .expect("fixed invalid-event signature envelope must be valid"),
+    )
+    .expect("fixed invalid-event metadata must be valid");
     assert_eq!(
-        append(&mut client, invalid, tenant_a).await,
+        PostgresDecisionEventWriter::new(&mut client)
+            .append(invalid, invalid_metadata)
+            .await,
         Err(AppendDecisionEventError::EventRejected),
     );
     assert!(tenant_context_is_absent(&client).await);

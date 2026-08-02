@@ -43,7 +43,7 @@ use bioworld_decision_query::{
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
     DecisionEventVerificationClock, DecisionEventVerifier, ScientificEventRow,
-    decision_event_signature_message, decision_event_signature_value, reconstruct_decision_event,
+    decision_event_signature_value, stored_decision_event_signature_message,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -216,10 +216,8 @@ fn event_signature(
             .expect("placeholder signature must be an object")
             .clone(),
     };
-    let event = reconstruct_decision_event(&row).expect("fixture event must reconstruct");
-    let message =
-        decision_event_signature_message(event, tenant_id.to_owned(), occurred_at, EVENT_KEY_ID)
-            .expect("fixture signature message must be valid");
+    let message = stored_decision_event_signature_message(&row, EVENT_KEY_ID)
+        .expect("fixture signature message must be valid");
     let signature = event_signing_key(tenant_id).sign(&message);
     serde_json::to_string(
         &decision_event_signature_value(EVENT_KEY_ID, signature.as_ref())

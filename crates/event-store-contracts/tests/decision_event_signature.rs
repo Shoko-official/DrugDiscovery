@@ -14,6 +14,7 @@ use bioworld_event_store_contracts::{
     DecisionEventMetadata, DecisionEventVerificationClock, DecisionEventVerificationError,
     DecisionEventVerifier, EventProjectionError, decision_event_signature_message,
     decision_event_signature_value, parse_stored_decision_payload, project_decision_event,
+    reconstruct_decision_event, stored_decision_event_signature_message,
 };
 use chrono::{DateTime, Timelike as _, Utc};
 use serde_json::json;
@@ -333,6 +334,39 @@ fn rejects_mutation_of_each_stored_message_field() {
     let mut payload_sha256 = signed_row(&key_pair);
     payload_sha256.payload_sha256 = "0".repeat(64);
     rejected(payload_sha256);
+}
+
+#[test]
+fn signs_valid_historical_rows_without_reapplying_new_write_policy() {
+    let now = 1_800_000_000;
+    let key_pair = key_pair();
+    let mut row = signed_row(&key_pair);
+    let payload = row.payload.as_object_mut().unwrap();
+    for field in [
+        "ood_status",
+        "ood_detector",
+        "prediction_interval",
+        "prediction_positions",
+        "decision_criterion",
+    ] {
+        payload.remove(field);
+    }
+    refresh_payload_hash(&mut row);
+    row.signature = json!({"placeholder":true}).as_object().unwrap().clone();
+    let expected = reconstruct_decision_event(&row).unwrap();
+    let message = stored_decision_event_signature_message(&row, KEY_ID).unwrap();
+    row.signature = decision_event_signature_value(KEY_ID, key_pair.sign(&message).as_ref())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    let verifier = DecisionEventVerifier::try_from_snapshot_with_clock(
+        &snapshot(&key_pair, now, "trusted"),
+        TestClock::new(now),
+    )
+    .unwrap();
+
+    assert_eq!(verifier.verify_and_reconstruct(&row).unwrap(), expected);
 }
 
 #[test]
