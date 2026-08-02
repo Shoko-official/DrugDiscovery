@@ -27,6 +27,7 @@ pub const MAX_DECISION_GRPC_CONNECTION_AGE_GRACE: Duration = Duration::from_secs
 pub const MAX_DECISION_GRPC_SHUTDOWN_GRACE: Duration = Duration::from_secs(330);
 
 const DEFAULT_ACTIVE_CONNECTIONS: usize = 128;
+const DEFAULT_ACTIVE_CONNECTIONS_PER_PEER: usize = 32;
 const DEFAULT_STREAMS_PER_CONNECTION: u32 = 32;
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_TRANSPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -40,6 +41,7 @@ const PRIVATE_KEY_LABEL: &str = "PRIVATE KEY";
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct DecisionGrpcServerLimits {
     max_active_connections: usize,
+    max_active_connections_per_peer: usize,
     max_concurrent_streams_per_connection: u32,
     tls_handshake_timeout: Duration,
     transport_request_timeout: Duration,
@@ -53,6 +55,7 @@ impl DecisionGrpcServerLimits {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         max_active_connections: usize,
+        max_active_connections_per_peer: usize,
         max_concurrent_streams_per_connection: u32,
         tls_handshake_timeout: Duration,
         transport_request_timeout: Duration,
@@ -60,7 +63,8 @@ impl DecisionGrpcServerLimits {
         connection_age_grace: Duration,
         shutdown_grace: Duration,
     ) -> Result<Self, InvalidDecisionGrpcServerLimits> {
-        if !(1..=MAX_DECISION_GRPC_ACTIVE_CONNECTIONS).contains(&max_active_connections)
+        if !(2..=MAX_DECISION_GRPC_ACTIVE_CONNECTIONS).contains(&max_active_connections)
+            || !(1..max_active_connections).contains(&max_active_connections_per_peer)
             || !(1..=MAX_DECISION_GRPC_STREAMS_PER_CONNECTION)
                 .contains(&max_concurrent_streams_per_connection)
             || max_active_connections
@@ -84,6 +88,7 @@ impl DecisionGrpcServerLimits {
 
         Ok(Self {
             max_active_connections,
+            max_active_connections_per_peer,
             max_concurrent_streams_per_connection,
             tls_handshake_timeout,
             transport_request_timeout,
@@ -96,6 +101,11 @@ impl DecisionGrpcServerLimits {
     /// Returns the active TCP connection cap.
     pub fn max_active_connections(self) -> usize {
         self.max_active_connections
+    }
+
+    /// Returns the active TCP connection cap for one immediate transport peer.
+    pub fn max_active_connections_per_peer(self) -> usize {
+        self.max_active_connections_per_peer
     }
 
     /// Returns the concurrent HTTP/2 stream cap for one connection.
@@ -133,6 +143,7 @@ impl Default for DecisionGrpcServerLimits {
     fn default() -> Self {
         Self {
             max_active_connections: DEFAULT_ACTIVE_CONNECTIONS,
+            max_active_connections_per_peer: DEFAULT_ACTIVE_CONNECTIONS_PER_PEER,
             max_concurrent_streams_per_connection: DEFAULT_STREAMS_PER_CONNECTION,
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             transport_request_timeout: DEFAULT_TRANSPORT_REQUEST_TIMEOUT,

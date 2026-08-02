@@ -18,6 +18,7 @@ zeroize.workspace = true
 [dev-dependencies]
 bioworld-contracts = { path = "../contracts" }
 bioworld-decision-query = { path = "../decision-query" }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
 prost.workspace = true
 rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "zeroize"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

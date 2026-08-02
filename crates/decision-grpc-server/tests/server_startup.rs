@@ -22,6 +22,7 @@ fn tls_identity() -> DecisionGrpcTlsIdentity {
 fn limits() -> DecisionGrpcServerLimits {
     DecisionGrpcServerLimits::try_new(
         4,
+        2,
         4,
         Duration::from_secs(1),
         Duration::from_secs(1),

@@ -16,6 +16,7 @@ use tonic::{Extensions, Request, Response, Status, metadata::MetadataMap};
 
 use crate::{
     TenantScope, TenantScopedGetDecisionExecutor, TenantScopedWatchDecisionExecutor, get_decision,
+    peer::{DecisionGrpcConnectInfo, DecisionGrpcPeerKey},
     watch_runtime::{DecisionGrpcWatchRuntime, WorkerDeadline, watch_encoding_limit},
 };
 
@@ -83,6 +84,13 @@ impl<'request> TenantAuthenticationContext<'request> {
 
     pub fn extensions(&self) -> &'request Extensions {
         self.extensions
+    }
+
+    pub fn peer(&self) -> Option<DecisionGrpcPeerKey> {
+        self.extensions
+            .get::<DecisionGrpcConnectInfo>()
+            .copied()
+            .map(DecisionGrpcConnectInfo::peer)
     }
 }
 

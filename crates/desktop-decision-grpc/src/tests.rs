@@ -190,6 +190,7 @@ async fn start_server(authenticator: ExactAuthenticator, executor: ExactExecutor
     .unwrap();
     let limits = DecisionGrpcServerLimits::try_new(
         4,
+        2,
         4,
         Duration::from_millis(250),
         Duration::from_secs(2),

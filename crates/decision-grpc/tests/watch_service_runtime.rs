@@ -94,6 +94,17 @@ struct RecordingAuthenticator {
     authority_for: Duration,
 }
 
+struct CapacityAuthenticator;
+
+impl TenantAuthenticator for CapacityAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        _context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        Box::pin(async { Err(AuthenticateTenantError::capacity_exhausted()) })
+    }
+}
+
 impl TenantAuthenticator for RecordingAuthenticator {
     fn authenticate_tenant<'a>(
         &'a self,
@@ -434,6 +445,65 @@ async fn activated_watch_uses_authenticated_tenant_and_returns_its_first_event()
             page_size: 1,
         }]
     );
+}
+
+#[tokio::test]
+async fn authentication_capacity_rejection_never_reaches_get_or_watch_executors() {
+    let get_observations = Arc::new(Mutex::new(Vec::new()));
+    let watch_observations = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let service = DecisionGrpcService::try_new_with_watch(
+        CapacityAuthenticator,
+        RecordingExecutor {
+            get_observations: Arc::clone(&get_observations),
+            observations: Arc::clone(&watch_observations),
+            sources: Mutex::new(VecDeque::from([RecordingReplaySource {
+                reads: Arc::clone(&reads),
+                behavior: Some(ReadBehavior::Page(DecisionReplaySourcePage::new(
+                    vec![event()],
+                    None,
+                ))),
+            }])),
+        },
+        DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(5)).unwrap(),
+        DecisionGrpcWatchConfig::try_new(1, 1).unwrap(),
+    )
+    .unwrap();
+
+    let watch_result = GeneratedDecisionService::watch_decision(
+        &service,
+        Request::new(WatchDecisionRequest {
+            decision_id: DECISION_ID.to_owned(),
+        }),
+    )
+    .await;
+    let watch_status = match watch_result {
+        Ok(_) => panic!("authentication capacity must reject Watch before execution"),
+        Err(status) => status,
+    };
+    assert_public_status(
+        &watch_status,
+        Code::ResourceExhausted,
+        "authentication service is at capacity",
+    );
+
+    let get_status = GeneratedDecisionService::get_decision(
+        &service,
+        Request::new(GetDecisionRequest {
+            decision_id: DECISION_ID.to_owned(),
+        }),
+    )
+    .await
+    .expect_err("authentication capacity must reject Get before execution");
+    assert_public_status(
+        &get_status,
+        Code::ResourceExhausted,
+        "authentication service is at capacity",
+    );
+
+    assert!(get_observations.lock().unwrap().is_empty());
+    assert!(watch_observations.lock().unwrap().is_empty());
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

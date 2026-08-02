@@ -512,7 +512,8 @@ fn runtime_config_with_watch(
             "required_scope": JWT_REQUIRED_SCOPE,
             "jwks_file": path_text(&jwks_file),
             "jwks_valid_until": now + 600,
-            "max_concurrent_verifications": 2
+            "max_concurrent_verifications": 2,
+            "max_concurrent_verifications_per_peer": 1
         },
         "postgres": {
             "host": POSTGRES_HOST,
@@ -530,6 +531,7 @@ fn runtime_config_with_watch(
         },
         "transport": {
             "max_active_connections": 2,
+            "max_active_connections_per_peer": 1,
             "max_concurrent_streams_per_connection": 4,
             "tls_handshake_timeout_seconds": 2,
             "request_timeout_seconds": 5,

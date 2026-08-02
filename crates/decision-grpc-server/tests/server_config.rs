@@ -45,6 +45,7 @@ fn valid_shape_identity() -> DecisionGrpcTlsIdentity {
 fn accepts_exact_server_limit_boundaries() {
     let limits = DecisionGrpcServerLimits::try_new(
         MAX_DECISION_GRPC_ACTIVE_CONNECTIONS,
+        MAX_DECISION_GRPC_ACTIVE_CONNECTIONS - 1,
         4,
         MAX_DECISION_GRPC_TLS_HANDSHAKE_TIMEOUT,
         MAX_DECISION_GRPC_TRANSPORT_REQUEST_TIMEOUT,
@@ -57,6 +58,10 @@ fn accepts_exact_server_limit_boundaries() {
     assert_eq!(
         limits.max_active_connections(),
         MAX_DECISION_GRPC_ACTIVE_CONNECTIONS
+    );
+    assert_eq!(
+        limits.max_active_connections_per_peer(),
+        MAX_DECISION_GRPC_ACTIVE_CONNECTIONS - 1
     );
     assert_eq!(limits.max_concurrent_streams_per_connection(), 4);
     assert_eq!(
@@ -79,6 +84,7 @@ fn accepts_exact_server_limit_boundaries() {
 
     let stream_limits = DecisionGrpcServerLimits::try_new(
         16,
+        8,
         MAX_DECISION_GRPC_STREAMS_PER_CONNECTION,
         MAX_DECISION_GRPC_TLS_HANDSHAKE_TIMEOUT,
         MAX_DECISION_GRPC_TRANSPORT_REQUEST_TIMEOUT,
@@ -99,6 +105,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
         DecisionGrpcServerLimits::try_new(
             0,
             1,
+            1,
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -108,6 +115,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
         DecisionGrpcServerLimits::try_new(
             MAX_DECISION_GRPC_ACTIVE_CONNECTIONS + 1,
             1,
+            1,
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -115,6 +123,37 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
+            0,
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ),
+        DecisionGrpcServerLimits::try_new(
+            2,
+            2,
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ),
+        DecisionGrpcServerLimits::try_new(
+            2,
+            3,
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ),
+        DecisionGrpcServerLimits::try_new(
+            2,
             1,
             0,
             Duration::from_secs(1),
@@ -124,6 +163,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             MAX_DECISION_GRPC_STREAMS_PER_CONNECTION + 1,
             Duration::from_secs(1),
@@ -134,6 +174,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
         ),
         DecisionGrpcServerLimits::try_new(
             129,
+            1,
             32,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -142,6 +183,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(3),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::ZERO,
@@ -151,6 +193,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             MAX_DECISION_GRPC_TLS_HANDSHAKE_TIMEOUT + Duration::from_nanos(1),
@@ -160,6 +203,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -169,6 +213,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -178,6 +223,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             MAX_DECISION_GRPC_SHUTDOWN_GRACE,
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -187,6 +233,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -196,6 +243,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -205,6 +253,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -214,6 +263,7 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(2),
         ),
         DecisionGrpcServerLimits::try_new(
+            2,
             1,
             1,
             Duration::from_secs(1),
@@ -221,6 +271,16 @@ fn rejects_unsafe_server_limits_with_a_fixed_error() {
             Duration::from_secs(1),
             Duration::from_secs(1),
             MAX_DECISION_GRPC_SHUTDOWN_GRACE + Duration::from_nanos(1),
+        ),
+        DecisionGrpcServerLimits::try_new(
+            2,
+            1,
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
         ),
     ];
 
@@ -239,6 +299,7 @@ fn defaults_are_secure_and_in_range() {
     let limits = DecisionGrpcServerLimits::default();
 
     assert!(limits.max_active_connections() <= MAX_DECISION_GRPC_ACTIVE_CONNECTIONS);
+    assert!(limits.max_active_connections_per_peer() < limits.max_active_connections());
     assert!(
         limits.max_concurrent_streams_per_connection() <= MAX_DECISION_GRPC_STREAMS_PER_CONNECTION
     );
@@ -256,6 +317,7 @@ fn defaults_are_secure_and_in_range() {
 #[test]
 fn allows_shutdown_to_force_a_request_before_its_outer_timeout() {
     let limits = DecisionGrpcServerLimits::try_new(
+        2,
         1,
         1,
         Duration::from_secs(1),

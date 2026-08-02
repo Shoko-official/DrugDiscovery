@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     future::{Future, pending, poll_fn},
+    net::SocketAddr,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,8 +23,8 @@ use bioworld_contracts::v2::{
     decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
-    DecisionGrpcService, DecisionGrpcServiceConfig, TenantScope, TenantScopedGetDecisionExecutor,
-    TenantScopedGetDecisionFuture,
+    DecisionGrpcConnectInfo, DecisionGrpcPeerKey, DecisionGrpcService, DecisionGrpcServiceConfig,
+    TenantScope, TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_grpc_jwt::{
     BIOWORLD_TENANT_CLAIM, JwtClock, JwtTenantAuthenticator, JwtTenantAuthenticatorConfig,
@@ -83,6 +84,60 @@ struct BlockingClock {
     calls: Arc<AtomicU64>,
     gate: BlockingPoolGate,
     now: u64,
+}
+
+#[derive(Clone)]
+struct FirstVerificationBlockingClock {
+    calls: Arc<AtomicU64>,
+    gate: BlockingPoolGate,
+    now: u64,
+}
+
+#[derive(Clone)]
+struct PanicOnceClock {
+    calls: Arc<AtomicU64>,
+    now: u64,
+}
+
+impl PanicOnceClock {
+    fn new(now: u64) -> Self {
+        Self {
+            calls: Arc::new(AtomicU64::new(0)),
+            now,
+        }
+    }
+}
+
+impl JwtClock for PanicOnceClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            panic!("verification clock failed");
+        }
+        Some(self.now)
+    }
+}
+
+impl FirstVerificationBlockingClock {
+    fn new(now: u64, gate: BlockingPoolGate) -> Self {
+        Self {
+            calls: Arc::new(AtomicU64::new(0)),
+            gate,
+            now,
+        }
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl JwtClock for FirstVerificationBlockingClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.gate.block();
+        }
+        Some(self.now)
+    }
 }
 
 #[derive(Clone)]
@@ -171,6 +226,17 @@ async fn wait_for_gate(gate: &BlockingPoolGate) {
         assert!(
             Instant::now() < deadline,
             "blocking worker did not enter the test gate"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_clock_calls(calls: &AtomicU64, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) < expected {
+        assert!(
+            Instant::now() < deadline,
+            "blocking workers did not enter the test clock"
         );
         tokio::task::yield_now().await;
     }
@@ -406,12 +472,14 @@ fn now() -> u64 {
 }
 
 fn config(now: u64, max_concurrent_verifications: usize) -> JwtTenantAuthenticatorConfig {
+    let max_concurrent_verifications = max_concurrent_verifications.max(2);
     JwtTenantAuthenticatorConfig::try_new(
         ISSUER.to_owned(),
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         now + 3_600,
         max_concurrent_verifications,
+        max_concurrent_verifications - 1,
     )
     .unwrap()
 }
@@ -470,12 +538,25 @@ fn request_with_token(token: &str) -> Request<GetDecisionRequest> {
 }
 
 fn request_with_authorization(value: &str) -> Request<GetDecisionRequest> {
+    request_with_authorization_from(value, "127.0.0.1:41000".parse().unwrap())
+}
+
+fn request_with_token_from(token: &str, peer: SocketAddr) -> Request<GetDecisionRequest> {
+    request_with_authorization_from(&format!("Bearer {token}"), peer)
+}
+
+fn request_with_authorization_from(value: &str, peer: SocketAddr) -> Request<GetDecisionRequest> {
     let mut request = Request::new(GetDecisionRequest {
         decision_id: DECISION_ID.to_owned(),
     });
     request
         .metadata_mut()
         .insert("authorization", value.parse().unwrap());
+    request
+        .extensions_mut()
+        .insert(DecisionGrpcConnectInfo::new(
+            DecisionGrpcPeerKey::from_socket_addr(peer),
+        ));
     request
 }
 
@@ -545,6 +626,7 @@ fn rejects_issuer_without_an_https_authority() {
         REQUIRED_SCOPE.to_owned(),
         now() + 3_600,
         2,
+        1,
     );
 
     assert!(result.is_err());
@@ -560,6 +642,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             "http://identity.bioworld.test".to_owned(),
@@ -567,6 +650,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             "https://identity.bioworld.test:not-a-port".to_owned(),
@@ -574,6 +658,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             ISSUER.to_owned(),
@@ -581,6 +666,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             ISSUER.to_owned(),
@@ -588,6 +674,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             "decision:read decision:write".to_owned(),
             now + 3_600,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             ISSUER.to_owned(),
@@ -595,6 +682,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             0,
             2,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             ISSUER.to_owned(),
@@ -602,6 +690,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             0,
+            1,
         ),
         JwtTenantAuthenticatorConfig::try_new(
             ISSUER.to_owned(),
@@ -609,6 +698,31 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             now + 3_600,
             65,
+            1,
+        ),
+        JwtTenantAuthenticatorConfig::try_new(
+            ISSUER.to_owned(),
+            AUDIENCE.to_owned(),
+            REQUIRED_SCOPE.to_owned(),
+            now + 3_600,
+            2,
+            0,
+        ),
+        JwtTenantAuthenticatorConfig::try_new(
+            ISSUER.to_owned(),
+            AUDIENCE.to_owned(),
+            REQUIRED_SCOPE.to_owned(),
+            now + 3_600,
+            2,
+            2,
+        ),
+        JwtTenantAuthenticatorConfig::try_new(
+            ISSUER.to_owned(),
+            AUDIENCE.to_owned(),
+            REQUIRED_SCOPE.to_owned(),
+            now + 3_600,
+            2,
+            3,
         ),
     ];
     for result in invalid_configs {
@@ -632,6 +746,7 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
             REQUIRED_SCOPE.to_owned(),
             valid_until,
             2,
+            1,
         )
         .unwrap();
         assert!(
@@ -697,6 +812,46 @@ fn rejects_unsafe_configuration_and_jwk_sets_with_fixed_errors() {
 }
 
 #[tokio::test]
+async fn missing_trusted_peer_fails_closed_before_verification_work() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = FixedClock::new(FIXED_NOW);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        2,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+    let calls_before_request = clock.calls();
+    let mut request = Request::new(GetDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    });
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+
+    let status = GeneratedDecisionService::get_decision(&service, request)
+        .await
+        .expect_err("untrusted forwarding metadata must not establish a peer");
+
+    assert_unavailable(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert_eq!(clock.calls(), calls_before_request);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn rejects_noncanonical_duplicate_scope_values() {
     let now = now();
     let key = TestKey::generate(KEY_ID);
@@ -727,6 +882,7 @@ fn token_expiry_bounds_authorized_execution_before_the_jwks_snapshot() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 60,
+        2,
         1,
     )
     .unwrap();
@@ -801,6 +957,7 @@ fn jwks_expiry_bounds_authorized_execution_before_the_token() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 30,
+        2,
         1,
     )
     .unwrap();
@@ -876,6 +1033,7 @@ async fn rejects_a_token_that_expires_during_verification() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -904,6 +1062,7 @@ async fn reports_a_jwks_snapshot_expiring_during_verification_as_unavailable() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         SNAPSHOT_EXPIRY,
+        2,
         1,
     )
     .unwrap();
@@ -931,6 +1090,7 @@ async fn reports_completion_clock_failure_as_fixed_unavailable_error() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -959,6 +1119,7 @@ async fn rejects_token_authority_too_close_for_conservative_conversion() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -987,6 +1148,7 @@ async fn reports_jwks_authority_too_close_for_conservative_conversion_as_unavail
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         SNAPSHOT_EXPIRY,
+        2,
         1,
     )
     .unwrap();
@@ -1014,6 +1176,7 @@ fn a_backward_completion_clock_cannot_extend_authority() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1090,6 +1253,7 @@ fn a_stalled_verification_clock_cannot_pause_authority_time() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1170,6 +1334,7 @@ async fn rejects_a_key_snapshot_at_its_exact_expiry() {
         REQUIRED_SCOPE.to_owned(),
         SNAPSHOT_EXPIRY,
         2,
+        1,
     )
     .unwrap();
     let authenticator =
@@ -1205,6 +1370,7 @@ async fn reports_clock_failure_as_unavailable_without_execution() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1233,6 +1399,7 @@ fn cancelling_queued_crypto_prevents_orphan_verification() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1296,6 +1463,7 @@ fn reports_verification_saturation_as_capacity_exhaustion() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1344,6 +1512,189 @@ fn reports_verification_saturation_as_capacity_exhaustion() {
     assert!(tenants.lock().unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_verification_limit_bounds_distinct_peers_and_recovers() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let gate = BlockingPoolGate::new();
+    let release = GateRelease(gate.clone());
+    let clock = BlockingClock::new(FIXED_NOW, gate);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        2,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let tenants = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(DecisionGrpcService::new(
+        authenticator,
+        RecordingExecutor {
+            tenants: Arc::clone(&tenants),
+        },
+        DecisionGrpcServiceConfig::try_new(4, Duration::from_secs(2)).unwrap(),
+    ));
+    let peer_a: SocketAddr = "127.0.0.2:41000".parse().unwrap();
+    let peer_b: SocketAddr = "127.0.0.3:41000".parse().unwrap();
+    let peer_c: SocketAddr = "127.0.0.4:41000".parse().unwrap();
+
+    let first_service = Arc::clone(&service);
+    let first_token = token.clone();
+    let first = tokio::spawn(async move {
+        GeneratedDecisionService::get_decision(
+            first_service.as_ref(),
+            request_with_token_from(&first_token, peer_a),
+        )
+        .await
+    });
+    let second_service = Arc::clone(&service);
+    let second_token = token.clone();
+    let second = tokio::spawn(async move {
+        GeneratedDecisionService::get_decision(
+            second_service.as_ref(),
+            request_with_token_from(&second_token, peer_b),
+        )
+        .await
+    });
+    wait_for_clock_calls(clock.calls.as_ref(), 3).await;
+
+    let calls_before_rejection = clock.calls.load(Ordering::SeqCst);
+    let status = GeneratedDecisionService::get_decision(
+        service.as_ref(),
+        request_with_token_from(&token, peer_c),
+    )
+    .await
+    .expect_err("global verification saturation must reject a distinct peer");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert_eq!(status.message(), "authentication service is at capacity");
+    assert!(status.details().is_empty());
+    assert!(status.metadata().is_empty());
+    assert_eq!(clock.calls.load(Ordering::SeqCst), calls_before_rejection);
+
+    release.0.release();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    GeneratedDecisionService::get_decision(
+        service.as_ref(),
+        request_with_token_from(&token, peer_c),
+    )
+    .await
+    .expect("global verification capacity must recover");
+    assert_eq!(tenants.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_verification_peer_does_not_block_another_peer() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let gate = BlockingPoolGate::new();
+    let release = GateRelease(gate.clone());
+    let clock = FirstVerificationBlockingClock::new(FIXED_NOW, gate.clone());
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        2,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+    let service = Arc::new(service);
+    let peer_a: SocketAddr = "127.0.0.2:41000".parse().unwrap();
+    let peer_b: SocketAddr = "127.0.0.3:41000".parse().unwrap();
+    let first_service = Arc::clone(&service);
+    let first_token = token.clone();
+    let first = tokio::spawn(async move {
+        GeneratedDecisionService::get_decision(
+            first_service.as_ref(),
+            request_with_token_from(&first_token, peer_a),
+        )
+        .await
+    });
+    wait_for_gate(&gate).await;
+
+    let calls_before_rejection = clock.calls();
+    let mut same_peer_request = request_with_token_from(&token, peer_a);
+    same_peer_request
+        .metadata_mut()
+        .insert("x-forwarded-for", "127.0.0.3".parse().unwrap());
+    let status = GeneratedDecisionService::get_decision(service.as_ref(), same_peer_request)
+        .await
+        .expect_err("a saturated peer must fail before crypto work");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert_eq!(status.message(), "authentication service is at capacity");
+    assert!(status.details().is_empty());
+    assert!(status.metadata().is_empty());
+    assert_eq!(clock.calls(), calls_before_rejection);
+    assert!(tenants.lock().unwrap().is_empty());
+
+    GeneratedDecisionService::get_decision(
+        service.as_ref(),
+        request_with_token_from(&token, peer_b),
+    )
+    .await
+    .expect("another peer must retain verification capacity");
+    assert_eq!(tenants.lock().unwrap().len(), 1);
+
+    release.0.release();
+    first.await.unwrap().unwrap();
+    GeneratedDecisionService::get_decision(
+        service.as_ref(),
+        request_with_token_from(&token, peer_a),
+    )
+    .await
+    .expect("peer capacity must recover after blocking verification completes");
+    assert_eq!(tenants.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn blocking_worker_panic_restores_peer_and_global_capacity() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        2,
+        1,
+    )
+    .unwrap();
+    let authenticator = JwtTenantAuthenticator::try_from_jwks_with_clock(
+        config,
+        &jwks(&[&key]),
+        PanicOnceClock::new(FIXED_NOW),
+    )
+    .unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("blocking worker panic must fail closed");
+    assert_unavailable(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+
+    GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect("same peer must recover after the panicking worker exits");
+    assert_eq!(*tenants.lock().unwrap(), vec![TENANT_ID.to_owned()]);
+}
+
 #[test]
 fn cancelling_running_crypto_retains_capacity_until_work_ends() {
     const FIXED_NOW: u64 = 1_000_000;
@@ -1356,6 +1707,7 @@ fn cancelling_running_crypto_retains_capacity_until_work_ends() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1418,6 +1770,7 @@ fn service_timeout_keeps_running_crypto_bounded_until_completion() {
         AUDIENCE.to_owned(),
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
+        2,
         1,
     )
     .unwrap();
@@ -1738,6 +2091,7 @@ async fn accepts_profile_boundaries_and_overlapping_rotation_keys() {
         REQUIRED_SCOPE.to_owned(),
         FIXED_NOW + 3_600,
         2,
+        1,
     )
     .unwrap();
     let authenticator = JwtTenantAuthenticator::try_from_jwks_with_clock(
