@@ -890,9 +890,11 @@ async fn consumes_two_authenticated_events_in_order_then_stays_at_eof() {
         .expect("second event read must succeed")
         .expect("second event must exist");
 
-    assert_eq!(first.event_id().to_string(), FIRST_EVENT_ID);
-    assert_eq!(first.decision().aggregate_version().get(), 1);
-    assert_eq!(first.decision().decision().id().to_string(), DECISION_ID);
+    let (first_event_id, first_decision) = first.into_parts();
+
+    assert_eq!(first_event_id.to_string(), FIRST_EVENT_ID);
+    assert_eq!(first_decision.aggregate_version().get(), 1);
+    assert_eq!(first_decision.decision().id().to_string(), DECISION_ID);
     assert_eq!(second.event_id().to_string(), SECOND_EVENT_ID);
     assert_eq!(second.decision().aggregate_version().get(), 2);
     assert_eq!(second.decision().decision().id().to_string(), DECISION_ID);
@@ -1253,6 +1255,74 @@ async fn pending_next_event_reaches_absolute_deadline_drops_body_and_restores_ca
     let recovered = guarded(client.watch_decision(DECISION_ID, limits))
         .await
         .expect("deadline termination must restore global and Watch capacity");
+    assert_two_events_then_eof(recovered).await;
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(watch_calls.load(Ordering::SeqCst), 2);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn aborting_task_during_stream_read_drops_body_and_restores_capacity() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let watch_calls = Arc::new(AtomicUsize::new(0));
+    let (body_entered_tx, body_entered_rx) = oneshot::channel();
+    let (body_dropped_tx, body_dropped_rx) = oneshot::channel();
+    let server = start_server_with_responses(
+        Arc::clone(&watch_calls),
+        Arc::new(AtomicUsize::new(0)),
+        Duration::ZERO,
+        None,
+        Some(ObservedPendingResponse {
+            entered: body_entered_tx,
+            dropped: body_dropped_tx,
+        }),
+        VecDeque::new(),
+    )
+    .await;
+    let client = guarded(DecisionGrpcClient::connect(
+        server.client_config_with_limits(Duration::from_secs(2), 2),
+        StaticAccessTokenProvider {
+            calls: Arc::clone(&provider_calls),
+        },
+    ))
+    .await
+    .expect("trusted TLS client must connect");
+    let limits = DecisionGrpcWatchLimits::try_new(Duration::from_secs(2), 2)
+        .expect("test Watch limits must be valid");
+    let mut watch = guarded(client.watch_decision(DECISION_ID, limits))
+        .await
+        .expect("pending-body Watch must open");
+    let (task_started_tx, task_started_rx) = oneshot::channel();
+    let pending_task = tokio::spawn(async move {
+        let _ = task_started_tx.send(());
+        let result = watch.next_event().await;
+        panic!("pending stream read completed before task abort: {result:?}");
+    });
+
+    guarded(task_started_rx)
+        .await
+        .expect("next_event task must start");
+    guarded(body_entered_rx)
+        .await
+        .expect("server must enter its pending response body");
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    pending_task.abort();
+    let cancellation = guarded(pending_task)
+        .await
+        .expect_err("pending next_event task must be cancelled");
+    assert!(cancellation.is_cancelled());
+    guarded(body_dropped_rx)
+        .await
+        .expect("server must observe the cancelled response body");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(watch_calls.load(Ordering::SeqCst), 1);
+
+    let recovered = guarded(client.watch_decision(DECISION_ID, limits))
+        .await
+        .expect("task cancellation must restore global and Watch capacity");
     assert_two_events_then_eof(recovered).await;
     assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
     assert_eq!(watch_calls.load(Ordering::SeqCst), 2);

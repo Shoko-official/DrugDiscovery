@@ -621,3 +621,19 @@ fn parse_canonical_uuid(value: &str) -> Option<Uuid> {
 fn map_watch_request_error(_error: WatchDecisionRequestError) -> DecisionGrpcClientError {
     DecisionGrpcClientError::InvalidDecisionId
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{WatchCancellation, WatchTerminal, cancellation_terminal};
+    use crate::DecisionGrpcClientError;
+
+    #[test]
+    fn finish_cancellation_preserves_the_exact_terminal_error() {
+        let expected = WatchTerminal::Error(DecisionGrpcClientError::PermissionDenied);
+
+        assert_eq!(
+            cancellation_terminal(Some(WatchCancellation::Finish(expected))),
+            expected,
+        );
+    }
+}
