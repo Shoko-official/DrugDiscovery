@@ -34,7 +34,8 @@ fn valid_control_value() -> Value {
             "required_scope": "decision.read",
             "jwks_file": sensitive_path("jwks.json"),
             "jwks_valid_until": 4_102_444_800_u64,
-            "max_concurrent_verifications": 32
+            "max_concurrent_verifications": 32,
+            "max_concurrent_verifications_per_peer": 8
         },
         "postgres": {
             "host": "database.example.test",
@@ -52,6 +53,7 @@ fn valid_control_value() -> Value {
         },
         "transport": {
             "max_active_connections": 128,
+            "max_active_connections_per_peer": 32,
             "max_concurrent_streams_per_connection": 32,
             "tls_handshake_timeout_seconds": 5,
             "request_timeout_seconds": 300,
@@ -132,6 +134,84 @@ impl TemporaryFile {
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn requires_peer_fair_admission_limits() {
+    for (section, field) in [
+        ("transport", "max_active_connections_per_peer"),
+        ("jwt", "max_concurrent_verifications_per_peer"),
+    ] {
+        let mut control = valid_control_value();
+        control[section]
+            .as_object_mut()
+            .expect("control section must be an object")
+            .remove(field);
+
+        assert!(
+            DecisionServerConfig::try_from_json(
+                &serde_json::to_vec(&control).expect("test control serialization")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn rejects_per_peer_limits_not_strictly_below_global_limits() {
+    for per_peer in [0, 128, 129] {
+        let mut control = valid_control_value();
+        control["transport"]["max_active_connections_per_peer"] = json!(per_peer);
+
+        assert!(
+            DecisionServerConfig::try_from_json(
+                &serde_json::to_vec(&control).expect("test control serialization")
+            )
+            .is_err()
+        );
+    }
+
+    for per_peer in [0, 32, 33] {
+        let mut control = valid_control_value();
+        control["jwt"]["max_concurrent_verifications_per_peer"] = json!(per_peer);
+
+        assert!(
+            DecisionServerConfig::try_from_json(
+                &serde_json::to_vec(&control).expect("test control serialization")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn reserves_service_capacity_beyond_one_peers_jwt_verifications() {
+    let control_with_per_peer = |per_peer| {
+        let mut control = valid_control_value();
+        control["jwt"]["max_concurrent_verifications"] = json!(16);
+        control["jwt"]["max_concurrent_verifications_per_peer"] = json!(per_peer);
+        control["service"]["max_in_flight"] = json!(8);
+        control["postgres"]["pool_max_size"] = json!(8);
+        control
+    };
+
+    let reserved = control_with_per_peer(7);
+    assert!(
+        DecisionServerConfig::try_from_json(
+            &serde_json::to_vec(&reserved).expect("test control serialization")
+        )
+        .is_ok()
+    );
+
+    for per_peer in [8, 9] {
+        let control = control_with_per_peer(per_peer);
+        assert!(
+            DecisionServerConfig::try_from_json(
+                &serde_json::to_vec(&control).expect("test control serialization")
+            )
+            .is_err()
+        );
     }
 }
 

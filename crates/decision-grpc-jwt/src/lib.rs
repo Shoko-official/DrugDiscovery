@@ -1,24 +1,24 @@
 #![deny(unsafe_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     error::Error,
     fmt,
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_decision_grpc::{
-    AuthenticateTenantError, AuthenticateTenantFuture, TenantAuthenticationContext,
-    TenantAuthenticator, TenantAuthority,
+    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcPeerKey,
+    TenantAuthenticationContext, TenantAuthenticator, TenantAuthority,
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use tokio::{
     runtime::Handle,
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::{JoinError, JoinHandle},
 };
 
@@ -49,6 +49,7 @@ pub struct JwtTenantAuthenticatorConfig {
     required_scope: Box<str>,
     jwks_valid_until: u64,
     max_concurrent_verifications: NonZeroUsize,
+    max_concurrent_verifications_per_peer: NonZeroUsize,
 }
 
 impl JwtTenantAuthenticatorConfig {
@@ -56,17 +57,23 @@ impl JwtTenantAuthenticatorConfig {
     ///
     /// The issuer must be an HTTPS identifier. The key snapshot expiry is checked
     /// against the authenticator clock during construction and may be at most 24
-    /// hours in the future. Verification concurrency must be between 1 and 64.
+    /// hours in the future. Global verification concurrency must be between 2 and 64,
+    /// while the per-peer limit must be positive and strictly lower than the global limit.
     pub fn try_new(
         issuer: String,
         audience: String,
         required_scope: String,
         jwks_valid_until: u64,
         max_concurrent_verifications: usize,
+        max_concurrent_verifications_per_peer: usize,
     ) -> Result<Self, InvalidJwtTenantAuthenticatorConfig> {
         let max_concurrent_verifications = NonZeroUsize::new(max_concurrent_verifications)
-            .filter(|value| value.get() <= MAX_CONCURRENT_VERIFICATIONS)
+            .filter(|value| (2..=MAX_CONCURRENT_VERIFICATIONS).contains(&value.get()))
             .ok_or(InvalidJwtTenantAuthenticatorConfig)?;
+        let max_concurrent_verifications_per_peer =
+            NonZeroUsize::new(max_concurrent_verifications_per_peer)
+                .filter(|value| value.get() < max_concurrent_verifications.get())
+                .ok_or(InvalidJwtTenantAuthenticatorConfig)?;
         if !valid_https_identifier(&issuer, MAX_ISSUER_BYTES)
             || !valid_identifier(&audience, MAX_AUDIENCE_BYTES)
             || !valid_scope_token(&required_scope)
@@ -81,6 +88,7 @@ impl JwtTenantAuthenticatorConfig {
             required_scope: required_scope.into_boxed_str(),
             jwks_valid_until,
             max_concurrent_verifications,
+            max_concurrent_verifications_per_peer,
         })
     }
 }
@@ -122,6 +130,7 @@ impl JwtClock for SystemJwtClock {
 pub struct JwtTenantAuthenticator {
     verifier: Arc<JwtVerifier>,
     admission: Arc<Semaphore>,
+    peer_admission: Arc<PeerAdmission>,
 }
 
 impl JwtTenantAuthenticator {
@@ -160,6 +169,9 @@ impl JwtTenantAuthenticator {
         }
         let keys = parse_jwks(jwks)?;
         let admission = Arc::new(Semaphore::new(config.max_concurrent_verifications.get()));
+        let peer_admission = Arc::new(PeerAdmission::new(
+            config.max_concurrent_verifications_per_peer.get(),
+        ));
 
         Ok(Self {
             verifier: Arc::new(JwtVerifier {
@@ -168,6 +180,7 @@ impl JwtTenantAuthenticator {
                 clock: Arc::new(clock),
             }),
             admission,
+            peer_admission,
         })
     }
 }
@@ -177,16 +190,29 @@ impl TenantAuthenticator for JwtTenantAuthenticator {
         &'a self,
         context: TenantAuthenticationContext<'a>,
     ) -> AuthenticateTenantFuture<'a> {
-        let token = match bearer_token(context) {
+        let token = match bearer_token(&context) {
             Ok(token) => token,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
-        let permit = match Arc::clone(&self.admission).try_acquire_owned() {
+        let peer = match context.peer() {
+            Some(peer) => peer,
+            None => {
+                return Box::pin(async { Err(AuthenticateTenantError::unavailable()) });
+            }
+        };
+        let global_permit = match Arc::clone(&self.admission).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 return Box::pin(async { Err(AuthenticateTenantError::capacity_exhausted()) });
             }
         };
+        let peer_permit = match self.peer_admission.try_acquire(peer) {
+            Some(permit) => permit,
+            None => {
+                return Box::pin(async { Err(AuthenticateTenantError::capacity_exhausted()) });
+            }
+        };
+        let admission = VerificationAdmissionPermit::new(global_permit, peer_permit);
         let verifier = Arc::clone(&self.verifier);
         let runtime = match Handle::try_current() {
             Ok(runtime) => runtime,
@@ -196,7 +222,7 @@ impl TenantAuthenticator for JwtTenantAuthenticator {
 
         Box::pin(async move {
             let verified = AbortOnDropTask::new(runtime.spawn_blocking(move || {
-                let _permit = permit;
+                let _admission = admission;
                 verifier.verify(&token, authority_started_at)
             }))
             .join()
@@ -205,6 +231,84 @@ impl TenantAuthenticator for JwtTenantAuthenticator {
             TenantAuthority::try_new(verified.tenant_id, verified.valid_until)
                 .map_err(|_| verified.expiry_error)
         })
+    }
+}
+
+struct PeerAdmission {
+    active: Mutex<HashMap<DecisionGrpcPeerKey, usize>>,
+    max_per_peer: usize,
+}
+
+impl PeerAdmission {
+    fn new(max_per_peer: usize) -> Self {
+        Self {
+            active: Mutex::new(HashMap::new()),
+            max_per_peer,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, peer: DecisionGrpcPeerKey) -> Option<PeerAdmissionPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = active.entry(peer).or_default();
+        if *count >= self.max_per_peer {
+            return None;
+        }
+        *count += 1;
+        drop(active);
+
+        Some(PeerAdmissionPermit {
+            admission: Arc::clone(self),
+            peer,
+        })
+    }
+
+    fn release(&self, peer: DecisionGrpcPeerKey) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Entry::Occupied(mut entry) = active.entry(peer) {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+}
+
+struct PeerAdmissionPermit {
+    admission: Arc<PeerAdmission>,
+    peer: DecisionGrpcPeerKey,
+}
+
+struct VerificationAdmissionPermit {
+    peer: Option<PeerAdmissionPermit>,
+    global: Option<OwnedSemaphorePermit>,
+}
+
+impl VerificationAdmissionPermit {
+    fn new(global: OwnedSemaphorePermit, peer: PeerAdmissionPermit) -> Self {
+        Self {
+            peer: Some(peer),
+            global: Some(global),
+        }
+    }
+}
+
+impl Drop for VerificationAdmissionPermit {
+    fn drop(&mut self) {
+        self.peer.take();
+        self.global.take();
+    }
+}
+
+impl Drop for PeerAdmissionPermit {
+    fn drop(&mut self) {
+        self.admission.release(self.peer);
     }
 }
 
@@ -490,7 +594,7 @@ fn parse_jwks(
 }
 
 fn bearer_token(
-    context: TenantAuthenticationContext<'_>,
+    context: &TenantAuthenticationContext<'_>,
 ) -> Result<String, AuthenticateTenantError> {
     if context.metadata().get_bin("authorization-bin").is_some() {
         return Err(AuthenticateTenantError::rejected());
@@ -635,4 +739,31 @@ fn unix_timestamp() -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    #[test]
+    fn peer_admission_removes_empty_entries_after_release() {
+        let admission = Arc::new(PeerAdmission::new(1));
+        let peer = DecisionGrpcPeerKey::from_socket_addr(
+            "192.0.2.17:41000"
+                .parse::<SocketAddr>()
+                .expect("fixed peer address must parse"),
+        );
+
+        let permit = admission
+            .try_acquire(peer)
+            .expect("first peer permit must be available");
+        assert_eq!(admission.active.lock().unwrap().len(), 1);
+        assert!(admission.try_acquire(peer).is_none());
+
+        drop(permit);
+        assert!(admission.active.lock().unwrap().is_empty());
+        assert!(admission.try_acquire(peer).is_some());
+    }
 }

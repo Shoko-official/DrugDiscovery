@@ -11,9 +11,12 @@ use bioworld_decision_query::{
 };
 use tonic::{Request, Response, Status};
 
+mod peer;
 mod service;
 mod watch;
 mod watch_runtime;
+
+pub use peer::{DecisionGrpcConnectInfo, DecisionGrpcPeerKey};
 
 pub use service::{
     AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,

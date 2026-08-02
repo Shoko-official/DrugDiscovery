@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    io,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
@@ -17,7 +18,7 @@ use bioworld_contracts::v2::{
     OodDetectorRef, OodStatus, Recommendation, decision_service_client::DecisionServiceClient,
 };
 use bioworld_decision_grpc::{
-    AuthenticateTenantFuture, DecisionGrpcService, DecisionGrpcServiceConfig,
+    AuthenticateTenantFuture, DecisionGrpcPeerKey, DecisionGrpcService, DecisionGrpcServiceConfig,
     TenantAuthenticationContext, TenantAuthenticator, TenantAuthority, TenantScope,
     TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
 };
@@ -26,11 +27,12 @@ use bioworld_decision_grpc_server::{
     DecisionGrpcTlsIdentity, ServeDecisionGrpcServerError,
 };
 use bioworld_decision_query::{GetDecisionQuery, GetDecisionRequestExecutionError};
+use hyper_util::rt::TokioIo;
 use prost::Message;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::{
     io::AsyncReadExt,
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     sync::{Notify, oneshot},
 };
 use tonic::{
@@ -38,6 +40,7 @@ use tonic::{
     metadata::MetadataValue,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
+use tower::Service;
 
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -79,8 +82,27 @@ fn transport_config_with(
     request_timeout: Duration,
     shutdown_grace: Duration,
 ) -> DecisionGrpcServerConfig {
+    transport_config_with_peer(
+        max_connections,
+        max_connections.saturating_sub(1),
+        max_streams,
+        handshake_timeout,
+        request_timeout,
+        shutdown_grace,
+    )
+}
+
+fn transport_config_with_peer(
+    max_connections: usize,
+    max_connections_per_peer: usize,
+    max_streams: u32,
+    handshake_timeout: Duration,
+    request_timeout: Duration,
+    shutdown_grace: Duration,
+) -> DecisionGrpcServerConfig {
     let limits = DecisionGrpcServerLimits::try_new(
         max_connections,
+        max_connections_per_peer,
         max_streams,
         handshake_timeout,
         request_timeout,
@@ -97,6 +119,26 @@ fn transport_config_with(
 
 struct CountingAuthenticator {
     calls: Arc<AtomicUsize>,
+}
+
+struct RecordingPeerAuthenticator {
+    observed: Arc<Mutex<Vec<Option<DecisionGrpcPeerKey>>>>,
+}
+
+impl TenantAuthenticator for RecordingPeerAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        self.observed.lock().unwrap().push(context.peer());
+        Box::pin(async {
+            Ok(TenantAuthority::try_new(
+                "trusted-tenant".to_owned(),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap())
+        })
+    }
 }
 
 impl TenantAuthenticator for CountingAuthenticator {
@@ -390,6 +432,60 @@ async fn try_trusted_channel(
         .await
 }
 
+#[derive(Clone, Copy)]
+struct SourceBoundConnector {
+    source: Ipv4Addr,
+    destination: SocketAddr,
+}
+
+impl Service<http::Uri> for SourceBoundConnector {
+    type Response = TokioIo<TcpStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<TokioIo<TcpStream>>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _request: http::Uri) -> Self::Future {
+        let source = self.source;
+        let destination = self.destination;
+        Box::pin(async move {
+            let socket = TcpSocket::new_v4()?;
+            socket.bind(SocketAddr::from((source, 0)))?;
+            socket.connect(destination).await.map(TokioIo::new)
+        })
+    }
+}
+
+async fn try_trusted_channel_from(
+    address: SocketAddr,
+    certificate_pem: Vec<u8>,
+    source: Ipv4Addr,
+) -> Result<Channel, tonic::transport::Error> {
+    Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(certificate_pem))
+                .domain_name("localhost"),
+        )
+        .unwrap()
+        .connect_with_connector(SourceBoundConnector {
+            source,
+            destination: address,
+        })
+        .await
+}
+
+async fn connect_from(source: Ipv4Addr, destination: SocketAddr) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::from((source, 0)))
+        .expect("loopback source address must bind");
+    socket.connect(destination).await.unwrap()
+}
+
 async fn get_decision(channel: Channel) -> Result<DecisionRecord, tonic::Status> {
     DecisionServiceClient::new(channel)
         .get_decision(GetDecisionRequest {
@@ -418,7 +514,7 @@ fn request_with_encoded_len(target: usize) -> GetDecisionRequest {
 #[tokio::test]
 async fn serves_get_decision_over_trusted_tls() {
     let tls = test_tls();
-    let server = DecisionGrpcServer::bind(transport_config(1), tls.identity)
+    let server = DecisionGrpcServer::bind(transport_config(2), tls.identity)
         .await
         .unwrap();
     let address = server.local_addr();
@@ -434,7 +530,7 @@ async fn serves_get_decision_over_trusted_tls() {
 
     let channel = tokio::time::timeout(
         Duration::from_secs(3),
-        trusted_channel(address, tls.certificate_pem),
+        trusted_channel(address, tls.certificate_pem.clone()),
     )
     .await
     .unwrap();
@@ -468,7 +564,7 @@ async fn bounds_stalled_handshakes_and_recovers_connection_capacity() {
     let tls = test_tls();
     let server = DecisionGrpcServer::bind(
         transport_config_with(
-            1,
+            2,
             1,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -490,12 +586,13 @@ async fn bounds_stalled_handshakes_and_recovers_connection_capacity() {
     ));
 
     let mut stalled = guarded(TcpStream::connect(address)).await.unwrap();
-    let blocked = tokio::time::timeout(
-        Duration::from_millis(100),
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(1),
         try_trusted_channel(address, tls.certificate_pem.clone()),
     )
-    .await;
-    assert!(blocked.is_err());
+    .await
+    .expect("saturated peer connection must fail without queueing");
+    assert!(rejected.is_err());
     assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
 
     let mut byte = [0_u8; 1];
@@ -522,9 +619,145 @@ async fn bounds_stalled_handshakes_and_recovers_connection_capacity() {
 }
 
 #[tokio::test]
+async fn global_transport_limit_bounds_distinct_peers_and_recovers() {
+    let tls = test_tls();
+    let server = DecisionGrpcServer::bind(
+        transport_config_with_peer(
+            2,
+            1,
+            1,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        ),
+        tls.identity,
+    )
+    .await
+    .unwrap();
+    let address = server.local_addr();
+    let auth_calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(server.serve(
+        service(Arc::clone(&auth_calls), observed),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let stalled_a = guarded(connect_from(Ipv4Addr::new(127, 0, 0, 2), address)).await;
+    let channel_b = tokio::time::timeout(
+        TEST_TIMEOUT,
+        try_trusted_channel_from(
+            address,
+            tls.certificate_pem.clone(),
+            Ipv4Addr::new(127, 0, 0, 3),
+        ),
+    )
+    .await
+    .expect("second distinct peer must complete TLS")
+    .unwrap();
+    let pending_c = try_trusted_channel(address, tls.certificate_pem);
+    tokio::pin!(pending_c);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pending_c.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
+
+    drop(stalled_a);
+    let recovered_c = tokio::time::timeout(TEST_TIMEOUT, pending_c.as_mut())
+        .await
+        .expect("global connection capacity must recover")
+        .unwrap();
+    guarded(get_decision(recovered_c)).await.unwrap();
+    assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+
+    drop(channel_b);
+    shutdown_tx.send(()).unwrap();
+    guarded(server_task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn saturated_transport_peer_does_not_block_another_direct_peer() {
+    let tls = test_tls();
+    let server = DecisionGrpcServer::bind(
+        transport_config_with_peer(
+            2,
+            1,
+            1,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        ),
+        tls.identity,
+    )
+    .await
+    .unwrap();
+    let address = server.local_addr();
+    let observed_peers = Arc::new(Mutex::new(Vec::new()));
+    let observed_queries = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        RecordingPeerAuthenticator {
+            observed: Arc::clone(&observed_peers),
+        },
+        RecordingExecutor {
+            observed: observed_queries,
+        },
+        DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(1)).unwrap(),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(server.serve(service, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let peer_a = Ipv4Addr::new(127, 0, 0, 2);
+    let stalled_a = guarded(connect_from(peer_a, address)).await;
+    let mut rejected_a = guarded(connect_from(peer_a, address)).await;
+    let mut byte = [0_u8; 1];
+    let rejected = tokio::time::timeout(Duration::from_secs(1), rejected_a.read(&mut byte))
+        .await
+        .expect("saturated peer connection must close immediately");
+    assert!(matches!(rejected, Ok(0) | Err(_)));
+
+    let peer_b_channel = tokio::time::timeout(
+        Duration::from_secs(1),
+        trusted_channel(address, tls.certificate_pem.clone()),
+    )
+    .await
+    .expect("another direct peer must retain transport capacity");
+    guarded(get_decision(peer_b_channel)).await.unwrap();
+    assert_eq!(
+        *observed_peers.lock().unwrap(),
+        vec![Some(DecisionGrpcPeerKey::from_socket_addr(
+            "127.0.0.1:1".parse().unwrap()
+        ))]
+    );
+
+    drop(stalled_a);
+    let recovered_a = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match try_trusted_channel_from(address, tls.certificate_pem.clone(), peer_a).await {
+                Ok(channel) => break channel,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("released peer must complete TLS again");
+    guarded(get_decision(recovered_a)).await.unwrap();
+    assert_eq!(observed_peers.lock().unwrap().len(), 2);
+
+    shutdown_tx.send(()).unwrap();
+    guarded(server_task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn preserves_message_bounds_and_rejects_oversized_headers_before_authentication() {
     let tls = test_tls();
-    let server = DecisionGrpcServer::bind(transport_config(2), tls.identity)
+    let server = DecisionGrpcServer::bind(transport_config(4), tls.identity)
         .await
         .unwrap();
     let address = server.local_addr();
@@ -602,7 +835,7 @@ async fn bounds_concurrent_streams_on_each_connection() {
     let tls = test_tls();
     let server = DecisionGrpcServer::bind(
         transport_config_with(
-            1,
+            2,
             1,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -682,7 +915,7 @@ async fn bounds_concurrent_streams_on_each_connection() {
 #[tokio::test]
 async fn drains_active_rpc_then_closes_the_listener_on_shutdown() {
     let tls = test_tls();
-    let server = DecisionGrpcServer::bind(transport_config(1), tls.identity)
+    let server = DecisionGrpcServer::bind(transport_config(2), tls.identity)
         .await
         .unwrap();
     let address = server.local_addr();
@@ -736,7 +969,7 @@ async fn transport_timeout_drops_work_and_recovers_capacity() {
     let tls = test_tls();
     let server = DecisionGrpcServer::bind(
         transport_config_with(
-            1,
+            2,
             1,
             Duration::from_secs(1),
             Duration::from_millis(100),
@@ -817,7 +1050,7 @@ async fn rejects_a_service_timeout_that_cannot_drain_before_shutdown() {
     let tls = test_tls();
     let server = DecisionGrpcServer::bind(
         transport_config_with(
-            1,
+            2,
             1,
             Duration::from_secs(1),
             Duration::from_secs(2),
@@ -843,7 +1076,7 @@ async fn force_closes_flow_controlled_response_when_shutdown_deadline_expires() 
     let tls = test_tls();
     let server = DecisionGrpcServer::bind(
         transport_config_with(
-            1,
+            2,
             1,
             Duration::from_secs(1),
             Duration::from_secs(2),

@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     future::pending,
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -21,9 +22,10 @@ use bioworld_contracts::v2::{
     decision_service_server::DecisionService as GeneratedDecisionService,
 };
 use bioworld_decision_grpc::{
-    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantAuthority,
-    TenantScope, get_decision, watch_decision,
+    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcConnectInfo,
+    DecisionGrpcPeerKey, DecisionGrpcService, DecisionGrpcServiceConfig,
+    TenantAuthenticationContext, TenantAuthenticator, TenantAuthority, TenantScope, get_decision,
+    watch_decision,
 };
 use bioworld_decision_grpc_jwt::{
     BIOWORLD_TENANT_CLAIM, JwtTenantAuthenticator, JwtTenantAuthenticatorConfig,
@@ -871,8 +873,14 @@ fn jwt_authenticated_request(
     token: &str,
     hostile_tenant_id: &str,
     decision_id: &str,
+    peer: SocketAddr,
 ) -> Request<GetDecisionRequest> {
     let mut request = request(decision_id);
+    request
+        .extensions_mut()
+        .insert(DecisionGrpcConnectInfo::new(
+            DecisionGrpcPeerKey::from_socket_addr(peer),
+        ));
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1303,6 +1311,7 @@ async fn jwt_authenticated_service_executes_tenant_isolated_postgres_reads() {
             JWT_REQUIRED_SCOPE.to_owned(),
             now + 600,
             2,
+            1,
         )
         .unwrap(),
         &signing_key.jwks,
@@ -1320,11 +1329,21 @@ async fn jwt_authenticated_service_executes_tenant_isolated_postgres_reads() {
     let (tenant_a_response, tenant_b_response) = tokio::join!(
         GeneratedDecisionService::get_decision(
             &service,
-            jwt_authenticated_request(&tenant_a_token, JWT_SERVICE_TENANT_B, SHARED_DECISION_ID),
+            jwt_authenticated_request(
+                &tenant_a_token,
+                JWT_SERVICE_TENANT_B,
+                SHARED_DECISION_ID,
+                "127.0.0.2:41000".parse().unwrap(),
+            ),
         ),
         GeneratedDecisionService::get_decision(
             &service,
-            jwt_authenticated_request(&tenant_b_token, JWT_SERVICE_TENANT_A, SHARED_DECISION_ID),
+            jwt_authenticated_request(
+                &tenant_b_token,
+                JWT_SERVICE_TENANT_A,
+                SHARED_DECISION_ID,
+                "127.0.0.3:41000".parse().unwrap(),
+            ),
         ),
     );
 

@@ -161,6 +161,7 @@ struct RawJwt {
     jwks_file: String,
     jwks_valid_until: u64,
     max_concurrent_verifications: usize,
+    max_concurrent_verifications_per_peer: usize,
 }
 
 #[derive(Deserialize)]
@@ -195,6 +196,7 @@ struct RawWatch {
 #[serde(deny_unknown_fields)]
 struct RawTransport {
     max_active_connections: usize,
+    max_active_connections_per_peer: usize,
     max_concurrent_streams_per_connection: u32,
     tls_handshake_timeout_seconds: u64,
     request_timeout_seconds: u64,
@@ -222,6 +224,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
         let shutdown_grace = Duration::from_secs(raw.transport.shutdown_grace_seconds);
         let limits = DecisionGrpcServerLimits::try_new(
             raw.transport.max_active_connections,
+            raw.transport.max_active_connections_per_peer,
             raw.transport.max_concurrent_streams_per_connection,
             Duration::from_secs(raw.transport.tls_handshake_timeout_seconds),
             transport_request_timeout,
@@ -254,6 +257,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
 
         if request_timeout >= shutdown_grace
             || transport_request_timeout >= shutdown_grace
+            || raw.jwt.max_concurrent_verifications_per_peer >= raw.service.max_in_flight
             || raw.postgres.pool_max_size > raw.service.max_in_flight
             || watch.is_some_and(|watch| watch.max_in_flight() >= raw.postgres.pool_max_size)
             || acquire_timeout > request_timeout
@@ -291,6 +295,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
             raw.jwt.required_scope,
             raw.jwt.jwks_valid_until,
             raw.jwt.max_concurrent_verifications,
+            raw.jwt.max_concurrent_verifications_per_peer,
         )
         .map_err(|_| InvalidDecisionServerConfig)?;
 

@@ -1,5 +1,6 @@
 use std::{
     future::{Future, poll_fn},
+    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -19,10 +20,11 @@ use bioworld_contracts::{
     },
 };
 use bioworld_decision_grpc::{
-    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig, InvalidTenantAuthority,
-    TenantAuthenticationContext, TenantAuthenticator, TenantAuthority, TenantScope,
-    TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
+    AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcConnectInfo,
+    DecisionGrpcPeerKey, DecisionGrpcService, DecisionGrpcServiceConfig,
+    InvalidDecisionGrpcServiceConfig, InvalidTenantAuthority, TenantAuthenticationContext,
+    TenantAuthenticator, TenantAuthority, TenantScope, TenantScopedGetDecisionExecutor,
+    TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_query::{GetDecisionQuery, GetDecisionRequestExecutionError};
 use http_body_util::{BodyExt, Full};
@@ -143,6 +145,20 @@ fn generated_server_is_constructible_and_thread_safe() {
 }
 
 struct StaticAuthenticator;
+
+struct RecordingPeerAuthenticator {
+    observed: Arc<Mutex<Vec<Option<DecisionGrpcPeerKey>>>>,
+}
+
+impl TenantAuthenticator for RecordingPeerAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        self.observed.lock().unwrap().push(context.peer());
+        Box::pin(async { Ok(authority("trusted-tenant").unwrap()) })
+    }
+}
 
 impl TenantAuthenticator for StaticAuthenticator {
     fn authenticate_tenant<'a>(
@@ -660,6 +676,63 @@ async fn authenticates_and_executes_the_exact_tenant_scoped_query() {
         *observed.lock().unwrap(),
         vec![("trusted-tenant".to_owned(), DECISION_ID.to_owned())]
     );
+}
+
+#[tokio::test]
+async fn authentication_context_uses_normalized_connect_info_not_forwarding_metadata() {
+    let first_address: SocketAddr = "192.0.2.17:41000".parse().unwrap();
+    let second_port: SocketAddr = "192.0.2.17:42000".parse().unwrap();
+    let mapped_address: SocketAddr = "[::ffff:192.0.2.17]:43000".parse().unwrap();
+    let peer = DecisionGrpcPeerKey::from_socket_addr(first_address);
+
+    assert_eq!(peer, DecisionGrpcPeerKey::from_socket_addr(second_port));
+    assert_eq!(peer, DecisionGrpcPeerKey::from_socket_addr(mapped_address));
+    assert_ne!(
+        peer,
+        DecisionGrpcPeerKey::from_socket_addr("192.0.2.18:41000".parse().unwrap())
+    );
+    assert_eq!(format!("{peer:?}"), "DecisionGrpcPeerKey");
+
+    let connect_info = DecisionGrpcConnectInfo::new(peer);
+    assert_eq!(connect_info.peer(), peer);
+    assert_eq!(format!("{connect_info:?}"), "DecisionGrpcConnectInfo");
+
+    let observed_peers = Arc::new(Mutex::new(Vec::new()));
+    let observed_queries = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        RecordingPeerAuthenticator {
+            observed: Arc::clone(&observed_peers),
+        },
+        RecordingExecutor {
+            observed: observed_queries,
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(1)).unwrap(),
+    );
+    let mut trusted_request = Request::new(GetDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    });
+    trusted_request
+        .metadata_mut()
+        .insert("x-forwarded-for", "203.0.113.200".parse().unwrap());
+    trusted_request.extensions_mut().insert(connect_info);
+
+    GeneratedDecisionService::get_decision(&service, trusted_request)
+        .await
+        .unwrap();
+
+    let mut untrusted_only_request = Request::new(GetDecisionRequest {
+        decision_id: DECISION_ID.to_owned(),
+    });
+    untrusted_only_request
+        .metadata_mut()
+        .insert("forwarded", "for=203.0.113.201".parse().unwrap());
+
+    GeneratedDecisionService::get_decision(&service, untrusted_only_request)
+        .await
+        .unwrap();
+
+    assert_eq!(*observed_peers.lock().unwrap(), vec![Some(peer), None]);
 }
 
 #[tokio::test]

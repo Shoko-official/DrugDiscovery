@@ -333,6 +333,7 @@ dependencies = [
  "bioworld-decision-grpc",
  "bioworld-decision-query",
  "http",
+ "hyper-util",
  "prost",
  "rcgen",
  "socket2",

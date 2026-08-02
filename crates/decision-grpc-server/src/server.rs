@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, hash_map::Entry},
     convert::Infallible,
     error::Error,
     fmt,
@@ -6,7 +7,7 @@ use std::{
     io,
     net::{SocketAddr, TcpListener as StdTcpListener},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll, ready},
 };
 
@@ -29,8 +30,8 @@ use tonic::{
 use tower::{Layer, Service};
 
 use bioworld_decision_grpc::{
-    DECISION_GRPC_REQUEST_DEADLINE_MESSAGE, DecisionGrpcService, TenantAuthenticator,
-    TenantScopedGetDecisionExecutor,
+    DECISION_GRPC_REQUEST_DEADLINE_MESSAGE, DecisionGrpcConnectInfo, DecisionGrpcPeerKey,
+    DecisionGrpcService, TenantAuthenticator, TenantScopedGetDecisionExecutor,
 };
 
 use crate::{DecisionGrpcServerConfig, DecisionGrpcTlsIdentity};
@@ -83,6 +84,7 @@ impl DecisionGrpcServer {
             incoming: BoundedTcpIncoming::new(
                 incoming,
                 limits.max_active_connections(),
+                limits.max_active_connections_per_peer(),
                 Arc::clone(&connection_shutdown),
             ),
             connection_shutdown,
@@ -337,6 +339,7 @@ type SemaphoreAcquireFuture =
 struct BoundedTcpIncoming {
     incoming: TcpIncoming,
     admission: Arc<Semaphore>,
+    peer_admission: Arc<PeerAdmission>,
     pending_permit: Option<SemaphoreAcquireFuture>,
     connection_shutdown: Arc<Semaphore>,
 }
@@ -345,11 +348,13 @@ impl BoundedTcpIncoming {
     fn new(
         incoming: TcpIncoming,
         max_active_connections: usize,
+        max_active_connections_per_peer: usize,
         connection_shutdown: Arc<Semaphore>,
     ) -> Self {
         Self {
             incoming,
             admission: Arc::new(Semaphore::new(max_active_connections)),
+            peer_admission: Arc::new(PeerAdmission::new(max_active_connections_per_peer)),
             pending_permit: None,
             connection_shutdown,
         }
@@ -390,12 +395,24 @@ impl Stream for BoundedTcpIncoming {
         };
 
         match Pin::new(&mut this.incoming).poll_next(context) {
-            Poll::Ready(Some(Ok(stream))) => Poll::Ready(Some(Ok(AdmittedTcpStream {
-                stream,
-                _permit: permit,
-                forced_shutdown: Box::pin(Arc::clone(&this.connection_shutdown).acquire_owned()),
-                forced_shutdown_observed: false,
-            }))),
+            Poll::Ready(Some(Ok(stream))) => {
+                let peer = match stream.peer_addr() {
+                    Ok(address) => DecisionGrpcPeerKey::from_socket_addr(address),
+                    Err(_) => return Poll::Ready(Some(Err(connection_admission_error()))),
+                };
+                let Some(peer_permit) = this.peer_admission.try_acquire(peer) else {
+                    return Poll::Ready(Some(Err(connection_admission_error())));
+                };
+                Poll::Ready(Some(Ok(AdmittedTcpStream {
+                    stream,
+                    connect_info: DecisionGrpcConnectInfo::new(peer),
+                    _admission: ConnectionAdmissionPermit::new(permit, peer_permit),
+                    forced_shutdown: Box::pin(
+                        Arc::clone(&this.connection_shutdown).acquire_owned(),
+                    ),
+                    forced_shutdown_observed: false,
+                })))
+            }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -405,7 +422,8 @@ impl Stream for BoundedTcpIncoming {
 
 struct AdmittedTcpStream {
     stream: TcpStream,
-    _permit: OwnedSemaphorePermit,
+    connect_info: DecisionGrpcConnectInfo,
+    _admission: ConnectionAdmissionPermit,
     forced_shutdown: SemaphoreAcquireFuture,
     forced_shutdown_observed: bool,
 }
@@ -425,11 +443,96 @@ impl AdmittedTcpStream {
 }
 
 impl Connected for AdmittedTcpStream {
-    type ConnectInfo = <TcpStream as Connected>::ConnectInfo;
+    type ConnectInfo = DecisionGrpcConnectInfo;
 
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.stream.connect_info()
+        self.connect_info
     }
+}
+
+struct PeerAdmission {
+    active: Mutex<HashMap<DecisionGrpcPeerKey, usize>>,
+    max_per_peer: usize,
+}
+
+impl PeerAdmission {
+    fn new(max_per_peer: usize) -> Self {
+        Self {
+            active: Mutex::new(HashMap::new()),
+            max_per_peer,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, peer: DecisionGrpcPeerKey) -> Option<PeerAdmissionPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = active.entry(peer).or_default();
+        if *count >= self.max_per_peer {
+            return None;
+        }
+        *count += 1;
+        drop(active);
+
+        Some(PeerAdmissionPermit {
+            admission: Arc::clone(self),
+            peer,
+        })
+    }
+
+    fn release(&self, peer: DecisionGrpcPeerKey) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Entry::Occupied(mut entry) = active.entry(peer) {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+}
+
+struct PeerAdmissionPermit {
+    admission: Arc<PeerAdmission>,
+    peer: DecisionGrpcPeerKey,
+}
+
+struct ConnectionAdmissionPermit {
+    peer: Option<PeerAdmissionPermit>,
+    global: Option<OwnedSemaphorePermit>,
+}
+
+impl ConnectionAdmissionPermit {
+    fn new(global: OwnedSemaphorePermit, peer: PeerAdmissionPermit) -> Self {
+        Self {
+            peer: Some(peer),
+            global: Some(global),
+        }
+    }
+}
+
+impl Drop for ConnectionAdmissionPermit {
+    fn drop(&mut self) {
+        self.peer.take();
+        self.global.take();
+    }
+}
+
+impl Drop for PeerAdmissionPermit {
+    fn drop(&mut self) {
+        self.admission.release(self.peer);
+    }
+}
+
+fn connection_admission_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "connection admission rejected",
+    )
 }
 
 impl AsyncRead for AdmittedTcpStream {
@@ -498,7 +601,7 @@ fn forced_shutdown_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::poll_fn, net::Ipv4Addr, time::Duration};
+    use std::{net::Ipv4Addr, time::Duration};
 
     use tokio_stream::StreamExt;
 
@@ -514,19 +617,39 @@ mod tests {
     async fn connection_permit_is_held_until_the_accepted_stream_drops() {
         let incoming = bind_incoming(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 1).unwrap();
         let address = incoming.local_addr().unwrap();
-        let mut incoming = BoundedTcpIncoming::new(incoming, 1, Arc::new(Semaphore::new(0)));
+        let mut incoming = BoundedTcpIncoming::new(incoming, 2, 1, Arc::new(Semaphore::new(0)));
 
         let _first_client = guarded(TcpStream::connect(address)).await.unwrap();
         let first_stream = guarded(incoming.next()).await.unwrap().unwrap();
-        let _second_client = guarded(TcpStream::connect(address)).await.unwrap();
-        let second_accept = incoming.next();
-        tokio::pin!(second_accept);
-
-        let first_poll = poll_fn(|context| Poll::Ready(second_accept.as_mut().poll(context))).await;
-        assert!(first_poll.is_pending());
+        let _rejected_client = guarded(TcpStream::connect(address)).await.unwrap();
+        let rejection = guarded(incoming.next()).await.unwrap();
+        assert!(matches!(
+            rejection,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
 
         drop(first_stream);
-        let second_stream = guarded(second_accept).await.unwrap().unwrap();
-        drop(second_stream);
+        let _recovered_client = guarded(TcpStream::connect(address)).await.unwrap();
+        let recovered_stream = guarded(incoming.next()).await.unwrap().unwrap();
+        drop(recovered_stream);
+    }
+
+    #[test]
+    fn peer_admission_removes_empty_entries_after_release() {
+        let admission = Arc::new(PeerAdmission::new(1));
+        let peer = DecisionGrpcPeerKey::from_socket_addr(SocketAddr::from((
+            Ipv4Addr::new(192, 0, 2, 17),
+            41_000,
+        )));
+
+        let permit = admission
+            .try_acquire(peer)
+            .expect("first peer permit must be available");
+        assert_eq!(admission.active.lock().unwrap().len(), 1);
+        assert!(admission.try_acquire(peer).is_none());
+
+        drop(permit);
+        assert!(admission.active.lock().unwrap().is_empty());
+        assert!(admission.try_acquire(peer).is_some());
     }
 }

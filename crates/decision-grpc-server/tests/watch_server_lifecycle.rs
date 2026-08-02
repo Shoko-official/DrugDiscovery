@@ -60,6 +60,7 @@ fn test_tls() -> TestTls {
 
 fn transport_config() -> DecisionGrpcServerConfig {
     let limits = DecisionGrpcServerLimits::try_new(
+        2,
         1,
         1,
         Duration::from_secs(1),
