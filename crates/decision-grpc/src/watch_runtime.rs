@@ -17,9 +17,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{Status, codegen::tokio_stream::Stream};
 
 use crate::{
-    DECISION_GRPC_REQUEST_DEADLINE_MESSAGE, DecisionGrpcWatchConfig, TenantScope,
-    TenantScopedWatchDecisionExecutor,
-    watch::{MAX_DECISION_EVENT_WIRE_BYTES, watch_decision_query},
+    DECISION_GRPC_REQUEST_DEADLINE_MESSAGE, DecisionGrpcWatchConfig, MAX_DECISION_EVENT_WIRE_BYTES,
+    TenantScope, TenantScopedWatchDecisionExecutor, watch::watch_decision_query,
 };
 
 const DECISION_SERVICE_UNAVAILABLE_MESSAGE: &str = "decision service is unavailable";

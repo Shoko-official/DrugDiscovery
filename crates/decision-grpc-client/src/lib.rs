@@ -1,5 +1,10 @@
 #![deny(unsafe_code)]
 
+mod watch;
+
+use watch::WatchCleanup;
+pub use watch::{DecisionGrpcWatch, DecisionGrpcWatchEvent};
+
 use std::{
     collections::HashSet, fmt, future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration,
 };
@@ -15,7 +20,10 @@ use rustls::{
     pki_types::{CertificateDer, pem::PemObject, pem::SectionKind},
 };
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::{
+    sync::Semaphore,
+    time::{Instant, sleep_until},
+};
 use tonic::{
     Code, Request,
     metadata::MetadataValue,
@@ -26,7 +34,9 @@ use zeroize::Zeroizing;
 pub const MAX_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CLIENT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_CLIENT_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_CLIENT_IN_FLIGHT: usize = 64;
+pub const MAX_CLIENT_WATCH_EVENTS: usize = 65_536;
 pub const MAX_DECISION_CLIENT_ENDPOINT_BYTES: usize = 2_048;
 pub const MAX_TLS_CA_CERTIFICATE_BYTES: usize = 65_536;
 pub const MAX_TLS_CA_CERTIFICATES: usize = 16;
@@ -105,6 +115,7 @@ pub struct DecisionGrpcClientLimits {
     tls_handshake_timeout: Duration,
     request_timeout: Duration,
     max_in_flight: usize,
+    max_active_watches: usize,
 }
 
 impl DecisionGrpcClientLimits {
@@ -114,6 +125,22 @@ impl DecisionGrpcClientLimits {
         request_timeout: Duration,
         max_in_flight: usize,
     ) -> Result<Self, DecisionGrpcClientError> {
+        Self::try_new_with_watch_capacity(
+            connect_timeout,
+            tls_handshake_timeout,
+            request_timeout,
+            max_in_flight,
+            0,
+        )
+    }
+
+    pub fn try_new_with_watch_capacity(
+        connect_timeout: Duration,
+        tls_handshake_timeout: Duration,
+        request_timeout: Duration,
+        max_in_flight: usize,
+        max_active_watches: usize,
+    ) -> Result<Self, DecisionGrpcClientError> {
         if connect_timeout.is_zero()
             || connect_timeout > MAX_CLIENT_CONNECT_TIMEOUT
             || tls_handshake_timeout.is_zero()
@@ -122,6 +149,7 @@ impl DecisionGrpcClientLimits {
             || request_timeout > MAX_CLIENT_REQUEST_TIMEOUT
             || max_in_flight == 0
             || max_in_flight > MAX_CLIENT_IN_FLIGHT
+            || max_active_watches >= max_in_flight
         {
             return Err(DecisionGrpcClientError::InvalidConfiguration);
         }
@@ -131,7 +159,47 @@ impl DecisionGrpcClientLimits {
             tls_handshake_timeout,
             request_timeout,
             max_in_flight,
+            max_active_watches,
         })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DecisionGrpcWatchLimits {
+    timeout: Duration,
+    max_events: usize,
+}
+
+impl fmt::Debug for DecisionGrpcWatchLimits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecisionGrpcWatchLimits")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecisionGrpcWatchLimits {
+    pub fn try_new(timeout: Duration, max_events: usize) -> Result<Self, DecisionGrpcClientError> {
+        if timeout.is_zero()
+            || timeout > MAX_CLIENT_WATCH_TIMEOUT
+            || max_events == 0
+            || max_events > MAX_CLIENT_WATCH_EVENTS
+        {
+            return Err(DecisionGrpcClientError::InvalidConfiguration);
+        }
+
+        Ok(Self {
+            timeout,
+            max_events,
+        })
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn max_events(self) -> usize {
+        self.max_events
     }
 }
 
@@ -204,6 +272,8 @@ pub struct DecisionGrpcClient<P> {
     channel: Channel,
     token_provider: Arc<P>,
     admission: Arc<Semaphore>,
+    watch_admission: Arc<Semaphore>,
+    watch_cleanup: Arc<WatchCleanup>,
     request_timeout: Duration,
 }
 
@@ -213,6 +283,8 @@ impl<P> Clone for DecisionGrpcClient<P> {
             channel: self.channel.clone(),
             token_provider: Arc::clone(&self.token_provider),
             admission: Arc::clone(&self.admission),
+            watch_admission: Arc::clone(&self.watch_admission),
+            watch_cleanup: Arc::clone(&self.watch_cleanup),
             request_timeout: self.request_timeout,
         }
     }
@@ -235,7 +307,6 @@ where
         let endpoint = Endpoint::from_shared(endpoint)
             .map_err(|_| DecisionGrpcClientError::InvalidConfiguration)?
             .connect_timeout(limits.connect_timeout)
-            .timeout(limits.request_timeout)
             .concurrency_limit(limits.max_in_flight)
             .buffer_size(limits.max_in_flight)
             .http2_max_header_list_size(MAX_HTTP2_HEADER_LIST_BYTES)
@@ -255,6 +326,8 @@ where
             channel,
             token_provider: Arc::new(token_provider),
             admission: Arc::new(Semaphore::new(limits.max_in_flight)),
+            watch_admission: Arc::new(Semaphore::new(limits.max_active_watches)),
+            watch_cleanup: Arc::new(WatchCleanup::new()),
             request_timeout: limits.request_timeout,
         })
     }
@@ -274,30 +347,17 @@ where
         let _permit = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| DecisionGrpcClientError::CapacityExhausted)?;
+        let deadline = Instant::now() + self.request_timeout;
         let operation = async {
-            let token = self
-                .token_provider
-                .access_token()
-                .await
-                .map_err(|_| DecisionGrpcClientError::AuthenticationUnavailable)?;
-            let mut bearer = Zeroizing::new(String::with_capacity(
-                AUTHORIZATION_PREFIX.len() + token.as_str().len(),
-            ));
-            bearer.push_str(AUTHORIZATION_PREFIX);
-            bearer.push_str(token.as_str());
-            let mut authorization = MetadataValue::try_from(bearer.as_str())
-                .map_err(|_| DecisionGrpcClientError::AuthenticationUnavailable)?;
-            authorization.set_sensitive(true);
-            drop(bearer);
-            drop(token);
-
-            let mut request = Request::new(GetDecisionRequest {
-                decision_id: expected_decision_id.clone(),
-            });
-            request
-                .metadata_mut()
-                .insert("authorization", authorization);
-            request.set_timeout(self.request_timeout);
+            let request = authenticated_request(
+                self.token_provider.as_ref(),
+                GetDecisionRequest {
+                    decision_id: expected_decision_id.clone(),
+                },
+                deadline,
+                deadline,
+            )
+            .await?;
             let mut client = DecisionServiceClient::new(self.channel.clone())
                 .max_decoding_message_size(MAX_DECISION_WIRE_BYTES)
                 .max_encoding_message_size(MAX_DECISION_WIRE_BYTES);
@@ -314,10 +374,66 @@ where
                 .map_err(|_| DecisionGrpcClientError::InvalidResponse)
         };
 
-        tokio::time::timeout(self.request_timeout, operation)
+        complete_before_deadline(deadline, operation)
             .await
-            .map_err(|_| DecisionGrpcClientError::DeadlineExceeded)?
+            .ok_or(DecisionGrpcClientError::DeadlineExceeded)?
     }
+}
+
+pub(crate) async fn complete_before_deadline<F>(deadline: Instant, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = sleep_until(deadline) => None,
+        output = &mut future => Some(output),
+    }
+}
+
+pub(crate) async fn authenticated_request<P, M>(
+    token_provider: &P,
+    message: M,
+    credential_deadline: Instant,
+    request_deadline: Instant,
+) -> Result<Request<M>, DecisionGrpcClientError>
+where
+    P: AccessTokenProvider + ?Sized,
+{
+    let credential_deadline = credential_deadline.min(request_deadline);
+    let token = complete_before_deadline(credential_deadline, token_provider.access_token())
+        .await
+        .ok_or(DecisionGrpcClientError::DeadlineExceeded)?
+        .map_err(|_| DecisionGrpcClientError::AuthenticationUnavailable)?;
+    if Instant::now() >= credential_deadline {
+        return Err(DecisionGrpcClientError::DeadlineExceeded);
+    }
+    let mut bearer = Zeroizing::new(String::with_capacity(
+        AUTHORIZATION_PREFIX.len() + token.as_str().len(),
+    ));
+    bearer.push_str(AUTHORIZATION_PREFIX);
+    bearer.push_str(token.as_str());
+    let mut authorization = MetadataValue::try_from(bearer.as_str())
+        .map_err(|_| DecisionGrpcClientError::AuthenticationUnavailable)?;
+    authorization.set_sensitive(true);
+    drop(bearer);
+    drop(token);
+
+    if Instant::now() >= credential_deadline {
+        return Err(DecisionGrpcClientError::DeadlineExceeded);
+    }
+    let remaining = request_deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(DecisionGrpcClientError::DeadlineExceeded)?;
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert("authorization", authorization);
+    request.set_timeout(remaining);
+
+    Ok(request)
 }
 
 fn valid_tls_server_name(value: &str) -> bool {
@@ -430,7 +546,7 @@ fn strict_certificate_pem_shape(input: &[u8]) -> bool {
     !inside && count > 0 && count <= MAX_TLS_CA_CERTIFICATES
 }
 
-fn map_status(status: tonic::Status) -> DecisionGrpcClientError {
+pub(crate) fn map_status(status: tonic::Status) -> DecisionGrpcClientError {
     match status.code() {
         Code::NotFound => DecisionGrpcClientError::NotFound,
         Code::Unauthenticated => DecisionGrpcClientError::Unauthenticated,

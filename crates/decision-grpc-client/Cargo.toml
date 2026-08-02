@@ -9,10 +9,12 @@ rust-version.workspace = true
 bioworld-contracts = { path = "../contracts" }
 bioworld-decision-query = { path = "../decision-query" }
 http.workspace = true
+prost.workspace = true
 rustls = { workspace = true, features = ["aws_lc_rs", "std"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -20,5 +22,5 @@ bioworld-decision-grpc = { path = "../decision-grpc" }
 bioworld-decision-grpc-server = { path = "../decision-grpc-server" }
 prost.workspace = true
 rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "zeroize"] }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tonic = { workspace = true, features = ["server", "tls-aws-lc"] }

@@ -7,7 +7,7 @@ use std::{
 };
 
 use bioworld_contracts::{
-    MAX_DECISION_WIRE_BYTES,
+    MAX_DECISION_EVENT_WIRE_BYTES,
     v2::{DecisionEvent, WatchDecisionRequest},
 };
 use bioworld_decision_query::{
@@ -23,12 +23,6 @@ use tonic::{
 use crate::TenantScope;
 
 const DECISION_REPLAY_PAGE_EVENTS: usize = 1;
-const DECISION_EVENT_ENVELOPE_WIRE_BYTES: usize = 42;
-
-/// Maximum Prost-encoded decision event payload accepted by the adapter.
-pub const MAX_DECISION_EVENT_WIRE_BYTES: usize =
-    MAX_DECISION_WIRE_BYTES + DECISION_EVENT_ENVELOPE_WIRE_BYTES;
-
 /// Builds a tenant-scoped typed replay for one validated watch request.
 pub trait TenantScopedWatchDecisionExecutor: Send + Sync {
     type Source: DecisionReplaySource + 'static;
