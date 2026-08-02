@@ -61,6 +61,12 @@ const TENANT_A: &str = "tenant-runtime-integration-a";
 const TENANT_B: &str = "tenant-runtime-integration-b";
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fb701";
 const EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd701";
+const WATCH_TENANT_A: &str = "tenant-runtime-watch-a";
+const WATCH_TENANT_B: &str = "tenant-runtime-watch-b";
+const WATCH_DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fb702";
+const WATCH_FIRST_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd702";
+const WATCH_SECOND_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd703";
+const WATCH_OTHER_TENANT_EVENT_ID: &str = "01910d47-6f80-7a31-8c29-1d5c4f6bd704";
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct IntegrationInputs {
@@ -415,13 +421,30 @@ fn decision_record() -> DecisionRecord {
     }
 }
 
+fn watch_decision_record(aggregate_version: u64, rationale: &str) -> DecisionRecord {
+    let mut record = decision_record();
+    record.decision_id = WATCH_DECISION_ID.to_owned();
+    record.aggregate_version = aggregate_version;
+    record.rationale = vec![rationale.to_owned()];
+    record
+}
+
 async fn seed_decision(writer: &mut Client, expected: &DecisionRecord) {
+    seed_event(writer, TENANT_A, EVENT_ID, expected).await;
+}
+
+async fn seed_event(
+    writer: &mut Client,
+    tenant_id: &str,
+    event_id: &str,
+    expected: &DecisionRecord,
+) {
     let event = DecisionEvent {
         decision: Some(expected.clone()),
-        event_id: EVENT_ID.to_owned(),
+        event_id: event_id.to_owned(),
     };
     let metadata = DecisionEventMetadata::try_new(
-        TENANT_A.to_owned(),
+        tenant_id.to_owned(),
         occurred_at(),
         json!({
             "algorithm": "synthetic",
@@ -450,11 +473,31 @@ fn runtime_config(
     inputs: &IntegrationInputs,
     now: u64,
 ) -> DecisionServerConfig {
+    runtime_config_with_watch(
+        files,
+        certificate_pem,
+        private_key_pem,
+        signing_key,
+        inputs,
+        now,
+        false,
+    )
+}
+
+fn runtime_config_with_watch(
+    files: &TemporaryDirectory,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    signing_key: &IntegrationJwtKey,
+    inputs: &IntegrationInputs,
+    now: u64,
+    watch_enabled: bool,
+) -> DecisionServerConfig {
     let certificate_file = files.write_public("server-cert.pem", certificate_pem);
     let private_key_file = files.write_private("server-key.pem", private_key_pem);
     let jwks_file = files.write_public("jwks.json", &signing_key.jwks);
     let password_file = files.write_private("postgres-password", inputs.reader_password.as_bytes());
-    let control = json!({
+    let mut control = json!({
         "listen": {
             "address": "127.0.0.1:0",
             "exposure": "loopback"
@@ -495,6 +538,12 @@ fn runtime_config(
             "shutdown_grace_seconds": 10
         }
     });
+    if watch_enabled {
+        control["service"]["watch"] = json!({
+            "max_in_flight": 1,
+            "max_in_flight_per_tenant": 1
+        });
+    }
     DecisionServerConfig::try_from_json(
         &serde_json::to_vec(&control).expect("runtime control serialization must succeed"),
     )
@@ -538,6 +587,33 @@ fn authenticated_request<T>(message: T, token: &str, hostile_tenant: &str) -> Re
             .expect("hostile tenant metadata must be valid"),
     );
     request
+}
+
+async fn watch_history(
+    client: &mut DecisionServiceClient<Channel>,
+    token: &str,
+    hostile_tenant: &str,
+) -> Vec<DecisionEvent> {
+    let mut stream = guarded(client.watch_decision(authenticated_request(
+        WatchDecisionRequest {
+            decision_id: WATCH_DECISION_ID.to_owned(),
+        },
+        token,
+        hostile_tenant,
+    )))
+    .await
+    .expect("signed tenant must open its decision history")
+    .into_inner();
+    let mut history = Vec::new();
+    loop {
+        match guarded(stream.message())
+            .await
+            .expect("decision history stream must remain valid")
+        {
+            Some(event) => history.push(event),
+            None => return history,
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -650,4 +726,99 @@ async fn serves_tls_authenticated_tenant_isolated_reads_and_stops_cleanly() {
         .await
         .expect("runtime serving task must join")
         .expect("runtime must stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
+    let Some(inputs) = integration_inputs() else {
+        return;
+    };
+    let mut writer =
+        connect_writer(inputs.writer_password.as_bytes(), &inputs.postgres_ca_file).await;
+    let first = watch_decision_record(1, "First tenant A decision.");
+    let second = watch_decision_record(2, "Second tenant A decision.");
+    let other_tenant = watch_decision_record(1, "Tenant B homonym.");
+    seed_event(
+        &mut writer.client,
+        WATCH_TENANT_A,
+        WATCH_FIRST_EVENT_ID,
+        &first,
+    )
+    .await;
+    seed_event(
+        &mut writer.client,
+        WATCH_TENANT_A,
+        WATCH_SECOND_EVENT_ID,
+        &second,
+    )
+    .await;
+    seed_event(
+        &mut writer.client,
+        WATCH_TENANT_B,
+        WATCH_OTHER_TENANT_EVENT_ID,
+        &other_tenant,
+    )
+    .await;
+    let expected_tenant_a = vec![
+        DecisionEvent {
+            decision: Some(first),
+            event_id: WATCH_FIRST_EVENT_ID.to_owned(),
+        },
+        DecisionEvent {
+            decision: Some(second),
+            event_id: WATCH_SECOND_EVENT_ID.to_owned(),
+        },
+    ];
+    let expected_tenant_b = vec![DecisionEvent {
+        decision: Some(other_tenant),
+        event_id: WATCH_OTHER_TENANT_EVENT_ID.to_owned(),
+    }];
+
+    let signing_key = IntegrationJwtKey::generate();
+    let CertifiedKey {
+        cert,
+        signing_key: server_key,
+    } = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("ephemeral server TLS identity must be generated");
+    let certificate_pem = cert.pem().into_bytes();
+    let private_key_pem = Zeroizing::new(server_key.serialize_pem().into_bytes());
+    let now = unix_timestamp();
+    let files = TemporaryDirectory::create();
+    let config = runtime_config_with_watch(
+        &files,
+        &certificate_pem,
+        &private_key_pem,
+        &signing_key,
+        &inputs,
+        now,
+        true,
+    );
+    let runtime = guarded(DecisionServerRuntime::prepare(config))
+        .await
+        .expect("Watch-enabled runtime must prepare through PostgreSQL TLS preflight");
+    let address = runtime.local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(runtime.serve(async move {
+        let _ = shutdown_rx.await;
+    }));
+    let channel = trusted_channel(address, certificate_pem).await;
+    let mut client = DecisionServiceClient::new(channel);
+    let tenant_a_token = signing_key.token(now, WATCH_TENANT_A);
+    let tenant_b_token = signing_key.token(now, WATCH_TENANT_B);
+
+    let tenant_a_history =
+        watch_history(&mut client, tenant_a_token.as_str(), WATCH_TENANT_B).await;
+    assert_eq!(tenant_a_history, expected_tenant_a);
+    let tenant_b_history =
+        watch_history(&mut client, tenant_b_token.as_str(), WATCH_TENANT_A).await;
+    assert_eq!(tenant_b_history, expected_tenant_b);
+
+    drop(client);
+    shutdown_tx
+        .send(())
+        .expect("runtime shutdown receiver must remain available");
+    guarded(server_task)
+        .await
+        .expect("runtime serving task must join")
+        .expect("Watch-enabled runtime must stop cleanly");
 }

@@ -13,15 +13,18 @@ use tonic::{Request, Response, Status};
 
 mod service;
 mod watch;
+mod watch_runtime;
 
 pub use service::{
     AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,
-    DecisionGrpcService, DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig,
-    InvalidTenantAuthority, MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS,
-    MAX_DECISION_GRPC_REQUEST_TIMEOUT, TenantAuthenticationContext, TenantAuthenticator,
+    DecisionGrpcService, DecisionGrpcServiceConfig, DecisionGrpcWatchConfig,
+    InvalidDecisionGrpcServiceConfig, InvalidDecisionGrpcWatchConfig, InvalidTenantAuthority,
+    MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS, MAX_DECISION_GRPC_REQUEST_TIMEOUT,
+    MAX_DECISION_GRPC_WATCH_IN_FLIGHT_REQUESTS, TenantAuthenticationContext, TenantAuthenticator,
     TenantAuthority,
 };
 pub use watch::{MAX_DECISION_EVENT_WIRE_BYTES, TenantScopedWatchDecisionExecutor, watch_decision};
+pub use watch_runtime::DecisionGrpcWatchLifecycle;
 
 pub struct TenantScope(Box<str>);
 

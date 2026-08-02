@@ -5,7 +5,7 @@ use std::{
 
 use bioworld_decision_grpc::{DecisionGrpcService, TenantScope, TenantScopedGetDecisionExecutor};
 use bioworld_decision_grpc_jwt::JwtTenantAuthenticator;
-use bioworld_decision_grpc_postgres::{PostgresGetDecisionExecutor, PostgresReaderPool};
+use bioworld_decision_grpc_postgres::{PostgresDecisionExecutor, PostgresReaderPool};
 use bioworld_decision_grpc_server::{
     BindDecisionGrpcServerError, DecisionGrpcServer, DecisionGrpcTlsIdentity,
     MAX_DECISION_GRPC_TLS_CERTIFICATE_CHAIN_PEM_BYTES, MAX_DECISION_GRPC_TLS_PRIVATE_KEY_PEM_BYTES,
@@ -33,7 +33,7 @@ const POSTGRES_READER_ROLE: &str = "bioworld_reader";
 const POSTGRES_APPLICATION_NAME: &str = "bioworld-decision-server";
 const PREFLIGHT_TENANT_ID: &str = "bioworld-startup-probe";
 
-type RuntimeExecutor = PostgresGetDecisionExecutor<PostgresReaderPool>;
+type RuntimeExecutor = PostgresDecisionExecutor<PostgresReaderPool>;
 type RuntimeService = DecisionGrpcService<JwtTenantAuthenticator, RuntimeExecutor>;
 
 /// Prepared read-only server with every dependency verified before listener use.
@@ -52,7 +52,8 @@ impl DecisionServerRuntime {
             jwt,
             jwks_file,
             postgres,
-            service,
+            service: service_config,
+            watch,
         } = config.into_parts();
 
         let certificate_chain = read_secure_file(
@@ -109,8 +110,21 @@ impl DecisionServerRuntime {
         let pool = PoolCloseGuard::new(pool);
         preflight_with_deadline(postgres.preflight_timeout, preflight_reader(pool.pool())).await?;
 
-        let executor = PostgresGetDecisionExecutor::new(pool.pool().clone());
-        let service = DecisionGrpcService::new(authenticator, executor, service);
+        let executor = PostgresDecisionExecutor::new(pool.pool().clone());
+        let service = match watch {
+            Some(watch_config) => DecisionGrpcService::try_new_with_watch(
+                authenticator,
+                executor,
+                service_config,
+                watch_config,
+            ),
+            None => Ok(DecisionGrpcService::new(
+                authenticator,
+                executor,
+                service_config,
+            )),
+        }
+        .map_err(|_| DecisionServerStartupError::ServiceConfigurationRejected)?;
         let server = DecisionGrpcServer::bind(server, server_identity)
             .await
             .map_err(map_bind_error)?;
@@ -158,6 +172,8 @@ pub enum DecisionServerStartupError {
     ServerIdentityRejected,
     /// JWT verification policy or key snapshot was rejected.
     IdentityConfigurationRejected,
+    /// The validated service and Watch capacity relationship was rejected.
+    ServiceConfigurationRejected,
     /// PostgreSQL CA, password, or connection policy was rejected.
     DatabaseConfigurationRejected,
     /// PostgreSQL availability, schema, reader identity, or tenant boundary was rejected.
@@ -177,6 +193,9 @@ impl fmt::Display for DecisionServerStartupError {
             }
             Self::IdentityConfigurationRejected => {
                 formatter.write_str("decision server authentication configuration is rejected")
+            }
+            Self::ServiceConfigurationRejected => {
+                formatter.write_str("decision server service configuration is rejected")
             }
             Self::DatabaseConfigurationRejected => {
                 formatter.write_str("decision server database configuration is rejected")
@@ -383,7 +402,7 @@ fn normalize_password(password: &mut Vec<u8>) -> Result<(), DecisionServerStartu
 }
 
 async fn preflight_reader(pool: &PostgresReaderPool) -> Result<(), DecisionServerStartupError> {
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresDecisionExecutor::new(pool.clone());
     let scope = TenantScope::try_from_trusted_tenant_id(PREFLIGHT_TENANT_ID.to_owned())
         .map_err(|_| DecisionServerStartupError::DatabaseUnavailable)?;
     let query = GetDecisionQuery::new(Uuid::nil());

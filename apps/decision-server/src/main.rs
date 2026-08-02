@@ -7,12 +7,15 @@ use std::{
     process::ExitCode,
 };
 
-use bioworld_decision_server::{DecisionServerConfig, DecisionServerRuntime};
+use bioworld_decision_server::{
+    DecisionServerConfig, DecisionServerRuntime, install_redacted_panic_hook,
+};
 
 const CONTROL_ENVIRONMENT: &str = "BIOWORLD_DECISION_SERVER_CONFIG";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    install_redacted_panic_hook();
     if emit_stdout("decision_server starting").is_err() {
         let _ = emit_stderr("decision_server failed");
         return ExitCode::FAILURE;

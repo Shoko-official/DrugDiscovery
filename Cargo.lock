@@ -267,6 +267,7 @@ dependencies = [
  "http-body-util",
  "prost",
  "tokio",
+ "tokio-util",
  "tonic",
 ]
 
@@ -5025,6 +5026,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

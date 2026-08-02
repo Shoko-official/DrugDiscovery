@@ -121,10 +121,15 @@ impl DecisionGrpcServer {
         if service.request_timeout() >= config.limits().shutdown_grace() {
             return Err(ServeDecisionGrpcServerError::ServiceLimitsRejected);
         }
+        let watch_lifecycle = service.watch_lifecycle();
+        let shutdown_watch_lifecycle = watch_lifecycle.clone();
         let (shutdown_started_tx, mut shutdown_started_rx) = oneshot::channel();
         let transport_shutdown = async move {
             shutdown.await;
-            let _ = shutdown_started_tx.send(());
+            if let Some(lifecycle) = shutdown_watch_lifecycle {
+                lifecycle.begin_shutdown();
+            }
+            let _ = shutdown_started_tx.send(tokio::time::Instant::now());
         };
         let mut transport = transport.layer(RequestTimeoutLayer {
             timeout: config.limits().transport_request_timeout(),
@@ -134,16 +139,44 @@ impl DecisionGrpcServer {
         tokio::pin!(serving);
 
         tokio::select! {
-            result = &mut serving => map_serve_result(result),
-            shutdown_started = &mut shutdown_started_rx => {
-                if shutdown_started.is_err() {
-                    return map_serve_result(serving.await);
+            result = &mut serving => {
+                if let Some(lifecycle) = watch_lifecycle {
+                    lifecycle.begin_shutdown();
+                    lifecycle.abort_workers();
+                    lifecycle.wait().await;
                 }
-                match tokio::time::timeout(config.limits().shutdown_grace(), &mut serving).await {
+                map_serve_result(result)
+            },
+            shutdown_started = &mut shutdown_started_rx => {
+                let Ok(shutdown_started) = shutdown_started else {
+                    if let Some(lifecycle) = watch_lifecycle {
+                        lifecycle.begin_shutdown();
+                        lifecycle.abort_workers();
+                        lifecycle.wait().await;
+                    }
+                    return map_serve_result(serving.await);
+                };
+                let shutdown_deadline = shutdown_started + config.limits().shutdown_grace();
+                let drained = async {
+                    let result = (&mut serving).await;
+                    if let Some(lifecycle) = watch_lifecycle.as_ref() {
+                        lifecycle.wait().await;
+                    }
+                    result
+                };
+                match tokio::time::timeout_at(shutdown_deadline, drained).await {
                     Ok(result) => map_serve_result(result),
                     Err(_) => {
                         connection_lifetime.close();
-                        match map_serve_result(serving.await) {
+                        if let Some(lifecycle) = watch_lifecycle.as_ref() {
+                            lifecycle.abort_workers();
+                        }
+                        let result = serving.await;
+                        if let Some(lifecycle) = watch_lifecycle {
+                            lifecycle.begin_shutdown();
+                            lifecycle.wait().await;
+                        }
+                        match map_serve_result(result) {
                             Ok(()) => Err(ServeDecisionGrpcServerError::ShutdownDeadlineExceeded),
                             Err(error) => Err(error),
                         }

@@ -9,7 +9,8 @@ rust-version.workspace = true
 bioworld-contracts = { path = "../contracts" }
 bioworld-decision-query = { path = "../decision-query" }
 prost.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
