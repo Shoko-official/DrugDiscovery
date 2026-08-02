@@ -18,6 +18,7 @@ mod watch_runtime;
 
 pub use peer::{DecisionGrpcConnectInfo, DecisionGrpcPeerKey};
 
+pub use bioworld_contracts::MAX_DECISION_EVENT_WIRE_BYTES;
 pub use service::{
     AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,
     DecisionGrpcService, DecisionGrpcServiceConfig, DecisionGrpcWatchConfig,
@@ -26,7 +27,7 @@ pub use service::{
     MAX_DECISION_GRPC_WATCH_IN_FLIGHT_REQUESTS, TenantAuthenticationContext, TenantAuthenticator,
     TenantAuthority,
 };
-pub use watch::{MAX_DECISION_EVENT_WIRE_BYTES, TenantScopedWatchDecisionExecutor, watch_decision};
+pub use watch::{TenantScopedWatchDecisionExecutor, watch_decision};
 pub use watch_runtime::DecisionGrpcWatchLifecycle;
 
 pub struct TenantScope(Box<str>);

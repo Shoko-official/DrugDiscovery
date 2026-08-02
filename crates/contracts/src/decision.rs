@@ -16,6 +16,9 @@ use uuid::Uuid;
 use crate::v2;
 
 pub const MAX_DECISION_WIRE_BYTES: usize = 65_536;
+const DECISION_EVENT_ENVELOPE_WIRE_BYTES: usize = 42;
+pub const MAX_DECISION_EVENT_WIRE_BYTES: usize =
+    MAX_DECISION_WIRE_BYTES + DECISION_EVENT_ENVELOPE_WIRE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedDecisionRecord {
