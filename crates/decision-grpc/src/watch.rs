@@ -33,6 +33,7 @@ pub const MAX_DECISION_EVENT_WIRE_BYTES: usize =
 pub trait TenantScopedWatchDecisionExecutor: Send + Sync {
     type Source: DecisionReplaySource + 'static;
 
+    /// Constructs a fresh lazy replay without blocking or reading its source.
     fn execute_watch_decision(
         &self,
         scope: TenantScope,
@@ -53,6 +54,18 @@ where
 {
     let query = WatchDecisionQuery::try_from(request.into_inner())
         .map_err(|_| Status::invalid_argument("decision request is invalid"))?;
+    watch_decision_query(executor, scope, query).map(Response::new)
+}
+
+pub(crate) fn watch_decision_query<E>(
+    executor: &E,
+    scope: TenantScope,
+    query: WatchDecisionQuery,
+) -> Result<BoxStream<DecisionEvent>, Status>
+where
+    E: TenantScopedWatchDecisionExecutor + ?Sized,
+    <E::Source as DecisionReplaySource>::Continuation: 'static,
+{
     let page_size = DecisionReplayPageSize::try_from(DECISION_REPLAY_PAGE_EVENTS)
         .map_err(|_| unavailable_status())?;
     let replay = executor.execute_watch_decision(scope, query, page_size);
@@ -60,8 +73,7 @@ where
         return Err(unavailable_status());
     }
 
-    let stream: BoxStream<DecisionEvent> = Box::pin(DecisionReplayEventStream::new(replay));
-    Ok(Response::new(stream))
+    Ok(Box::pin(DecisionReplayEventStream::new(replay)))
 }
 
 enum WatchState<S>

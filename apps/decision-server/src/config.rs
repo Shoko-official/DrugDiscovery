@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bioworld_decision_grpc::DecisionGrpcServiceConfig;
+use bioworld_decision_grpc::{DecisionGrpcServiceConfig, DecisionGrpcWatchConfig};
 use bioworld_decision_grpc_jwt::JwtTenantAuthenticatorConfig;
 use bioworld_decision_grpc_postgres::PostgresReaderPoolConfig;
 use bioworld_decision_grpc_server::{
@@ -33,6 +33,7 @@ pub struct DecisionServerConfig {
     jwks_file: PathBuf,
     postgres: PostgresRuntimeConfig,
     service: DecisionGrpcServiceConfig,
+    watch: Option<DecisionGrpcWatchConfig>,
 }
 
 impl DecisionServerConfig {
@@ -70,6 +71,7 @@ impl DecisionServerConfig {
             jwks_file: self.jwks_file,
             postgres: self.postgres,
             service: self.service,
+            watch: self.watch,
         }
     }
 }
@@ -99,6 +101,7 @@ pub(crate) struct DecisionServerConfigParts {
     pub(crate) jwks_file: PathBuf,
     pub(crate) postgres: PostgresRuntimeConfig,
     pub(crate) service: DecisionGrpcServiceConfig,
+    pub(crate) watch: Option<DecisionGrpcWatchConfig>,
 }
 
 pub(crate) struct ServerTlsFiles {
@@ -178,6 +181,14 @@ struct RawPostgres {
 struct RawService {
     max_in_flight: usize,
     request_timeout_seconds: u64,
+    watch: Option<RawWatch>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWatch {
+    max_in_flight: usize,
+    max_in_flight_per_tenant: usize,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +235,18 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
         let service =
             DecisionGrpcServiceConfig::try_new(raw.service.max_in_flight, request_timeout)
                 .map_err(|_| InvalidDecisionServerConfig)?;
+        let watch = raw
+            .service
+            .watch
+            .map(|watch| {
+                DecisionGrpcWatchConfig::try_new(
+                    watch.max_in_flight,
+                    watch.max_in_flight_per_tenant,
+                )
+                .and_then(|watch| watch.validate_for_service(service))
+            })
+            .transpose()
+            .map_err(|_| InvalidDecisionServerConfig)?;
         let acquire_timeout = Duration::from_secs(raw.postgres.acquire_timeout_seconds);
         let connect_timeout = Duration::from_secs(raw.postgres.connect_timeout_seconds);
         let pool = PostgresReaderPoolConfig::try_new(raw.postgres.pool_max_size, acquire_timeout)
@@ -232,6 +255,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
         if request_timeout >= shutdown_grace
             || transport_request_timeout >= shutdown_grace
             || raw.postgres.pool_max_size > raw.service.max_in_flight
+            || watch.is_some_and(|watch| watch.max_in_flight() >= raw.postgres.pool_max_size)
             || acquire_timeout > request_timeout
             || connect_timeout.is_zero()
             || connect_timeout > MAX_POSTGRES_CONNECT_TIMEOUT
@@ -286,6 +310,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
                 preflight_timeout: request_timeout,
             },
             service,
+            watch,
         })
     }
 }

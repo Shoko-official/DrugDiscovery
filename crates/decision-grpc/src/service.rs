@@ -10,13 +10,19 @@ use bioworld_contracts::{
         decision_service_server::{DecisionService, DecisionServiceServer},
     },
 };
+use bioworld_decision_query::{DecisionReplaySource, WatchDecisionQuery};
 use tokio::{sync::Semaphore, time::Instant};
 use tonic::{Extensions, Request, Response, Status, metadata::MetadataMap};
 
-use crate::{TenantScope, TenantScopedGetDecisionExecutor, get_decision};
+use crate::{
+    TenantScope, TenantScopedGetDecisionExecutor, TenantScopedWatchDecisionExecutor, get_decision,
+    watch_runtime::{DecisionGrpcWatchRuntime, WorkerDeadline, watch_encoding_limit},
+};
 
 /// Hard ceiling for admitted decision RPCs across one service instance.
 pub const MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS: usize = 4_096;
+/// Hard ceiling for supervised WatchDecision sessions across one service instance.
+pub const MAX_DECISION_GRPC_WATCH_IN_FLIGHT_REQUESTS: usize = 256;
 /// Hard ceiling for one authenticated decision RPC.
 pub const MAX_DECISION_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Stable public message for an expired decision RPC.
@@ -187,6 +193,10 @@ impl DecisionGrpcServiceConfig {
             request_timeout,
         })
     }
+
+    pub const fn max_in_flight(self) -> usize {
+        self.max_in_flight.get()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,32 +210,124 @@ impl fmt::Display for InvalidDecisionGrpcServiceConfig {
 
 impl Error for InvalidDecisionGrpcServiceConfig {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecisionGrpcWatchConfig {
+    max_in_flight: NonZeroUsize,
+    max_in_flight_per_tenant: NonZeroUsize,
+}
+
+impl DecisionGrpcWatchConfig {
+    pub fn try_new(
+        max_in_flight: usize,
+        max_in_flight_per_tenant: usize,
+    ) -> Result<Self, InvalidDecisionGrpcWatchConfig> {
+        let max_in_flight =
+            NonZeroUsize::new(max_in_flight).ok_or(InvalidDecisionGrpcWatchConfig)?;
+        let max_in_flight_per_tenant =
+            NonZeroUsize::new(max_in_flight_per_tenant).ok_or(InvalidDecisionGrpcWatchConfig)?;
+        if max_in_flight.get() > MAX_DECISION_GRPC_WATCH_IN_FLIGHT_REQUESTS
+            || max_in_flight_per_tenant > max_in_flight
+        {
+            return Err(InvalidDecisionGrpcWatchConfig);
+        }
+
+        Ok(Self {
+            max_in_flight,
+            max_in_flight_per_tenant,
+        })
+    }
+
+    pub fn validate_for_service(
+        self,
+        service: DecisionGrpcServiceConfig,
+    ) -> Result<Self, InvalidDecisionGrpcWatchConfig> {
+        if self.max_in_flight.get() >= service.max_in_flight() {
+            return Err(InvalidDecisionGrpcWatchConfig);
+        }
+        Ok(self)
+    }
+
+    pub const fn max_in_flight(self) -> usize {
+        self.max_in_flight.get()
+    }
+
+    pub const fn max_in_flight_per_tenant(self) -> usize {
+        self.max_in_flight_per_tenant.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidDecisionGrpcWatchConfig;
+
+impl fmt::Display for InvalidDecisionGrpcWatchConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("gRPC decision Watch configuration is invalid")
+    }
+}
+
+impl Error for InvalidDecisionGrpcWatchConfig {}
+
 pub struct DecisionGrpcService<A, E> {
     authenticator: A,
-    executor: E,
+    executor: Arc<E>,
     admission: Arc<Semaphore>,
     request_timeout: Duration,
+    watch: Option<DecisionGrpcWatchRuntime>,
 }
 
 impl<A, E> DecisionGrpcService<A, E> {
     pub fn new(authenticator: A, executor: E, config: DecisionGrpcServiceConfig) -> Self {
         Self {
             authenticator,
-            executor,
+            executor: Arc::new(executor),
             admission: Arc::new(Semaphore::new(config.max_in_flight.get())),
             request_timeout: config.request_timeout,
+            watch: None,
         }
     }
 
     pub fn into_server(self) -> DecisionServiceServer<Self> {
+        let max_encoding_message_size = if self.watch.is_some() {
+            watch_encoding_limit()
+        } else {
+            MAX_DECISION_WIRE_BYTES
+        };
         DecisionServiceServer::new(self)
             .max_decoding_message_size(MAX_DECISION_WIRE_BYTES)
-            .max_encoding_message_size(MAX_DECISION_WIRE_BYTES)
+            .max_encoding_message_size(max_encoding_message_size)
     }
 
     /// Returns the fixed request deadline enforced by this service instance.
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    pub fn watch_lifecycle(&self) -> Option<crate::DecisionGrpcWatchLifecycle> {
+        self.watch.as_ref().map(DecisionGrpcWatchRuntime::lifecycle)
+    }
+}
+
+impl<A, E> DecisionGrpcService<A, E>
+where
+    E: TenantScopedWatchDecisionExecutor + 'static,
+    <E::Source as DecisionReplaySource>::Continuation: 'static,
+{
+    pub fn try_new_with_watch(
+        authenticator: A,
+        executor: E,
+        service_config: DecisionGrpcServiceConfig,
+        watch_config: DecisionGrpcWatchConfig,
+    ) -> Result<Self, InvalidDecisionGrpcWatchConfig> {
+        let watch_config = watch_config.validate_for_service(service_config)?;
+        let executor = Arc::new(executor);
+        let watch = DecisionGrpcWatchRuntime::new(Arc::clone(&executor), watch_config);
+        Ok(Self {
+            authenticator,
+            executor,
+            admission: Arc::new(Semaphore::new(service_config.max_in_flight.get())),
+            request_timeout: service_config.request_timeout,
+            watch: Some(watch),
+        })
     }
 }
 
@@ -262,7 +364,7 @@ where
             }
         };
         let (scope, authority_deadline) = authority.into_parts();
-        let execution = get_decision(&self.executor, scope, request);
+        let execution = get_decision(self.executor.as_ref(), scope, request);
         tokio::pin!(execution);
         if authority_deadline < service_deadline {
             tokio::select! {
@@ -296,10 +398,56 @@ where
 
     async fn watch_decision(
         &self,
-        _request: Request<WatchDecisionRequest>,
+        request: Request<WatchDecisionRequest>,
     ) -> Result<Response<Self::WatchDecisionStream>, Status> {
-        Err(Status::unimplemented(
-            "decision operation is not implemented",
-        ))
+        let Some(watch) = self.watch.as_ref() else {
+            return Err(Status::unimplemented(
+                "decision operation is not implemented",
+            ));
+        };
+        if watch.is_cancelled() {
+            return Err(Status::unavailable("decision service is unavailable"));
+        }
+
+        let global_permit = watch.try_acquire_global()?;
+        let service_permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("decision service is at capacity"))?;
+        let service_deadline = Instant::now() + self.request_timeout;
+        let authority = {
+            let authentication =
+                self.authenticator
+                    .authenticate_tenant(TenantAuthenticationContext {
+                        metadata: request.metadata(),
+                        extensions: request.extensions(),
+                    });
+            tokio::pin!(authentication);
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(service_deadline) => {
+                    return Err(Status::deadline_exceeded(DECISION_GRPC_REQUEST_DEADLINE_MESSAGE));
+                }
+                _ = watch.cancelled() => {
+                    return Err(Status::unavailable("decision service is unavailable"));
+                }
+                result = &mut authentication => {
+                    result.map_err(AuthenticateTenantError::status)?
+                }
+            }
+        };
+        let (scope, authority_deadline) = authority.into_parts();
+        let query = WatchDecisionQuery::try_from(request.into_inner())
+            .map_err(|_| Status::invalid_argument("decision request is invalid"))?;
+        let tenant_permit = watch.try_acquire_tenant(scope.tenant_id())?;
+        let deadline = WorkerDeadline::select(service_deadline, authority_deadline);
+        let stream = watch.start(
+            scope,
+            query,
+            deadline,
+            service_permit,
+            global_permit,
+            tenant_permit,
+        )?;
+        Ok(Response::new(stream))
     }
 }

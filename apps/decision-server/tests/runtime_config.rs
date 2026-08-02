@@ -136,10 +136,56 @@ impl Drop for TemporaryFile {
 }
 
 #[test]
-fn accepts_explicit_bounded_configuration_with_redacted_debug() {
-    let control = DecisionServerConfig::try_from_json(&valid_control()).expect("valid control");
+fn accepts_get_only_and_explicit_bounded_watch_configuration_with_redacted_debug() {
+    let get_only =
+        DecisionServerConfig::try_from_json(&valid_control()).expect("valid Get-only control");
+    let mut watch = valid_control_value();
+    watch["service"]["watch"] = json!({
+        "max_in_flight": 8,
+        "max_in_flight_per_tenant": 2
+    });
+    let watch = DecisionServerConfig::try_from_json(
+        &serde_json::to_vec(&watch).expect("Watch control serialization"),
+    )
+    .expect("valid bounded Watch control");
 
-    assert_eq!(format!("{control:?}"), "DecisionServerConfig");
+    assert_eq!(format!("{get_only:?}"), "DecisionServerConfig");
+    assert_eq!(format!("{watch:?}"), "DecisionServerConfig");
+}
+
+#[test]
+fn rejects_watch_limits_without_reserved_service_and_reader_capacity() {
+    for (global, per_tenant) in [(128, 2), (16, 2), (8, 9)] {
+        let mut control = valid_control_value();
+        control["service"]["watch"] = json!({
+            "max_in_flight": global,
+            "max_in_flight_per_tenant": per_tenant
+        });
+
+        assert!(
+            DecisionServerConfig::try_from_json(
+                &serde_json::to_vec(&control).expect("Watch control serialization")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn rejects_unknown_watch_configuration_fields() {
+    let mut control = valid_control_value();
+    control["service"]["watch"] = json!({
+        "max_in_flight": 8,
+        "max_in_flight_per_tenant": 2,
+        "queue_capacity": 1
+    });
+
+    assert!(
+        DecisionServerConfig::try_from_json(
+            &serde_json::to_vec(&control).expect("Watch control serialization")
+        )
+        .is_err()
+    );
 }
 
 #[test]
