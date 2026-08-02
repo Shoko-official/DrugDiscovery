@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::{
     VersionedDecisionRecord,
     v2::{
@@ -13,7 +15,9 @@ use bioworld_decision_query::{
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
-    ScientificEventRow, project_decision_event,
+    DecisionEventVerificationClock, DecisionEventVerifier, ScientificEventRow,
+    decision_event_signature_message, decision_event_signature_value, project_decision_event,
+    stored_decision_event_signature_message,
 };
 use bioworld_event_store_postgres::{
     AppendDecisionEventError, DecisionStreamPageSize, InvalidDecisionSourceScope,
@@ -35,6 +39,94 @@ const POSTGRES_READER_USER: &str = "bioworld_reader";
 const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PASSWORD";
 const READER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_READER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
+const TEST_KEY_ID: &str = "postgres-reader-test";
+const TEST_NOW: u64 = 1_800_000_000;
+const TEST_TENANTS: [&str; 32] = [
+    "tenant-adapter-corrupt",
+    "tenant-adapter-future",
+    "tenant-adapter-hidden",
+    "tenant-adapter-hit",
+    "tenant-adapter-visible",
+    "tenant-adapter-wrong-reader",
+    "tenant-fixture",
+    "tenant-historical-ood-read",
+    "tenant-m11-exact",
+    "tenant-m11-hidden-a",
+    "tenant-m11-hidden-b",
+    "tenant-m11-shared-a",
+    "tenant-m11-shared-b",
+    "tenant-m13-opposite-identities",
+    "tenant-m14-corrupt",
+    "tenant-m14-hidden-a",
+    "tenant-m14-hidden-b",
+    "tenant-m14-latest",
+    "tenant-m14-version-one",
+    "tenant-m37-corrupt-final",
+    "tenant-m37-corrupt-first",
+    "tenant-m37-corrupt-middle",
+    "tenant-m37-cursor-a",
+    "tenant-m37-cursor-b",
+    "tenant-m37-gapped-pages",
+    "tenant-m37-hidden-a",
+    "tenant-m37-hidden-b",
+    "tenant-m37-historical-page",
+    "tenant-m37-page-cap",
+    "tenant-m37-single-page",
+    "tenant-m37-stable-horizon",
+    "tenant-qualified-ood-status",
+];
+
+#[derive(Clone, Copy)]
+struct TestClock;
+
+impl DecisionEventVerificationClock for TestClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        Some(TEST_NOW)
+    }
+}
+
+fn signing_key(tenant_id: &str) -> Ed25519KeyPair {
+    let seed = u8::try_from(
+        TEST_TENANTS
+            .iter()
+            .position(|candidate| *candidate == tenant_id)
+            .expect("fixture tenant must have a signing key")
+            + 1,
+    )
+    .expect("fixture key index must fit in a byte");
+    Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
+        .expect("deterministic Ed25519 seed must be valid")
+}
+
+fn test_verifier() -> DecisionEventVerifier {
+    let keys = TEST_TENANTS
+        .iter()
+        .map(|tenant_id| {
+            let key = signing_key(tenant_id);
+            json!({
+                "tenant_id": tenant_id,
+                "key_id": TEST_KEY_ID,
+                "algorithm": "Ed25519",
+                "public_key": URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+                "not_before": 1,
+                "not_after": 4_102_444_800_u64,
+                "status": "trusted"
+            })
+        })
+        .collect::<Vec<_>>();
+    let snapshot = serde_json::to_vec(&json!({
+        "version": "1",
+        "valid_until": TEST_NOW + 60,
+        "keys": keys
+    }))
+    .expect("fixture verifier snapshot must serialize");
+    DecisionEventVerifier::try_from_snapshot_with_clock(&snapshot, TestClock)
+        .expect("fixture verifier snapshot must be valid")
+}
+
+fn test_reader(client: &mut Client) -> PostgresDecisionEventReader<'_> {
+    PostgresDecisionEventReader::new(client, test_verifier())
+}
 
 #[test]
 fn validates_decision_stream_page_size_before_database_access() {
@@ -213,7 +305,7 @@ async fn preserves_every_qualified_ood_status_through_postgresql_write_and_read(
         append(&mut writer, expected.clone(), tenant_id).await;
         assert!(tenant_context_is_absent(&writer).await);
 
-        let stored = PostgresDecisionEventReader::new(&mut reader)
+        let stored = test_reader(&mut reader)
             .get(
                 tenant_id,
                 Uuid::parse_str(&event_id).expect("fixed event identifier must parse"),
@@ -253,7 +345,7 @@ async fn reads_an_exact_historical_event_without_detector() {
     insert_scientific_event_row(&mut writer, row).await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let stored = PostgresDecisionEventReader::new(&mut reader)
+    let stored = test_reader(&mut reader)
         .get(tenant_id, event_id)
         .await
         .expect("reader must accept the historical event")
@@ -305,7 +397,7 @@ async fn scoped_source_returns_the_exact_latest_decision_at_maximum_version() {
     assert!(tenant_context_is_absent(&writer).await);
 
     let actual = {
-        let reader = PostgresDecisionEventReader::new(&mut reader);
+        let reader = test_reader(&mut reader);
         let source = PostgresLatestDecisionSource::try_new(reader, tenant_id)
             .expect("fixed tenant scope must be valid");
         let mut get_decision = GetDecision::new(source);
@@ -331,13 +423,11 @@ async fn rejects_invalid_source_scopes_at_construction_without_database_access()
     let (mut reader, reader_task) = connect(POSTGRES_READER_USER, passwords.reader).await;
 
     for invalid_scope in ["", " tenant-adapter", "tenant-adapter ", "tenant\0adapter"] {
-        let error = match PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut reader),
-            invalid_scope,
-        ) {
-            Ok(_) => panic!("invalid tenant scope must be rejected"),
-            Err(error) => error,
-        };
+        let error =
+            match PostgresLatestDecisionSource::try_new(test_reader(&mut reader), invalid_scope) {
+                Ok(_) => panic!("invalid tenant scope must be rejected"),
+                Err(error) => error,
+            };
         let rendered = format!("{error:?} {error}");
 
         assert_eq!(error, InvalidDecisionSourceScope);
@@ -375,11 +465,9 @@ async fn scoped_source_makes_cross_tenant_and_absent_decisions_indistinguishable
     assert!(tenant_context_is_absent(&writer).await);
 
     let cross_tenant = {
-        let source = PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut reader),
-            visible_tenant,
-        )
-        .expect("fixed tenant scope must be valid");
+        let source =
+            PostgresLatestDecisionSource::try_new(test_reader(&mut reader), visible_tenant)
+                .expect("fixed tenant scope must be valid");
         GetDecision::new(source)
             .execute(GetDecisionQuery::new(hidden_decision_id))
             .await
@@ -388,11 +476,9 @@ async fn scoped_source_makes_cross_tenant_and_absent_decisions_indistinguishable
     assert!(tenant_context_is_absent(&reader).await);
 
     let absent = {
-        let source = PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut reader),
-            visible_tenant,
-        )
-        .expect("fixed tenant scope must be valid");
+        let source =
+            PostgresLatestDecisionSource::try_new(test_reader(&mut reader), visible_tenant)
+                .expect("fixed tenant scope must be valid");
         GetDecision::new(source)
             .execute(GetDecisionQuery::new(absent_decision_id))
             .await
@@ -433,11 +519,8 @@ async fn scoped_source_rejects_a_corrupt_latest_decision_without_fallback() {
     assert!(tenant_context_is_absent(&writer).await);
 
     let error = {
-        let source = PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut reader),
-            tenant_id,
-        )
-        .expect("fixed tenant scope must be valid");
+        let source = PostgresLatestDecisionSource::try_new(test_reader(&mut reader), tenant_id)
+            .expect("fixed tenant scope must be valid");
         GetDecision::new(source)
             .execute(GetDecisionQuery::new(decision_id))
             .await
@@ -466,11 +549,8 @@ async fn scoped_source_maps_writer_identity_rejection_to_source_unavailable() {
         .expect("fixed decision identifier must parse");
 
     let error = {
-        let source = PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut writer),
-            tenant_id,
-        )
-        .expect("fixed tenant scope must be valid");
+        let source = PostgresLatestDecisionSource::try_new(test_reader(&mut writer), tenant_id)
+            .expect("fixed tenant scope must be valid");
         GetDecision::new(source)
             .execute(GetDecisionQuery::new(decision_id))
             .await
@@ -505,7 +585,7 @@ async fn scoped_source_future_is_send_and_borrows_the_source_mutably() {
 
     {
         let mut source = PostgresLatestDecisionSource::try_new(
-            PostgresDecisionEventReader::new(&mut reader),
+            test_reader(&mut reader),
             "tenant-adapter-future",
         )
         .expect("fixed tenant scope must be valid");
@@ -537,7 +617,7 @@ async fn returns_the_only_version_one_event_for_a_decision_stream() {
     append(&mut writer, expected.clone(), tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let actual = PostgresDecisionEventReader::new(&mut reader)
+    let actual = test_reader(&mut reader)
         .get_latest(tenant_id, decision_id)
         .await
         .expect("reader must load the only stream event");
@@ -575,7 +655,7 @@ async fn reads_a_complete_single_event_decision_stream_page() {
     assert!(tenant_context_is_absent(&writer).await);
 
     let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
-    let page = PostgresDecisionEventReader::new(&mut reader)
+    let page = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, page_size, None)
         .await
         .expect("reader must load the complete stream page");
@@ -637,7 +717,7 @@ async fn rejects_a_continuation_reused_for_another_tenant_or_decision_stream() {
     assert!(tenant_context_is_absent(&writer).await);
 
     let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
-    let first = PostgresDecisionEventReader::new(&mut reader)
+    let first = test_reader(&mut reader)
         .get_stream_page(tenant_a, decision_a, page_size, None)
         .await
         .expect("first page must load");
@@ -646,7 +726,7 @@ async fn rejects_a_continuation_reused_for_another_tenant_or_decision_stream() {
         .expect("a second exact-stream event must require continuation");
 
     for (tenant_id, decision_id) in [(tenant_a, decision_b), (tenant_b, decision_a)] {
-        let error = PostgresDecisionEventReader::new(&mut reader)
+        let error = test_reader(&mut reader)
             .get_stream_page(tenant_id, decision_id, page_size, Some(continuation))
             .await
             .err()
@@ -690,7 +770,7 @@ async fn orders_and_resumes_gapped_versions_through_u64_max() {
     assert!(tenant_context_is_absent(&writer).await);
 
     let page_size = DecisionStreamPageSize::try_from(2).expect("fixed page size must be valid");
-    let first = PostgresDecisionEventReader::new(&mut reader)
+    let first = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, page_size, None)
         .await
         .expect("first page must load");
@@ -703,7 +783,7 @@ async fn orders_and_resumes_gapped_versions_through_u64_max() {
         .continuation()
         .expect("remaining events must produce a continuation");
 
-    let second = PostgresDecisionEventReader::new(&mut reader)
+    let second = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, page_size, Some(continuation))
         .await
         .expect("second page must resume");
@@ -745,7 +825,7 @@ async fn freezes_the_replay_horizon_until_a_fresh_page_sequence() {
     append(&mut writer, horizon_event.clone(), tenant_id).await;
 
     let one = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
-    let first = PostgresDecisionEventReader::new(&mut reader)
+    let first = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, one, None)
         .await
         .expect("first page must capture the horizon");
@@ -759,14 +839,14 @@ async fn freezes_the_replay_horizon_until_a_fresh_page_sequence() {
     append(&mut writer, later_event.clone(), tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let frozen = PostgresDecisionEventReader::new(&mut reader)
+    let frozen = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, all, Some(continuation))
         .await
         .expect("frozen replay must resume");
     assert_eq!(frozen.events(), std::slice::from_ref(&horizon_event));
     assert!(frozen.continuation().is_none());
 
-    let fresh = PostgresDecisionEventReader::new(&mut reader)
+    let fresh = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, all, None)
         .await
         .expect("fresh replay must observe the later append");
@@ -799,7 +879,7 @@ async fn makes_cross_tenant_and_missing_stream_pages_indistinguishable() {
 
     let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
     for decision_id in [hidden_decision_id, missing_decision_id] {
-        let page = PostgresDecisionEventReader::new(&mut reader)
+        let page = test_reader(&mut reader)
             .get_stream_page(tenant_a, decision_id, page_size, None)
             .await
             .expect("hidden and missing streams must both return empty pages");
@@ -814,7 +894,7 @@ async fn makes_cross_tenant_and_missing_stream_pages_indistinguishable() {
 }
 
 #[tokio::test]
-async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
+async fn rejects_the_complete_page_when_any_selected_row_has_an_invalid_signature() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -854,7 +934,7 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
         ),
     ];
 
-    for (tenant_id, decision_id, event_ids, corrupt_index) in cases {
+    for (tenant_id, decision_id, event_ids, invalid_signature_index) in cases {
         let decision_id =
             Uuid::parse_str(decision_id).expect("fixed decision identifier must parse");
         for (index, event_id) in event_ids.into_iter().enumerate() {
@@ -863,19 +943,19 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
                 &decision_id.to_string(),
                 u64::try_from(index + 1).expect("fixed version must fit"),
             );
-            if index == corrupt_index {
-                insert_corrupt_event(&mut writer, event, tenant_id).await;
+            if index == invalid_signature_index {
+                insert_event_with_invalid_signature(&mut writer, event, tenant_id).await;
             } else {
                 append(&mut writer, event, tenant_id).await;
             }
         }
         assert!(tenant_context_is_absent(&writer).await);
 
-        let error = PostgresDecisionEventReader::new(&mut reader)
+        let error = test_reader(&mut reader)
             .get_stream_page(tenant_id, decision_id, page_size, None)
             .await
             .err()
-            .expect("any corrupt selected row must reject the complete page");
+            .expect("any invalid signature must reject the complete page");
 
         assert_eq!(
             error,
@@ -926,7 +1006,7 @@ async fn caps_pages_at_sixteen_events_transfers_the_buffer_and_excludes_other_st
 
     let page_size = DecisionStreamPageSize::try_from(MAX_DECISION_STREAM_PAGE_EVENTS)
         .expect("maximum page size must be valid");
-    let first = PostgresDecisionEventReader::new(&mut reader)
+    let first = test_reader(&mut reader)
         .get_stream_page(tenant_id, target_decision_id, page_size, None)
         .await
         .expect("maximum first page must load");
@@ -938,7 +1018,7 @@ async fn caps_pages_at_sixteen_events_transfers_the_buffer_and_excludes_other_st
         .as_ref()
         .expect("seventeenth event must require continuation");
 
-    let second = PostgresDecisionEventReader::new(&mut reader)
+    let second = test_reader(&mut reader)
         .get_stream_page(tenant_id, target_decision_id, page_size, Some(continuation))
         .await
         .expect("final page must load");
@@ -963,7 +1043,7 @@ async fn preserves_historical_optional_field_absence_in_stream_pages() {
     insert_scientific_event_row(&mut writer, row).await;
 
     let page_size = DecisionStreamPageSize::try_from(1).expect("fixed page size must be valid");
-    let page = PostgresDecisionEventReader::new(&mut reader)
+    let page = test_reader(&mut reader)
         .get_stream_page(tenant_id, decision_id, page_size, None)
         .await
         .expect("historical stream page must remain readable");
@@ -1043,7 +1123,7 @@ async fn returns_u64_max_when_version_one_was_inserted_and_occurred_later() {
     .await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let actual = PostgresDecisionEventReader::new(&mut reader)
+    let actual = test_reader(&mut reader)
         .get_latest(tenant_id, decision_id)
         .await
         .expect("reader must load the numerically latest stream event");
@@ -1076,12 +1156,12 @@ async fn makes_cross_tenant_and_missing_decision_streams_indistinguishable() {
     append(&mut writer, hidden, tenant_b).await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let cross_tenant = PostgresDecisionEventReader::new(&mut reader)
+    let cross_tenant = test_reader(&mut reader)
         .get_latest(tenant_a, hidden_decision_id)
         .await
         .expect("cross-tenant stream lookup must not disclose an error");
     assert!(tenant_context_is_absent(&reader).await);
-    let absent = PostgresDecisionEventReader::new(&mut reader)
+    let absent = test_reader(&mut reader)
         .get_latest(tenant_a, missing_decision_id)
         .await
         .expect("absent stream lookup must succeed");
@@ -1094,7 +1174,7 @@ async fn makes_cross_tenant_and_missing_decision_streams_indistinguishable() {
 }
 
 #[tokio::test]
-async fn rejects_a_corrupt_latest_event_without_falling_back() {
+async fn rejects_an_invalid_signature_for_exact_and_latest_reads_without_falling_back() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -1108,7 +1188,7 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
         &decision_id.to_string(),
         1,
     );
-    let corrupt_latest = decision_event_at_version(
+    let invalid_latest = decision_event_at_version(
         "01910d47-6f80-7a31-8c29-1d5c4f6b8106",
         &decision_id.to_string(),
         2,
@@ -1116,21 +1196,31 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
 
     append(&mut writer, valid_older.clone(), tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
-    insert_corrupt_event(&mut writer, corrupt_latest, tenant_id).await;
+    let invalid_event_id = projected_row(&invalid_latest, tenant_id).event_id;
+    insert_event_with_invalid_signature(&mut writer, invalid_latest, tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
 
     let older_event_id = projected_row(&valid_older, tenant_id).event_id;
-    let loaded_older = PostgresDecisionEventReader::new(&mut reader)
+    let loaded_older = test_reader(&mut reader)
         .get(tenant_id, older_event_id)
         .await
         .expect("older stream event must remain readable");
     assert_eq!(loaded_older, Some(valid_older));
     assert!(tenant_context_is_absent(&reader).await);
 
-    let error = PostgresDecisionEventReader::new(&mut reader)
+    let exact_error = test_reader(&mut reader)
+        .get(tenant_id, invalid_event_id)
+        .await
+        .expect_err("exact read must reject an invalid signature");
+
+    assert_eq!(exact_error, ReadDecisionEventError::StoredEventRejected);
+    assert_redacted(&exact_error);
+    assert!(tenant_context_is_absent(&reader).await);
+
+    let error = test_reader(&mut reader)
         .get_latest(tenant_id, decision_id)
         .await
-        .expect_err("corrupt latest event must not fall back to an older version");
+        .expect_err("invalid latest signature must not fall back to an older version");
 
     assert_eq!(error, ReadDecisionEventError::StoredEventRejected);
     assert_redacted(&error);
@@ -1139,21 +1229,43 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
     reader_task.abort();
 }
 
-fn metadata(tenant_id: &str) -> DecisionEventMetadata {
-    metadata_at(tenant_id, occurred_at())
+fn metadata(event: &DecisionEvent, tenant_id: &str) -> DecisionEventMetadata {
+    metadata_at(event, tenant_id, occurred_at())
 }
 
-fn metadata_at(tenant_id: &str, event_occurred_at: DateTime<Utc>) -> DecisionEventMetadata {
+fn metadata_at(
+    event: &DecisionEvent,
+    tenant_id: &str,
+    event_occurred_at: DateTime<Utc>,
+) -> DecisionEventMetadata {
     DecisionEventMetadata::try_new(
         tenant_id.to_owned(),
         event_occurred_at,
-        json!({"algorithm": "Ed25519", "key_id": "m11-test", "value": "test-signature"}),
+        signature_value(event, tenant_id, event_occurred_at),
     )
     .expect("fixed metadata must be valid")
 }
 
+fn signature_value(
+    event: &DecisionEvent,
+    tenant_id: &str,
+    event_occurred_at: DateTime<Utc>,
+) -> serde_json::Value {
+    let key = signing_key(tenant_id);
+    let message = decision_event_signature_message(
+        event.clone(),
+        tenant_id.to_owned(),
+        event_occurred_at,
+        TEST_KEY_ID,
+    )
+    .expect("fixture signature message must be valid");
+    let signature = key.sign(&message);
+    decision_event_signature_value(TEST_KEY_ID, signature.as_ref())
+        .expect("fixture signature must be valid")
+}
+
 fn historical_ood_status_row(tenant_id: &str) -> ScientificEventRow {
-    ScientificEventRow {
+    let mut row = ScientificEventRow {
         event_id: Uuid::parse_str("01910d47-6f80-7a31-8c29-1d5c4f6b7012")
             .expect("fixed event identifier must parse"),
         event_type: DECISION_EVENT_TYPE.to_owned(),
@@ -1189,7 +1301,16 @@ fn historical_ood_status_row(tenant_id: &str) -> ScientificEventRow {
         .as_object()
         .expect("fixed signature must be an object")
         .clone(),
-    }
+    };
+    let key = signing_key(tenant_id);
+    let message = stored_decision_event_signature_message(&row, TEST_KEY_ID)
+        .expect("historical fixture signature message must be valid");
+    row.signature = decision_event_signature_value(TEST_KEY_ID, key.sign(&message).as_ref())
+        .expect("historical fixture signature must be valid")
+        .as_object()
+        .expect("fixture signature must be an object")
+        .clone();
+    row
 }
 
 fn integration_passwords() -> Option<IntegrationPasswords> {
@@ -1237,8 +1358,9 @@ async fn append_at(
     tenant_id: &str,
     event_occurred_at: DateTime<Utc>,
 ) {
+    let metadata = metadata_at(&event, tenant_id, event_occurred_at);
     PostgresDecisionEventWriter::new(client)
-        .append(event, metadata_at(tenant_id, event_occurred_at))
+        .append(event, metadata)
         .await
         .expect("writer must seed a valid integration event");
 }
@@ -1246,6 +1368,29 @@ async fn append_at(
 async fn insert_corrupt_event(client: &mut Client, event: DecisionEvent, tenant_id: &str) {
     let mut row = projected_row(&event, tenant_id);
     row.payload_sha256 = "0".repeat(64);
+    insert_scientific_event_row(client, row).await;
+}
+
+async fn insert_event_with_invalid_signature(
+    client: &mut Client,
+    event: DecisionEvent,
+    tenant_id: &str,
+) {
+    let mut row = projected_row(&event, tenant_id);
+    let signature_value = row
+        .signature
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .expect("projected signature value must be a string");
+    let mut signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_value)
+        .expect("projected signature must use canonical base64url");
+    assert_eq!(signature_bytes.len(), 64);
+    signature_bytes[0] ^= 1;
+    row.signature.insert(
+        "value".to_owned(),
+        serde_json::Value::String(URL_SAFE_NO_PAD.encode(signature_bytes)),
+    );
     insert_scientific_event_row(client, row).await;
 }
 
@@ -1304,7 +1449,8 @@ async fn tenant_context_is_absent(client: &Client) -> bool {
 }
 
 fn projected_row(event: &DecisionEvent, tenant_id: &str) -> ScientificEventRow {
-    project_decision_event(event.clone(), metadata(tenant_id)).expect("fixed event must project")
+    project_decision_event(event.clone(), metadata(event, tenant_id))
+        .expect("fixed event must project")
 }
 
 fn projected_row_at(
@@ -1312,8 +1458,11 @@ fn projected_row_at(
     tenant_id: &str,
     event_occurred_at: DateTime<Utc>,
 ) -> ScientificEventRow {
-    project_decision_event(event.clone(), metadata_at(tenant_id, event_occurred_at))
-        .expect("fixed historical event must project")
+    project_decision_event(
+        event.clone(),
+        metadata_at(event, tenant_id, event_occurred_at),
+    )
+    .expect("fixed historical event must project")
 }
 
 fn assert_redacted(error: &(impl std::fmt::Debug + std::fmt::Display)) {
@@ -1341,7 +1490,7 @@ fn assert_redacted(error: &(impl std::fmt::Debug + std::fmt::Display)) {
 #[test]
 fn exposes_a_narrow_reader_api_and_redacted_errors() {
     fn constructor(client: &mut Client) -> PostgresDecisionEventReader<'_> {
-        PostgresDecisionEventReader::new(client)
+        test_reader(client)
     }
     let _ = constructor;
 
@@ -1351,6 +1500,7 @@ fn exposes_a_narrow_reader_api_and_redacted_errors() {
         ReadDecisionEventError::TenantContextRejected,
         ReadDecisionEventError::ReadOnlyTransactionRejected,
         ReadDecisionEventError::StoredEventRejected,
+        ReadDecisionEventError::TrustUnavailable,
         ReadDecisionEventError::AccessDenied,
         ReadDecisionEventError::RetryableTransaction,
         ReadDecisionEventError::ConnectionUnavailable,
@@ -1385,7 +1535,7 @@ async fn reads_the_exact_decision_event_with_the_maximum_u64_version() {
     append(&mut writer, expected.clone(), tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
 
-    let actual = PostgresDecisionEventReader::new(&mut reader)
+    let actual = test_reader(&mut reader)
         .get(tenant_id, id)
         .await
         .expect("reader must load a valid event");
@@ -1422,12 +1572,12 @@ async fn makes_cross_tenant_events_indistinguishable_from_absent_events() {
 
     append(&mut writer, hidden, tenant_b).await;
 
-    let cross_tenant = PostgresDecisionEventReader::new(&mut reader)
+    let cross_tenant = test_reader(&mut reader)
         .get(tenant_a, hidden_id)
         .await
         .expect("cross-tenant lookup must not disclose an error");
     assert!(tenant_context_is_absent(&reader).await);
-    let absent = PostgresDecisionEventReader::new(&mut reader)
+    let absent = test_reader(&mut reader)
         .get(tenant_a, missing_id)
         .await
         .expect("absent lookup must succeed");
@@ -1467,11 +1617,11 @@ async fn resolves_the_same_event_identifier_independently_for_each_tenant() {
     append(&mut writer, event_a.clone(), tenant_a).await;
     append(&mut writer, event_b.clone(), tenant_b).await;
 
-    let loaded_a = PostgresDecisionEventReader::new(&mut reader)
+    let loaded_a = test_reader(&mut reader)
         .get(tenant_a, shared_id)
         .await
         .expect("tenant A event must be readable");
-    let loaded_b = PostgresDecisionEventReader::new(&mut reader)
+    let loaded_b = test_reader(&mut reader)
         .get(tenant_b, shared_id)
         .await
         .expect("tenant B event must be readable");
@@ -1495,7 +1645,7 @@ async fn rejects_a_corrupt_stored_event_without_leaking_details_or_tenant_contex
     );
     let fixture_id = projected_row(&fixture_identity, "tenant-fixture").event_id;
 
-    let error = PostgresDecisionEventReader::new(&mut reader)
+    let error = test_reader(&mut reader)
         .get("tenant-fixture", fixture_id)
         .await
         .expect_err("legacy fixture is not a valid decision event");
@@ -1522,7 +1672,7 @@ async fn rejects_writer_for_reads_and_reader_for_appends() {
     );
     let event_id = projected_row(&event, tenant_id).event_id;
 
-    let read_error = PostgresDecisionEventReader::new(&mut writer)
+    let read_error = test_reader(&mut writer)
         .get(tenant_id, event_id)
         .await
         .expect_err("writer identity must not be accepted for reads");
@@ -1530,7 +1680,7 @@ async fn rejects_writer_for_reads_and_reader_for_appends() {
     assert_redacted(&read_error);
     assert!(tenant_context_is_absent(&writer).await);
 
-    let page_error = PostgresDecisionEventReader::new(&mut writer)
+    let page_error = test_reader(&mut writer)
         .get_stream_page(
             tenant_id,
             decision_id,
@@ -1547,8 +1697,9 @@ async fn rejects_writer_for_reads_and_reader_for_appends() {
     assert_redacted(&page_error);
     assert!(tenant_context_is_absent(&writer).await);
 
+    let event_metadata = metadata(&event, tenant_id);
     let append_error = PostgresDecisionEventWriter::new(&mut reader)
-        .append(event, metadata(tenant_id))
+        .append(event, event_metadata)
         .await
         .expect_err("reader identity must not be accepted for appends");
     assert_eq!(

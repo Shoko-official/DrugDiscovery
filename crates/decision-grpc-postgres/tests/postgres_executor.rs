@@ -13,7 +13,7 @@ use aws_lc_rs::{
     digest::{SHA256, digest},
     rand::SystemRandom,
     rsa::{KeyPair, KeySize, PublicKeyComponents},
-    signature::{KeyPair as _, RSA_PKCS1_SHA256},
+    signature::{Ed25519KeyPair, KeyPair as _, RSA_PKCS1_SHA256},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
@@ -42,11 +42,15 @@ use bioworld_decision_query::{
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
+    DecisionEventVerificationClock, DecisionEventVerifier, ScientificEventRow,
+    decision_event_signature_value, stored_decision_event_signature_message,
 };
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use tonic::{Code, Request, Status, codegen::tokio_stream::StreamExt};
+use uuid::Uuid;
 
 const POSTGRES_HOST: &str = "127.0.0.1";
 const POSTGRES_PORT: u16 = 5432;
@@ -58,8 +62,8 @@ const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PAS
 const READER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_READER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
 const OCCURRED_AT: &str = "2026-07-21T00:00:00Z";
-const SIGNATURE: &str =
-    r#"{"algorithm":"Ed25519","key_id":"m22-test","value":"integration-signature"}"#;
+const EVENT_KEY_ID: &str = "grpc-postgres-test";
+const TEST_NOW: u64 = 1_800_000_000;
 const TENANT_CONTEXT_IS_ABSENT: &str =
     "SELECT NULLIF(pg_catalog.current_setting('bioworld.tenant_id', true), '') IS NULL";
 const INSERT_EVENT: &str = "INSERT INTO public.scientific_event (event_id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version, occurred_at, tenant_id, payload, payload_sha256, signature) VALUES ($1::text::uuid, $2, $3, $4, $5, $6::text::numeric, $7::text::timestamptz, $8, $9::text::jsonb, $10, $11::text::jsonb)";
@@ -87,6 +91,32 @@ const JWT_ISSUER: &str = "https://identity.bioworld.test";
 const JWT_AUDIENCE: &str = "https://decision.bioworld.test";
 const JWT_REQUIRED_SCOPE: &str = "decision:read";
 const JWT_KEY_ID: &str = "postgres-integration-key";
+const TEST_TENANTS: [&str; 24] = [
+    TENANT_A,
+    TENANT_B,
+    POOL_TENANT_A,
+    POOL_TENANT_B,
+    SERVICE_TENANT_A,
+    SERVICE_TENANT_B,
+    JWT_SERVICE_TENANT_A,
+    JWT_SERVICE_TENANT_B,
+    SERVICE_TIMEOUT_TENANT,
+    REPLAY_TENANT_A,
+    REPLAY_TENANT_B,
+    REPLAY_HORIZON_TENANT,
+    REPLAY_ROTATION_TENANT,
+    REPLAY_CORRUPT_TENANT,
+    REPLAY_CLEANUP_TENANT,
+    "tenant-grpc-postgres-cleanup",
+    "tenant-grpc-postgres-closed",
+    "tenant-grpc-postgres-corrupt",
+    "tenant-grpc-postgres-finish",
+    "tenant-grpc-postgres-hidden",
+    "tenant-grpc-postgres-visible",
+    "tenant-grpc-postgres-writer-role",
+    "tenant-grpc-watch-executor-a",
+    "tenant-grpc-watch-executor-b",
+];
 const TENANT_A_PAYLOAD: &str = r#"{"aggregate_version":"18446744073709551615","cou_id":"COU-GRPC-PG-A","decision_id":"018f5a72-9c4b-7d31-8f6a-26f08f3fa601","evidence":{"id":"ES-GRPC-PG-A","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"prediction_interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.25","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.5"},"prediction_positions":[{"dependency_group_id":"shared-training-set","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.4","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.4"},"prediction_evidence":{"id":"ES-PRED-Z","sha256":"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"},"source_id":"model-z","source_version":"2026.07"},{"dependency_group_id":"independent-assay","interval":{"calibration_evidence":{"id":"ES-CAL-001","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"calibration_method_id":"held_out_calibration","calibration_method_version":"2026.07","interval_method_id":"split_conformal","interval_method_version":"1.0","lower_decimal":"0.2","nominal_coverage_decimal":"0.95","target":"binding_affinity","unit":"nM","upper_decimal":"1.2"},"prediction_evidence":{"id":"ES-PRED-A","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"source_id":"model-a","source_version":"2026.06"}],"rationale":["Tenant A decision."],"recommendation":"promote"}"#;
 const TENANT_A_PAYLOAD_SHA256: &str =
     "fb6f8025346e9471ff088157960c3ae647d68056079772615db61948a0611b79";
@@ -105,6 +135,113 @@ struct EventFixture {
     payload: &'static str,
     payload_sha256: &'static str,
     record: DecisionRecord,
+}
+
+struct RawEventFixture<'a> {
+    event_id: &'a str,
+    tenant_id: &'a str,
+    decision_id: &'a str,
+    aggregate_version: u64,
+    payload: &'a str,
+    payload_sha256: &'a str,
+    signature: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct TestClock;
+
+impl DecisionEventVerificationClock for TestClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        Some(TEST_NOW)
+    }
+}
+
+fn event_signing_key(tenant_id: &str) -> Ed25519KeyPair {
+    let seed = u8::try_from(
+        TEST_TENANTS
+            .iter()
+            .position(|candidate| *candidate == tenant_id)
+            .expect("fixture tenant must have a signing key")
+            + 1,
+    )
+    .expect("fixture key index must fit in a byte");
+    Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
+        .expect("deterministic Ed25519 seed must be valid")
+}
+
+fn event_verifier() -> DecisionEventVerifier {
+    let keys = TEST_TENANTS
+        .iter()
+        .map(|tenant_id| {
+            let key = event_signing_key(tenant_id);
+            json!({
+                "tenant_id": tenant_id,
+                "key_id": EVENT_KEY_ID,
+                "algorithm": "Ed25519",
+                "public_key": URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+                "not_before": 1,
+                "not_after": 4_102_444_800_u64,
+                "status": "trusted"
+            })
+        })
+        .collect::<Vec<_>>();
+    let snapshot = serde_json::to_vec(&json!({
+        "version": "1",
+        "valid_until": TEST_NOW + 60,
+        "keys": keys
+    }))
+    .expect("fixture verifier snapshot must serialize");
+    DecisionEventVerifier::try_from_snapshot_with_clock(&snapshot, TestClock)
+        .expect("fixture verifier snapshot must be valid")
+}
+
+fn event_signature(
+    event_id: &str,
+    tenant_id: &str,
+    decision_id: &str,
+    aggregate_version: u64,
+    payload: &str,
+) -> String {
+    let payload_sha256 = digest(&SHA256, payload.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let occurred_at = DateTime::parse_from_rfc3339(OCCURRED_AT)
+        .expect("fixed event timestamp must parse")
+        .with_timezone(&Utc);
+    let row = ScientificEventRow {
+        event_id: Uuid::parse_str(event_id).expect("fixed event identifier must parse"),
+        event_type: DECISION_EVENT_TYPE.to_owned(),
+        schema_version: DECISION_SCHEMA_VERSION.to_owned(),
+        aggregate_type: DECISION_AGGREGATE_TYPE.to_owned(),
+        aggregate_id: decision_id.to_owned(),
+        aggregate_version,
+        occurred_at,
+        tenant_id: tenant_id.to_owned(),
+        payload: serde_json::from_str(payload).expect("fixture payload must parse"),
+        payload_sha256,
+        signature: json!({"placeholder": true})
+            .as_object()
+            .expect("placeholder signature must be an object")
+            .clone(),
+    };
+    let message = stored_decision_event_signature_message(&row, EVENT_KEY_ID)
+        .expect("fixture signature message must be valid");
+    let signature = event_signing_key(tenant_id).sign(&message);
+    serde_json::to_string(
+        &decision_event_signature_value(EVENT_KEY_ID, signature.as_ref())
+            .expect("fixture signature must be valid"),
+    )
+    .expect("fixture signature must serialize")
+}
+
+fn invalid_event_signature() -> String {
+    serde_json::to_string(
+        &decision_event_signature_value(EVENT_KEY_ID, &[0_u8; 64])
+            .expect("fixed invalid signature bytes must form a strict Ed25519 envelope"),
+    )
+    .expect("invalid fixture signature must serialize")
 }
 
 #[derive(Clone, Copy)]
@@ -524,6 +661,32 @@ async fn seed_raw_event(
     payload: &str,
     payload_sha256: &str,
 ) {
+    let signature = event_signature(event_id, tenant_id, decision_id, aggregate_version, payload);
+    seed_raw_event_with_signature(
+        writer,
+        RawEventFixture {
+            event_id,
+            tenant_id,
+            decision_id,
+            aggregate_version,
+            payload,
+            payload_sha256,
+            signature: &signature,
+        },
+    )
+    .await;
+}
+
+async fn seed_raw_event_with_signature(writer: &mut Client, fixture: RawEventFixture<'_>) {
+    let RawEventFixture {
+        event_id,
+        tenant_id,
+        decision_id,
+        aggregate_version,
+        payload,
+        payload_sha256,
+        signature,
+    } = fixture;
     let transaction = writer
         .transaction()
         .await
@@ -553,7 +716,7 @@ async fn seed_raw_event(
                 &tenant_id,
                 &payload,
                 &payload_sha256,
-                &SIGNATURE,
+                &signature,
             ],
         )
         .await
@@ -1195,7 +1358,7 @@ async fn production_pool_executes_concurrent_tenant_isolated_reads() {
     seed_event(&mut writer.client, &tenant_a).await;
     seed_event(&mut writer.client, &tenant_b).await;
     let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
 
     let (tenant_a_response, tenant_b_response) = tokio::join!(
         get_decision(&executor, scope(POOL_TENANT_A), request(SHARED_DECISION_ID),),
@@ -1246,7 +1409,7 @@ async fn generated_service_executes_concurrent_tenant_isolated_postgres_reads() 
     let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
     let service = DecisionGrpcService::new(
         TestTenantAuthenticator,
-        PostgresGetDecisionExecutor::new(pool.clone()),
+        PostgresGetDecisionExecutor::new(pool.clone(), event_verifier()),
         DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(2)).unwrap(),
     );
 
@@ -1320,7 +1483,7 @@ async fn jwt_authenticated_service_executes_tenant_isolated_postgres_reads() {
     let pool = production_reader_pool(passwords.reader, 2, Duration::from_secs(1));
     let service = DecisionGrpcService::new(
         authenticator,
-        PostgresGetDecisionExecutor::new(pool.clone()),
+        PostgresGetDecisionExecutor::new(pool.clone(), event_verifier()),
         DecisionGrpcServiceConfig::try_new(2, Duration::from_secs(2)).unwrap(),
     );
     let tenant_a_token = signing_key.token(now, JWT_SERVICE_TENANT_A);
@@ -1403,10 +1566,13 @@ async fn service_timeout_discards_an_acquired_production_lease_and_recovers() {
     let acquired = Arc::new(AtomicUsize::new(0));
     let service = DecisionGrpcService::new(
         TestTenantAuthenticator,
-        PostgresGetDecisionExecutor::new(DelayFirstProductionLease {
-            pool: pool.clone(),
-            acquired: Arc::clone(&acquired),
-        }),
+        PostgresGetDecisionExecutor::new(
+            DelayFirstProductionLease {
+                pool: pool.clone(),
+                acquired: Arc::clone(&acquired),
+            },
+            event_verifier(),
+        ),
         DecisionGrpcServiceConfig::try_new(1, Duration::from_millis(100)).unwrap(),
     );
 
@@ -1475,7 +1641,7 @@ async fn concurrent_scoped_reads_isolate_tenants_and_return_clean_sessions_for_r
     let reader_a = connect(POSTGRES_READER_USER, passwords.reader.clone()).await;
     let reader_b = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader_a, reader_b]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let mut tenant_a_request = request(SHARED_DECISION_ID);
     tenant_a_request
         .metadata_mut()
@@ -1540,7 +1706,7 @@ async fn cross_tenant_and_absent_decisions_have_the_same_redacted_status() {
 
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let mut hidden_request = request(hidden_decision_id);
     hidden_request
         .metadata_mut()
@@ -1590,7 +1756,7 @@ async fn writer_identity_failure_is_redacted_and_returns_a_clean_reusable_lease(
     };
     let writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
     let pool = TestReaderPool::new(vec![writer]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let submitted_tenant = "tenant-grpc-postgres-writer-role";
     let first_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa606";
     let second_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa608";
@@ -1669,7 +1835,7 @@ async fn inconsistent_stored_payload_is_redacted_and_returns_a_clean_reusable_le
 
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
 
     let status = get_decision(
         &executor,
@@ -1707,6 +1873,73 @@ async fn inconsistent_stored_payload_is_redacted_and_returns_a_clean_reusable_le
 }
 
 #[tokio::test]
+async fn invalid_stored_signature_maps_to_exact_redacted_grpc_error() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let submitted_tenant = "tenant-grpc-postgres-corrupt";
+    let submitted_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa608";
+    let invalid_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6bc608";
+    let (payload, payload_sha256) =
+        replay_payload(submitted_decision, 2, "COU-GRPC-PG-INVALID-SIGNATURE");
+    let invalid_signature = invalid_event_signature();
+    seed_raw_event_with_signature(
+        &mut writer.client,
+        RawEventFixture {
+            event_id: invalid_event_id,
+            tenant_id: submitted_tenant,
+            decision_id: submitted_decision,
+            aggregate_version: 2,
+            payload: &payload,
+            payload_sha256: &payload_sha256,
+            signature: &invalid_signature,
+        },
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer.client).await);
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
+
+    let status = get_decision(
+        &executor,
+        scope(submitted_tenant),
+        request(submitted_decision),
+    )
+    .await
+    .expect_err("invalid stored signature must be rejected");
+
+    assert_public_status(
+        &status,
+        Code::Unavailable,
+        "decision service is unavailable",
+    );
+    assert_status_does_not_reflect(
+        &status,
+        &[
+            submitted_tenant,
+            submitted_decision,
+            invalid_event_id,
+            &payload_sha256,
+            "COU-GRPC-PG-INVALID-SIGNATURE",
+        ],
+    );
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    assert_eq!(pool.active(), 0);
+    pool.assert_available_sessions_are_clean(1).await;
+
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
 async fn closed_connection_is_redacted_and_discarded_without_reuse() {
     let Some(passwords) = integration_passwords() else {
         return;
@@ -1717,7 +1950,7 @@ async fn closed_connection_is_redacted_and_discarded_without_reuse() {
     reader.disconnect().await;
 
     let pool = TestReaderPool::new(vec![reader]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let submitted_tenant = "tenant-grpc-postgres-closed";
     let submitted_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa609";
 
@@ -1775,7 +2008,7 @@ async fn residual_tenant_context_discards_the_session_instead_of_reusing_it() {
     assert_eq!(configured, residual_tenant);
 
     let pool = TestReaderPool::new(vec![reader]);
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let submitted_tenant = "tenant-grpc-postgres-cleanup";
     let submitted_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa604";
 
@@ -1816,7 +2049,7 @@ async fn finish_failure_discards_the_session_and_overrides_the_application_resul
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
     pool.fail_next_finish();
-    let executor = PostgresGetDecisionExecutor::new(pool.clone());
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
     let submitted_tenant = "tenant-grpc-postgres-finish";
     let submitted_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa605";
 
@@ -1903,7 +2136,7 @@ async fn watch_executor_streams_exact_tenant_history_with_one_clean_lease_per_pa
 
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
-    let executor = PostgresDecisionExecutor::new(pool.clone());
+    let executor = PostgresDecisionExecutor::new(pool.clone(), event_verifier());
     let response = watch_decision(
         &executor,
         scope(tenant_a),
@@ -1996,7 +2229,11 @@ async fn replay_uses_one_clean_lease_per_page_and_freezes_its_horizon() {
 
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
-    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_HORIZON_TENANT));
+    let source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_HORIZON_TENANT),
+        event_verifier(),
+    );
     let mut replay = DecisionReplay::try_from_request(
         source,
         watch_request(REPLAY_DECISION_ID),
@@ -2060,8 +2297,11 @@ async fn replay_uses_one_clean_lease_per_page_and_freezes_its_horizon() {
     );
     assert_eq!(pool.acquisitions(), 2);
 
-    let fresh_source =
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_HORIZON_TENANT));
+    let fresh_source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_HORIZON_TENANT),
+        event_verifier(),
+    );
     let mut fresh = DecisionReplay::try_from_request(
         fresh_source,
         watch_request(REPLAY_DECISION_ID),
@@ -2154,7 +2394,11 @@ async fn replay_continuation_resumes_on_a_different_physical_session() {
     assert_ne!(first_backend, second_backend);
 
     let pool = TestReaderPool::new(vec![first_reader, second_reader]);
-    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_ROTATION_TENANT));
+    let source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_ROTATION_TENANT),
+        event_verifier(),
+    );
     let mut replay =
         DecisionReplay::new(source, watch_query(REPLAY_DECISION_ID), replay_page_size(1));
 
@@ -2232,12 +2476,12 @@ async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
     let pool = TestReaderPool::new(vec![reader]);
     let query = watch_query(REPLAY_DECISION_ID);
     let mut tenant_a = DecisionReplay::new(
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A)),
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A), event_verifier()),
         query,
         replay_page_size(1),
     );
     let mut tenant_b = DecisionReplay::new(
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B), event_verifier()),
         query,
         replay_page_size(1),
     );
@@ -2267,7 +2511,7 @@ async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
     assert_eq!(pool.acquisitions(), 4);
 
     let mut tenant_a_source =
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A));
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_A), event_verifier());
     let tenant_a_page = tenant_a_source
         .read_page(query, replay_page_size(1), None)
         .await
@@ -2277,7 +2521,7 @@ async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
         tenant_a_continuation.expect("tenant A replay must expose a continuation");
     assert_eq!(pool.active(), 0);
     let mut tenant_b_source =
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B));
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B), event_verifier());
     let cross_scope = tenant_b_source
         .read_page(query, replay_page_size(1), Some(&tenant_a_continuation))
         .await;
@@ -2288,7 +2532,7 @@ async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
     assert_eq!(pool.active(), 0);
 
     let mut hidden = DecisionReplay::new(
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B), event_verifier()),
         watch_query(REPLAY_HIDDEN_DECISION_ID),
         replay_page_size(1),
     );
@@ -2296,7 +2540,7 @@ async fn replay_isolates_tenants_and_rejects_cross_scope_continuations() {
     assert!(matches!(hidden_result, Ok(None)));
     assert_eq!(pool.active(), 0);
     let mut missing = DecisionReplay::new(
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B)),
+        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_TENANT_B), event_verifier()),
         watch_query(REPLAY_MISSING_DECISION_ID),
         replay_page_size(1),
     );
@@ -2349,7 +2593,11 @@ async fn replay_rejects_a_corrupt_page_atomically_and_returns_a_clean_lease() {
 
     let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     let pool = TestReaderPool::new(vec![reader]);
-    let source = PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_CORRUPT_TENANT));
+    let source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_CORRUPT_TENANT),
+        event_verifier(),
+    );
     let mut replay = DecisionReplay::try_from_request(
         source,
         watch_request(REPLAY_DECISION_ID),
@@ -2392,6 +2640,84 @@ async fn replay_rejects_a_corrupt_page_atomically_and_returns_a_clean_lease() {
 }
 
 #[tokio::test]
+async fn replay_rejects_an_invalid_signature_page_atomically() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3fa704";
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba743",
+        REPLAY_CORRUPT_TENANT,
+        decision_id,
+        1,
+        "COU-REPLAY-SIGNATURE-VALID",
+    )
+    .await;
+    let invalid_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba744";
+    let (payload, payload_sha256) = replay_payload(decision_id, 2, "COU-REPLAY-SIGNATURE-INVALID");
+    let invalid_signature = invalid_event_signature();
+    seed_raw_event_with_signature(
+        &mut writer.client,
+        RawEventFixture {
+            event_id: invalid_event_id,
+            tenant_id: REPLAY_CORRUPT_TENANT,
+            decision_id,
+            aggregate_version: 2,
+            payload: &payload,
+            payload_sha256: &payload_sha256,
+            signature: &invalid_signature,
+        },
+    )
+    .await;
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_CORRUPT_TENANT),
+        event_verifier(),
+    );
+    let mut replay =
+        DecisionReplay::try_from_request(source, watch_request(decision_id), replay_page_size(2))
+            .expect("fixed replay request must be valid");
+
+    let error = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("one invalid signature must reject the complete page"),
+    };
+    assert_eq!(error, DecisionReplayError::StoredStateRejected);
+    let rendered = format!("{error:?} {error}");
+    for sensitive in [
+        REPLAY_CORRUPT_TENANT,
+        decision_id,
+        invalid_event_id,
+        &payload_sha256,
+        "COU-REPLAY-SIGNATURE-INVALID",
+    ] {
+        assert!(!rendered.contains(sensitive));
+    }
+    let repeated = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("rejected replay must remain terminal"),
+    };
+    assert_eq!(repeated, DecisionReplayError::StoredStateRejected);
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    drop(replay);
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
 async fn replay_cleanup_and_finish_failures_override_page_results() {
     let Some(passwords) = integration_passwords() else {
         return;
@@ -2409,8 +2735,11 @@ async fn replay_cleanup_and_finish_failures_override_page_results() {
         .get(0);
     assert_eq!(configured, residual_tenant);
     let residual_pool = TestReaderPool::new(vec![residual_reader]);
-    let mut residual_source =
-        PostgresDecisionReplaySource::new(residual_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+    let mut residual_source = PostgresDecisionReplaySource::new(
+        residual_pool.clone(),
+        scope(REPLAY_CLEANUP_TENANT),
+        event_verifier(),
+    );
 
     let residual_result = residual_source
         .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
@@ -2433,8 +2762,11 @@ async fn replay_cleanup_and_finish_failures_override_page_results() {
     let finish_reader = connect(POSTGRES_READER_USER, passwords.reader.clone()).await;
     let finish_pool = TestReaderPool::new(vec![finish_reader]);
     finish_pool.fail_next_finish();
-    let mut finish_source =
-        PostgresDecisionReplaySource::new(finish_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+    let mut finish_source = PostgresDecisionReplaySource::new(
+        finish_pool.clone(),
+        scope(REPLAY_CLEANUP_TENANT),
+        event_verifier(),
+    );
 
     let finish_result = finish_source
         .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
@@ -2457,8 +2789,11 @@ async fn replay_cleanup_and_finish_failures_override_page_results() {
     let mut closed_reader = connect(POSTGRES_READER_USER, passwords.reader).await;
     closed_reader.disconnect().await;
     let closed_pool = TestReaderPool::new(vec![closed_reader]);
-    let mut closed_source =
-        PostgresDecisionReplaySource::new(closed_pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+    let mut closed_source = PostgresDecisionReplaySource::new(
+        closed_pool.clone(),
+        scope(REPLAY_CLEANUP_TENANT),
+        event_verifier(),
+    );
 
     let closed_result = closed_source
         .read_page(watch_query(REPLAY_DECISION_ID), replay_page_size(1), None)
@@ -2506,6 +2841,7 @@ async fn cancelled_replay_acquisition_discards_its_lease_and_recovers_capacity()
             acquired: Arc::clone(&acquired),
         },
         scope(REPLAY_CLEANUP_TENANT),
+        event_verifier(),
     );
     let mut replay = DecisionReplay::try_from_request(
         source,
@@ -2543,8 +2879,11 @@ async fn cancelled_replay_acquisition_discards_its_lease_and_recovers_capacity()
         .finish(PostgresReaderLeaseDisposition::Reuse)
         .expect("replacement replay lease must return to the pool");
 
-    let recovered_source =
-        PostgresDecisionReplaySource::new(pool.clone(), scope(REPLAY_CLEANUP_TENANT));
+    let recovered_source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_CLEANUP_TENANT),
+        event_verifier(),
+    );
     let mut recovered = DecisionReplay::try_from_request(
         recovered_source,
         watch_request(REPLAY_DECISION_ID),

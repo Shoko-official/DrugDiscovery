@@ -39,6 +39,7 @@ impl DecisionEventMetadata {
         signature: Value,
     ) -> Result<Self, EventProjectionError> {
         validate_tenant_id(&tenant_id)?;
+        validate_occurred_at(occurred_at)?;
         let signature = signature
             .as_object()
             .filter(|value| !value.is_empty())
@@ -124,6 +125,8 @@ pub enum EventProjectionError {
     InvalidAggregateVersion,
     #[error("stored payload digest does not match its canonical form")]
     PayloadHashMismatch,
+    #[error("event timestamp must be a non-negative Unix time at PostgreSQL microsecond precision")]
+    InvalidOccurredAt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -627,11 +630,19 @@ fn validate_row_metadata(row: &ScientificEventRow) -> Result<(), EventProjection
         return Err(EventProjectionError::InvalidAggregateType);
     }
     validate_tenant_id(&row.tenant_id)?;
+    validate_occurred_at(row.occurred_at)?;
     if row.signature.is_empty() {
         return Err(EventProjectionError::InvalidSignature);
     }
     validate_signature_object(&row.signature)?;
     validate_signature_size(&row.signature)?;
+    Ok(())
+}
+
+fn validate_occurred_at(occurred_at: DateTime<Utc>) -> Result<(), EventProjectionError> {
+    if occurred_at.timestamp() < 0 || !occurred_at.timestamp_subsec_nanos().is_multiple_of(1_000) {
+        return Err(EventProjectionError::InvalidOccurredAt);
+    }
     Ok(())
 }
 

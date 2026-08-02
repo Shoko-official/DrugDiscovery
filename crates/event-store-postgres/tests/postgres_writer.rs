@@ -1,3 +1,4 @@
+use aws_lc_rs::signature::Ed25519KeyPair;
 use bioworld_contracts::v2::{
     DecisionCriterion, DecisionCriterionComparator, DecisionEvent, DecisionPredictionInterval,
     DecisionPredictionPosition, DecisionRecord, EvidenceSnapshotRef, OodDetectorRef, OodStatus,
@@ -5,7 +6,8 @@ use bioworld_contracts::v2::{
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION, DecisionEventMetadata,
-    MAX_EVENT_SIGNATURE_JSON_BYTES, ScientificEventRow, project_decision_event,
+    MAX_EVENT_SIGNATURE_JSON_BYTES, ScientificEventRow, decision_event_signature_message,
+    decision_event_signature_value, project_decision_event,
 };
 use bioworld_event_store_postgres::{AppendDecisionEventError, PostgresDecisionEventWriter};
 use chrono::{DateTime, Utc};
@@ -20,6 +22,7 @@ const POSTGRES_DATABASE: &str = "bioworld_migrations";
 const POSTGRES_USER: &str = "bioworld_writer";
 const WRITER_PASSWORD_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_WRITER_PASSWORD";
 const INTEGRATION_REQUIRED_ENVIRONMENT_VARIABLE: &str = "BIOWORLD_POSTGRES_INTEGRATION_REQUIRED";
+const TEST_KEY_ID: &str = "postgres-writer-test";
 
 fn occurred_at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
@@ -129,11 +132,22 @@ fn decision_event_at_version(
     }
 }
 
-fn metadata(tenant_id: &str) -> DecisionEventMetadata {
+fn metadata(event: &DecisionEvent, tenant_id: &str) -> DecisionEventMetadata {
+    let key = Ed25519KeyPair::from_seed_unchecked(&[91_u8; 32])
+        .expect("deterministic Ed25519 seed must be valid");
+    let message = decision_event_signature_message(
+        event.clone(),
+        tenant_id.to_owned(),
+        occurred_at(),
+        TEST_KEY_ID,
+    )
+    .expect("fixture signature message must be valid");
+    let signature = key.sign(&message);
     DecisionEventMetadata::try_new(
         tenant_id.to_owned(),
         occurred_at(),
-        json!({"algorithm": "Ed25519", "key_id": "m10-test", "value": "test-signature"}),
+        decision_event_signature_value(TEST_KEY_ID, signature.as_ref())
+            .expect("fixture signature must be valid"),
     )
     .expect("fixed metadata must be valid")
 }
@@ -171,8 +185,9 @@ async fn append(
     event: DecisionEvent,
     tenant_id: &str,
 ) -> Result<(), AppendDecisionEventError> {
+    let event_metadata = metadata(&event, tenant_id);
     PostgresDecisionEventWriter::new(client)
-        .append(event, metadata(tenant_id))
+        .append(event, event_metadata)
         .await
 }
 
@@ -200,8 +215,8 @@ async fn insert_blocking_event(
     event: DecisionEvent,
     tenant_id: &str,
 ) {
-    let row =
-        project_decision_event(event, metadata(tenant_id)).expect("blocking event must project");
+    let event_metadata = metadata(&event, tenant_id);
+    let row = project_decision_event(event, event_metadata).expect("blocking event must project");
     let aggregate_version = row.aggregate_version.to_string();
     let signature = Value::Object(row.signature);
     let parameters: [&(dyn ToSql + Sync); 11] = [
@@ -359,7 +374,7 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
     let event_id = "01910d47-6f80-7a31-8c29-1d5c4f6b7012";
     let decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
     let event = decision_event(event_id, decision_id);
-    let expected = project_decision_event(event.clone(), metadata(tenant_a))
+    let expected = project_decision_event(event.clone(), metadata(&event, tenant_a))
         .expect("fixed event must project");
 
     append(&mut client, event.clone(), tenant_a)
@@ -437,8 +452,17 @@ async fn appends_exact_events_and_resets_tenant_context_after_commit_and_rollbac
         "018f5a72-9c4b-7d31-8f6a-26f08f3f4d97",
     );
     invalid.event_id.make_ascii_uppercase();
+    let invalid_metadata = DecisionEventMetadata::try_new(
+        tenant_a.to_owned(),
+        occurred_at(),
+        decision_event_signature_value(TEST_KEY_ID, &[0_u8; 64])
+            .expect("fixed invalid-event signature envelope must be valid"),
+    )
+    .expect("fixed invalid-event metadata must be valid");
     assert_eq!(
-        append(&mut client, invalid, tenant_a).await,
+        PostgresDecisionEventWriter::new(&mut client)
+            .append(invalid, invalid_metadata)
+            .await,
         Err(AppendDecisionEventError::EventRejected),
     );
     assert!(tenant_context_is_absent(&client).await);

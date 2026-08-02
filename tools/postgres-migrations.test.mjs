@@ -423,6 +423,8 @@ test("stages and exercises the decision server before it is committed", async ()
     "apps/decision-server/tests/process.rs",
     "apps/decision-server/tests/runtime_config.rs",
     "apps/decision-server/tests/runtime_integration.rs",
+    "crates/event-store-contracts/src/signature.rs",
+    "crates/event-store-contracts/tests/decision_event_signature.rs",
     "crates/decision-grpc/src/watch_runtime.rs",
   ]) {
     assert.ok(sourceCommand.includes(sourcePath));

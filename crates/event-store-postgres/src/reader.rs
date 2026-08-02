@@ -7,9 +7,10 @@ use bioworld_decision_query::{
 };
 use bioworld_event_store_contracts::{
     DECISION_AGGREGATE_TYPE, DECISION_EVENT_TYPE, DECISION_SCHEMA_VERSION,
-    MAX_STORED_EVENT_IDENTIFIER_BYTES, MAX_STORED_EVENT_IDENTIFIER_CHARS,
-    MAX_STORED_EVENT_PAYLOAD_BYTES, MAX_STORED_EVENT_SIGNATURE_BYTES, ScientificEventRow,
-    parse_stored_decision_payload, parse_stored_event_signature, reconstruct_decision_event,
+    DecisionEventVerificationError, DecisionEventVerifier, MAX_STORED_EVENT_IDENTIFIER_BYTES,
+    MAX_STORED_EVENT_IDENTIFIER_CHARS, MAX_STORED_EVENT_PAYLOAD_BYTES,
+    MAX_STORED_EVENT_SIGNATURE_BYTES, ScientificEventRow, parse_stored_decision_payload,
+    parse_stored_event_signature,
 };
 use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
@@ -159,6 +160,8 @@ pub enum ReadDecisionEventError {
     ReadOnlyTransactionRejected,
     #[error("stored decision event was rejected")]
     StoredEventRejected,
+    #[error("decision event verification trust is unavailable")]
+    TrustUnavailable,
     #[error("database access was denied")]
     AccessDenied,
     #[error("database transaction should be retried")]
@@ -234,6 +237,7 @@ impl DecisionStreamPage {
 
 pub struct PostgresDecisionEventReader<'client> {
     client: &'client mut Client,
+    verifier: DecisionEventVerifier,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -273,8 +277,8 @@ impl LatestDecisionSource for PostgresLatestDecisionSource<'_, '_> {
 }
 
 impl<'client> PostgresDecisionEventReader<'client> {
-    pub fn new(client: &'client mut Client) -> Self {
-        Self { client }
+    pub fn new(client: &'client mut Client, verifier: DecisionEventVerifier) -> Self {
+        Self { client, verifier }
     }
 
     pub async fn get(
@@ -322,6 +326,7 @@ impl<'client> PostgresDecisionEventReader<'client> {
 
         let result = match read_stream_page_in_transaction(
             &transaction,
+            &self.verifier,
             tenant_id,
             decision_id,
             page_size,
@@ -360,7 +365,7 @@ impl<'client> PostgresDecisionEventReader<'client> {
             .await
             .map_err(|error| classify_reader_database_error(&error))?;
 
-        match read_in_transaction(&transaction, tenant_id, lookup).await {
+        match read_in_transaction(&transaction, &self.verifier, tenant_id, lookup).await {
             Ok(event) => transaction
                 .commit()
                 .await
@@ -376,6 +381,7 @@ impl<'client> PostgresDecisionEventReader<'client> {
 
 async fn read_stream_page_in_transaction(
     transaction: &Transaction<'_>,
+    verifier: &DecisionEventVerifier,
     tenant_id: &str,
     decision_id: Uuid,
     page_size: DecisionStreamPageSize,
@@ -456,7 +462,14 @@ async fn read_stream_page_in_transaction(
 
     let events = rows
         .into_iter()
-        .map(|row| reconstruct_row(row, tenant_id, DecisionEventLookup::Latest(decision_id)))
+        .map(|row| {
+            reconstruct_row(
+                row,
+                verifier,
+                tenant_id,
+                DecisionEventLookup::Latest(decision_id),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let Some(last_version) = events
         .last()
@@ -480,6 +493,7 @@ async fn read_stream_page_in_transaction(
 
 async fn read_in_transaction(
     transaction: &Transaction<'_>,
+    verifier: &DecisionEventVerifier,
     tenant_id: &str,
     lookup: DecisionEventLookup,
 ) -> Result<Option<DecisionEvent>, ReadDecisionEventError> {
@@ -540,7 +554,7 @@ async fn read_in_transaction(
     }
     .map_err(|error| classify_reader_database_error(&error))?;
 
-    row.map(|row| reconstruct_row(row, tenant_id, lookup))
+    row.map(|row| reconstruct_row(row, verifier, tenant_id, lookup))
         .transpose()
 }
 
@@ -564,6 +578,7 @@ async fn verify_read_only(transaction: &Transaction<'_>) -> Result<(), ReadDecis
 
 fn reconstruct_row(
     row: Row,
+    verifier: &DecisionEventVerifier,
     tenant_id: &str,
     lookup: DecisionEventLookup,
 ) -> Result<DecisionEvent, ReadDecisionEventError> {
@@ -619,7 +634,16 @@ fn reconstruct_row(
         signature,
     };
 
-    reconstruct_decision_event(&stored).map_err(|_| ReadDecisionEventError::StoredEventRejected)
+    verifier
+        .verify_and_reconstruct(&stored)
+        .map_err(|error| match error {
+            DecisionEventVerificationError::TrustUnavailable => {
+                ReadDecisionEventError::TrustUnavailable
+            }
+            DecisionEventVerificationError::EventRejected => {
+                ReadDecisionEventError::StoredEventRejected
+            }
+        })
 }
 
 fn map_read_error(error: ReadDecisionEventError) -> LatestDecisionSourceError {
@@ -627,6 +651,7 @@ fn map_read_error(error: ReadDecisionEventError) -> LatestDecisionSourceError {
         ReadDecisionEventError::StoredEventRejected => {
             LatestDecisionSourceError::StoredStateRejected
         }
+        ReadDecisionEventError::TrustUnavailable => LatestDecisionSourceError::Unavailable,
         ReadDecisionEventError::InvalidTenantId
         | ReadDecisionEventError::ReaderIdentityRejected
         | ReadDecisionEventError::TenantContextRejected
@@ -879,6 +904,10 @@ mod tests {
             (
                 ReadDecisionEventError::StoredEventRejected,
                 LatestDecisionSourceError::StoredStateRejected,
+            ),
+            (
+                ReadDecisionEventError::TrustUnavailable,
+                LatestDecisionSourceError::Unavailable,
             ),
             (
                 ReadDecisionEventError::AccessDenied,

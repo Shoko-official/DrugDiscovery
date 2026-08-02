@@ -31,6 +31,7 @@ pub struct DecisionServerConfig {
     server_tls: ServerTlsFiles,
     jwt: JwtTenantAuthenticatorConfig,
     jwks_file: PathBuf,
+    event_verification_keys_file: PathBuf,
     postgres: PostgresRuntimeConfig,
     service: DecisionGrpcServiceConfig,
     watch: Option<DecisionGrpcWatchConfig>,
@@ -69,6 +70,7 @@ impl DecisionServerConfig {
             server_tls: self.server_tls,
             jwt: self.jwt,
             jwks_file: self.jwks_file,
+            event_verification_keys_file: self.event_verification_keys_file,
             postgres: self.postgres,
             service: self.service,
             watch: self.watch,
@@ -99,6 +101,7 @@ pub(crate) struct DecisionServerConfigParts {
     pub(crate) server_tls: ServerTlsFiles,
     pub(crate) jwt: JwtTenantAuthenticatorConfig,
     pub(crate) jwks_file: PathBuf,
+    pub(crate) event_verification_keys_file: PathBuf,
     pub(crate) postgres: PostgresRuntimeConfig,
     pub(crate) service: DecisionGrpcServiceConfig,
     pub(crate) watch: Option<DecisionGrpcWatchConfig>,
@@ -126,6 +129,7 @@ struct RawDecisionServerConfig {
     listen: RawListen,
     server_tls: RawServerTls,
     jwt: RawJwt,
+    event_verification: RawEventVerification,
     postgres: RawPostgres,
     service: RawService,
     transport: RawTransport,
@@ -162,6 +166,12 @@ struct RawJwt {
     jwks_valid_until: u64,
     max_concurrent_verifications: usize,
     max_concurrent_verifications_per_peer: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEventVerification {
+    keys_file: String,
 }
 
 #[derive(Deserialize)]
@@ -276,12 +286,14 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
             private_key: validated_path(raw.server_tls.private_key_file)?,
         };
         let jwks_file = validated_path(raw.jwt.jwks_file)?;
+        let event_verification_keys_file = validated_path(raw.event_verification.keys_file)?;
         let password_file = validated_path(raw.postgres.password_file)?;
         let ca_file = validated_path(raw.postgres.ca_file)?;
         let paths = [
             &server_tls.certificate_chain,
             &server_tls.private_key,
             &jwks_file,
+            &event_verification_keys_file,
             &password_file,
             &ca_file,
         ];
@@ -304,6 +316,7 @@ impl TryFrom<RawDecisionServerConfig> for DecisionServerConfig {
             server_tls,
             jwt,
             jwks_file,
+            event_verification_keys_file,
             postgres: PostgresRuntimeConfig {
                 host: raw.postgres.host,
                 port: raw.postgres.port,

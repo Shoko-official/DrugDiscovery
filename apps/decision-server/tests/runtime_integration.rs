@@ -13,7 +13,7 @@ use std::{
 use aws_lc_rs::{
     rand::SystemRandom,
     rsa::{KeyPair, KeySize, PublicKeyComponents},
-    signature::{KeyPair as _, RSA_PKCS1_SHA256},
+    signature::{Ed25519KeyPair, KeyPair as _, RSA_PKCS1_SHA256},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bioworld_contracts::v2::{
@@ -24,7 +24,9 @@ use bioworld_contracts::v2::{
 };
 use bioworld_decision_grpc_jwt::BIOWORLD_TENANT_CLAIM;
 use bioworld_decision_server::{DecisionServerConfig, DecisionServerRuntime};
-use bioworld_event_store_contracts::DecisionEventMetadata;
+use bioworld_event_store_contracts::{
+    DecisionEventMetadata, decision_event_signature_message, decision_event_signature_value,
+};
 use bioworld_event_store_postgres::PostgresDecisionEventWriter;
 use chrono::{DateTime, Utc};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -57,6 +59,7 @@ const JWT_ISSUER: &str = "https://identity.runtime-integration.test";
 const JWT_AUDIENCE: &str = "bioworld-decision-runtime-integration";
 const JWT_REQUIRED_SCOPE: &str = "decision:read";
 const JWT_KEY_ID: &str = "runtime-integration-key";
+const EVENT_KEY_ID: &str = "runtime-event-key";
 const TENANT_A: &str = "tenant-runtime-integration-a";
 const TENANT_B: &str = "tenant-runtime-integration-b";
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3fb701";
@@ -78,6 +81,62 @@ struct IntegrationInputs {
 struct IntegrationJwtKey {
     key_pair: KeyPair,
     jwks: Vec<u8>,
+}
+
+struct IntegrationEventKeys {
+    tenant_a: Ed25519KeyPair,
+    watch_tenant_a: Ed25519KeyPair,
+    watch_tenant_b: Ed25519KeyPair,
+}
+
+impl IntegrationEventKeys {
+    fn generate() -> Self {
+        Self {
+            tenant_a: generate_event_key(),
+            watch_tenant_a: generate_event_key(),
+            watch_tenant_b: generate_event_key(),
+        }
+    }
+
+    fn key(&self, tenant_id: &str) -> &Ed25519KeyPair {
+        match tenant_id {
+            TENANT_A => &self.tenant_a,
+            WATCH_TENANT_A => &self.watch_tenant_a,
+            WATCH_TENANT_B => &self.watch_tenant_b,
+            _ => panic!("integration event tenant must have an explicit signing key"),
+        }
+    }
+
+    fn snapshot(&self, now: u64) -> Vec<u8> {
+        let entry = |tenant_id: &str, key: &Ed25519KeyPair| {
+            json!({
+                "tenant_id": tenant_id,
+                "key_id": EVENT_KEY_ID,
+                "algorithm": "Ed25519",
+                "public_key": URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+                "not_before": 1,
+                "not_after": now + 3_600,
+                "status": "trusted"
+            })
+        };
+        serde_json::to_vec(&json!({
+            "version": "1",
+            "valid_until": now + 600,
+            "keys": [
+                entry(TENANT_A, &self.tenant_a),
+                entry(WATCH_TENANT_A, &self.watch_tenant_a),
+                entry(WATCH_TENANT_B, &self.watch_tenant_b)
+            ]
+        }))
+        .expect("event verification snapshot serialization must succeed")
+    }
+}
+
+fn generate_event_key() -> Ed25519KeyPair {
+    let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .expect("ephemeral Ed25519 key generation must succeed");
+    Ed25519KeyPair::from_pkcs8(document.as_ref())
+        .expect("ephemeral Ed25519 key parsing must succeed")
 }
 
 impl IntegrationJwtKey {
@@ -429,8 +488,12 @@ fn watch_decision_record(aggregate_version: u64, rationale: &str) -> DecisionRec
     record
 }
 
-async fn seed_decision(writer: &mut Client, expected: &DecisionRecord) {
-    seed_event(writer, TENANT_A, EVENT_ID, expected).await;
+async fn seed_decision(
+    writer: &mut Client,
+    expected: &DecisionRecord,
+    event_keys: &IntegrationEventKeys,
+) {
+    seed_event(writer, TENANT_A, EVENT_ID, expected, event_keys).await;
 }
 
 async fn seed_event(
@@ -438,25 +501,31 @@ async fn seed_event(
     tenant_id: &str,
     event_id: &str,
     expected: &DecisionRecord,
+    event_keys: &IntegrationEventKeys,
 ) {
     let event = DecisionEvent {
         decision: Some(expected.clone()),
         event_id: event_id.to_owned(),
     };
+    let message = decision_event_signature_message(
+        event.clone(),
+        tenant_id.to_owned(),
+        occurred_at(),
+        EVENT_KEY_ID,
+    )
+    .expect("integration event signature message must be valid");
+    let signature = event_keys.key(tenant_id).sign(&message);
     let metadata = DecisionEventMetadata::try_new(
         tenant_id.to_owned(),
         occurred_at(),
-        json!({
-            "algorithm": "synthetic",
-            "key_id": "runtime-integration",
-            "value": "non-production-fixture"
-        }),
+        decision_event_signature_value(EVENT_KEY_ID, signature.as_ref())
+            .expect("integration event signature must be valid"),
     )
-    .expect("synthetic event metadata must be valid");
+    .expect("signed event metadata must be valid");
     PostgresDecisionEventWriter::new(writer)
         .append(event, metadata)
         .await
-        .expect("synthetic decision fixture must be appended through the writer");
+        .expect("signed decision fixture must be appended through the writer");
 }
 
 fn path_text(path: &Path) -> String {
@@ -467,17 +536,17 @@ fn path_text(path: &Path) -> String {
 
 fn runtime_config(
     files: &TemporaryDirectory,
-    certificate_pem: &[u8],
-    private_key_pem: &[u8],
+    server_identity: (&[u8], &[u8]),
     signing_key: &IntegrationJwtKey,
+    event_keys: &IntegrationEventKeys,
     inputs: &IntegrationInputs,
     now: u64,
 ) -> DecisionServerConfig {
     runtime_config_with_watch(
         files,
-        certificate_pem,
-        private_key_pem,
+        server_identity,
         signing_key,
+        event_keys,
         inputs,
         now,
         false,
@@ -486,16 +555,19 @@ fn runtime_config(
 
 fn runtime_config_with_watch(
     files: &TemporaryDirectory,
-    certificate_pem: &[u8],
-    private_key_pem: &[u8],
+    server_identity: (&[u8], &[u8]),
     signing_key: &IntegrationJwtKey,
+    event_keys: &IntegrationEventKeys,
     inputs: &IntegrationInputs,
     now: u64,
     watch_enabled: bool,
 ) -> DecisionServerConfig {
+    let (certificate_pem, private_key_pem) = server_identity;
     let certificate_file = files.write_public("server-cert.pem", certificate_pem);
     let private_key_file = files.write_private("server-key.pem", private_key_pem);
     let jwks_file = files.write_public("jwks.json", &signing_key.jwks);
+    let event_keys_file =
+        files.write_public("event-verification-keys.json", &event_keys.snapshot(now));
     let password_file = files.write_private("postgres-password", inputs.reader_password.as_bytes());
     let mut control = json!({
         "listen": {
@@ -514,6 +586,9 @@ fn runtime_config_with_watch(
             "jwks_valid_until": now + 600,
             "max_concurrent_verifications": 2,
             "max_concurrent_verifications_per_peer": 1
+        },
+        "event_verification": {
+            "keys_file": path_text(&event_keys_file)
         },
         "postgres": {
             "host": POSTGRES_HOST,
@@ -626,7 +701,8 @@ async fn serves_tls_authenticated_tenant_isolated_reads_and_stops_cleanly() {
     let mut writer =
         connect_writer(inputs.writer_password.as_bytes(), &inputs.postgres_ca_file).await;
     let expected = decision_record();
-    seed_decision(&mut writer.client, &expected).await;
+    let event_keys = IntegrationEventKeys::generate();
+    seed_decision(&mut writer.client, &expected, &event_keys).await;
 
     let signing_key = IntegrationJwtKey::generate();
     let CertifiedKey {
@@ -640,9 +716,9 @@ async fn serves_tls_authenticated_tenant_isolated_reads_and_stops_cleanly() {
     let files = TemporaryDirectory::create();
     let config = runtime_config(
         &files,
-        &certificate_pem,
-        &private_key_pem,
+        (&certificate_pem, &private_key_pem),
         &signing_key,
+        &event_keys,
         &inputs,
         now,
     );
@@ -737,6 +813,7 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
     };
     let mut writer =
         connect_writer(inputs.writer_password.as_bytes(), &inputs.postgres_ca_file).await;
+    let event_keys = IntegrationEventKeys::generate();
     let first = watch_decision_record(1, "First tenant A decision.");
     let second = watch_decision_record(2, "Second tenant A decision.");
     let other_tenant = watch_decision_record(1, "Tenant B homonym.");
@@ -745,6 +822,7 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
         WATCH_TENANT_A,
         WATCH_FIRST_EVENT_ID,
         &first,
+        &event_keys,
     )
     .await;
     seed_event(
@@ -752,6 +830,7 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
         WATCH_TENANT_A,
         WATCH_SECOND_EVENT_ID,
         &second,
+        &event_keys,
     )
     .await;
     seed_event(
@@ -759,6 +838,7 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
         WATCH_TENANT_B,
         WATCH_OTHER_TENANT_EVENT_ID,
         &other_tenant,
+        &event_keys,
     )
     .await;
     let expected_tenant_a = vec![
@@ -788,9 +868,9 @@ async fn serves_ordered_tenant_isolated_watch_history_and_stops_cleanly() {
     let files = TemporaryDirectory::create();
     let config = runtime_config_with_watch(
         &files,
-        &certificate_pem,
-        &private_key_pem,
+        (&certificate_pem, &private_key_pem),
         &signing_key,
+        &event_keys,
         &inputs,
         now,
         true,

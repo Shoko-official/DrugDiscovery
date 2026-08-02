@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bioworld-decision-grpc = { path = "../decision-grpc" }
 bioworld-decision-query = { path = "../decision-query" }
+bioworld-event-store-contracts = { path = "../event-store-contracts" }
 bioworld-event-store-postgres = { path = "../event-store-postgres" }
 deadpool-postgres.workspace = true
 tokio-postgres.workspace = true
@@ -17,7 +18,8 @@ aws-lc-rs.workspace = true
 base64.workspace = true
 bioworld-contracts = { path = "../contracts" }
 bioworld-decision-grpc-jwt = { path = "../decision-grpc-jwt" }
-bioworld-event-store-contracts = { path = "../event-store-contracts" }
+chrono.workspace = true
 serde_json.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid.workspace = true

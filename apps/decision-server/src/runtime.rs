@@ -12,6 +12,9 @@ use bioworld_decision_grpc_server::{
     ServeDecisionGrpcServerError,
 };
 use bioworld_decision_query::{GetDecisionQuery, GetDecisionRequestExecutionError};
+use bioworld_event_store_contracts::{
+    DecisionEventVerifier, MAX_DECISION_EVENT_VERIFICATION_SNAPSHOT_BYTES,
+};
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, pem::PemObject, pem::SectionKind},
@@ -51,6 +54,7 @@ impl DecisionServerRuntime {
             server_tls,
             jwt,
             jwks_file,
+            event_verification_keys_file,
             postgres,
             service: service_config,
             watch,
@@ -73,6 +77,13 @@ impl DecisionServerRuntime {
         let jwks = read_secure_file(&jwks_file, MAX_JWKS_FILE_BYTES, SecureFilePolicy::Public)
             .await
             .map_err(|_| DecisionServerStartupError::SensitiveInputRejected)?;
+        let event_verification_keys = read_secure_file(
+            &event_verification_keys_file,
+            MAX_DECISION_EVENT_VERIFICATION_SNAPSHOT_BYTES,
+            SecureFilePolicy::Public,
+        )
+        .await
+        .map_err(|_| DecisionServerStartupError::SensitiveInputRejected)?;
         let ca_pem = read_secure_file(
             &postgres.ca_file,
             MAX_POSTGRES_CA_FILE_BYTES,
@@ -91,6 +102,7 @@ impl DecisionServerRuntime {
         let mut certificate_chain = unique_contents(certificate_chain, &mut identities)?;
         let mut private_key = unique_contents(private_key, &mut identities)?;
         let jwks = unique_contents(jwks, &mut identities)?;
+        let event_verification_keys = unique_contents(event_verification_keys, &mut identities)?;
         let ca_pem = unique_contents(ca_pem, &mut identities)?;
         let mut password = unique_contents(password, &mut identities)?;
 
@@ -101,6 +113,8 @@ impl DecisionServerRuntime {
 
         let authenticator = JwtTenantAuthenticator::try_from_jwks(jwt, &jwks)
             .map_err(|_| DecisionServerStartupError::IdentityConfigurationRejected)?;
+        let event_verifier = DecisionEventVerifier::try_from_snapshot(&event_verification_keys)
+            .map_err(|_| DecisionServerStartupError::EventVerificationConfigurationRejected)?;
 
         normalize_password(&mut password)?;
         let (postgres_config, postgres_tls) =
@@ -108,9 +122,13 @@ impl DecisionServerRuntime {
         let pool = PostgresReaderPool::try_new(postgres_config, postgres_tls, postgres.pool)
             .map_err(|_| DecisionServerStartupError::DatabaseConfigurationRejected)?;
         let pool = PoolCloseGuard::new(pool);
-        preflight_with_deadline(postgres.preflight_timeout, preflight_reader(pool.pool())).await?;
+        preflight_with_deadline(
+            postgres.preflight_timeout,
+            preflight_reader(pool.pool(), event_verifier.clone()),
+        )
+        .await?;
 
-        let executor = PostgresDecisionExecutor::new(pool.pool().clone());
+        let executor = PostgresDecisionExecutor::new(pool.pool().clone(), event_verifier);
         let service = match watch {
             Some(watch_config) => DecisionGrpcService::try_new_with_watch(
                 authenticator,
@@ -172,6 +190,8 @@ pub enum DecisionServerStartupError {
     ServerIdentityRejected,
     /// JWT verification policy or key snapshot was rejected.
     IdentityConfigurationRejected,
+    /// Scientific event verification policy or key snapshot was rejected.
+    EventVerificationConfigurationRejected,
     /// The validated service and Watch capacity relationship was rejected.
     ServiceConfigurationRejected,
     /// PostgreSQL CA, password, or connection policy was rejected.
@@ -193,6 +213,9 @@ impl fmt::Display for DecisionServerStartupError {
             }
             Self::IdentityConfigurationRejected => {
                 formatter.write_str("decision server authentication configuration is rejected")
+            }
+            Self::EventVerificationConfigurationRejected => {
+                formatter.write_str("decision server event verification configuration is rejected")
             }
             Self::ServiceConfigurationRejected => {
                 formatter.write_str("decision server service configuration is rejected")
@@ -401,8 +424,11 @@ fn normalize_password(password: &mut Vec<u8>) -> Result<(), DecisionServerStartu
     Ok(())
 }
 
-async fn preflight_reader(pool: &PostgresReaderPool) -> Result<(), DecisionServerStartupError> {
-    let executor = PostgresDecisionExecutor::new(pool.clone());
+async fn preflight_reader(
+    pool: &PostgresReaderPool,
+    verifier: DecisionEventVerifier,
+) -> Result<(), DecisionServerStartupError> {
+    let executor = PostgresDecisionExecutor::new(pool.clone(), verifier);
     let scope = TenantScope::try_from_trusted_tenant_id(PREFLIGHT_TENANT_ID.to_owned())
         .map_err(|_| DecisionServerStartupError::DatabaseUnavailable)?;
     let query = GetDecisionQuery::new(Uuid::nil());

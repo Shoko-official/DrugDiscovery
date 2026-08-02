@@ -319,11 +319,13 @@ dependencies = [
  "bioworld-decision-query",
  "bioworld-event-store-contracts",
  "bioworld-event-store-postgres",
+ "chrono",
  "deadpool-postgres",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tonic",
+ "uuid",
 ]
 
 [[package]]
@@ -439,6 +441,8 @@ dependencies = [
 name = "bioworld-event-store-contracts"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "bioworld-contracts",
  "chrono",
  "serde",
@@ -454,6 +458,8 @@ dependencies = [
 name = "bioworld-event-store-postgres"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "bioworld-contracts",
  "bioworld-decision-query",
  "bioworld-event-store-contracts",
