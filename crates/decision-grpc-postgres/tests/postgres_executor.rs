@@ -137,6 +137,16 @@ struct EventFixture {
     record: DecisionRecord,
 }
 
+struct RawEventFixture<'a> {
+    event_id: &'a str,
+    tenant_id: &'a str,
+    decision_id: &'a str,
+    aggregate_version: u64,
+    payload: &'a str,
+    payload_sha256: &'a str,
+    signature: &'a str,
+}
+
 #[derive(Clone, Copy)]
 struct TestClock;
 
@@ -224,6 +234,14 @@ fn event_signature(
             .expect("fixture signature must be valid"),
     )
     .expect("fixture signature must serialize")
+}
+
+fn invalid_event_signature() -> String {
+    serde_json::to_string(
+        &decision_event_signature_value(EVENT_KEY_ID, &[0_u8; 64])
+            .expect("fixed invalid signature bytes must form a strict Ed25519 envelope"),
+    )
+    .expect("invalid fixture signature must serialize")
 }
 
 #[derive(Clone, Copy)]
@@ -644,6 +662,31 @@ async fn seed_raw_event(
     payload_sha256: &str,
 ) {
     let signature = event_signature(event_id, tenant_id, decision_id, aggregate_version, payload);
+    seed_raw_event_with_signature(
+        writer,
+        RawEventFixture {
+            event_id,
+            tenant_id,
+            decision_id,
+            aggregate_version,
+            payload,
+            payload_sha256,
+            signature: &signature,
+        },
+    )
+    .await;
+}
+
+async fn seed_raw_event_with_signature(writer: &mut Client, fixture: RawEventFixture<'_>) {
+    let RawEventFixture {
+        event_id,
+        tenant_id,
+        decision_id,
+        aggregate_version,
+        payload,
+        payload_sha256,
+        signature,
+    } = fixture;
     let transaction = writer
         .transaction()
         .await
@@ -673,7 +716,7 @@ async fn seed_raw_event(
                 &tenant_id,
                 &payload,
                 &payload_sha256,
-                &signature.as_str(),
+                &signature,
             ],
         )
         .await
@@ -1830,6 +1873,73 @@ async fn inconsistent_stored_payload_is_redacted_and_returns_a_clean_reusable_le
 }
 
 #[tokio::test]
+async fn invalid_stored_signature_maps_to_exact_redacted_grpc_error() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let submitted_tenant = "tenant-grpc-postgres-corrupt";
+    let submitted_decision = "018f5a72-9c4b-7d31-8f6a-26f08f3fa608";
+    let invalid_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6bc608";
+    let (payload, payload_sha256) =
+        replay_payload(submitted_decision, 2, "COU-GRPC-PG-INVALID-SIGNATURE");
+    let invalid_signature = invalid_event_signature();
+    seed_raw_event_with_signature(
+        &mut writer.client,
+        RawEventFixture {
+            event_id: invalid_event_id,
+            tenant_id: submitted_tenant,
+            decision_id: submitted_decision,
+            aggregate_version: 2,
+            payload: &payload,
+            payload_sha256: &payload_sha256,
+            signature: &invalid_signature,
+        },
+    )
+    .await;
+    assert!(tenant_context_is_absent(&writer.client).await);
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let executor = PostgresGetDecisionExecutor::new(pool.clone(), event_verifier());
+
+    let status = get_decision(
+        &executor,
+        scope(submitted_tenant),
+        request(submitted_decision),
+    )
+    .await
+    .expect_err("invalid stored signature must be rejected");
+
+    assert_public_status(
+        &status,
+        Code::Unavailable,
+        "decision service is unavailable",
+    );
+    assert_status_does_not_reflect(
+        &status,
+        &[
+            submitted_tenant,
+            submitted_decision,
+            invalid_event_id,
+            &payload_sha256,
+            "COU-GRPC-PG-INVALID-SIGNATURE",
+        ],
+    );
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    assert_eq!(pool.active(), 0);
+    pool.assert_available_sessions_are_clean(1).await;
+
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
 async fn closed_connection_is_redacted_and_discarded_without_reuse() {
     let Some(passwords) = integration_passwords() else {
         return;
@@ -2507,6 +2617,84 @@ async fn replay_rejects_a_corrupt_page_atomically_and_returns_a_clean_lease() {
         corrupt_event_id,
         corrupt_hash,
         "COU-REPLAY-CORRUPT",
+    ] {
+        assert!(!rendered.contains(sensitive));
+    }
+    let repeated = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("rejected replay must remain terminal"),
+    };
+    assert_eq!(repeated, DecisionReplayError::StoredStateRejected);
+    assert_eq!(pool.acquisitions(), 1);
+    assert_eq!(pool.active(), 0);
+    assert_eq!(
+        pool.finish_requests(),
+        vec![PostgresReaderLeaseDisposition::Reuse]
+    );
+    assert_eq!(pool.dispositions(), pool.finish_requests());
+    pool.assert_available_sessions_are_clean(1).await;
+
+    drop(replay);
+    pool.shutdown();
+    writer.discard();
+}
+
+#[tokio::test]
+async fn replay_rejects_an_invalid_signature_page_atomically() {
+    let Some(passwords) = integration_passwords() else {
+        return;
+    };
+    let mut writer = connect(POSTGRES_WRITER_USER, passwords.writer).await;
+    let decision_id = "018f5a72-9c4b-7d31-8f6a-26f08f3fa704";
+    seed_replay_event(
+        &mut writer.client,
+        "01910d47-6f80-7a31-8c29-1d5c4f6ba743",
+        REPLAY_CORRUPT_TENANT,
+        decision_id,
+        1,
+        "COU-REPLAY-SIGNATURE-VALID",
+    )
+    .await;
+    let invalid_event_id = "01910d47-6f80-7a31-8c29-1d5c4f6ba744";
+    let (payload, payload_sha256) = replay_payload(decision_id, 2, "COU-REPLAY-SIGNATURE-INVALID");
+    let invalid_signature = invalid_event_signature();
+    seed_raw_event_with_signature(
+        &mut writer.client,
+        RawEventFixture {
+            event_id: invalid_event_id,
+            tenant_id: REPLAY_CORRUPT_TENANT,
+            decision_id,
+            aggregate_version: 2,
+            payload: &payload,
+            payload_sha256: &payload_sha256,
+            signature: &invalid_signature,
+        },
+    )
+    .await;
+
+    let reader = connect(POSTGRES_READER_USER, passwords.reader).await;
+    let pool = TestReaderPool::new(vec![reader]);
+    let source = PostgresDecisionReplaySource::new(
+        pool.clone(),
+        scope(REPLAY_CORRUPT_TENANT),
+        event_verifier(),
+    );
+    let mut replay =
+        DecisionReplay::try_from_request(source, watch_request(decision_id), replay_page_size(2))
+            .expect("fixed replay request must be valid");
+
+    let error = match replay.next_page().await {
+        Err(error) => error,
+        Ok(_) => panic!("one invalid signature must reject the complete page"),
+    };
+    assert_eq!(error, DecisionReplayError::StoredStateRejected);
+    let rendered = format!("{error:?} {error}");
+    for sensitive in [
+        REPLAY_CORRUPT_TENANT,
+        decision_id,
+        invalid_event_id,
+        &payload_sha256,
+        "COU-REPLAY-SIGNATURE-INVALID",
     ] {
         assert!(!rendered.contains(sensitive));
     }

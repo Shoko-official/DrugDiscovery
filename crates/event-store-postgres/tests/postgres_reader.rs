@@ -894,7 +894,7 @@ async fn makes_cross_tenant_and_missing_stream_pages_indistinguishable() {
 }
 
 #[tokio::test]
-async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
+async fn rejects_the_complete_page_when_any_selected_row_has_an_invalid_signature() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -934,7 +934,7 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
         ),
     ];
 
-    for (tenant_id, decision_id, event_ids, corrupt_index) in cases {
+    for (tenant_id, decision_id, event_ids, invalid_signature_index) in cases {
         let decision_id =
             Uuid::parse_str(decision_id).expect("fixed decision identifier must parse");
         for (index, event_id) in event_ids.into_iter().enumerate() {
@@ -943,8 +943,8 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
                 &decision_id.to_string(),
                 u64::try_from(index + 1).expect("fixed version must fit"),
             );
-            if index == corrupt_index {
-                insert_corrupt_event(&mut writer, event, tenant_id).await;
+            if index == invalid_signature_index {
+                insert_event_with_invalid_signature(&mut writer, event, tenant_id).await;
             } else {
                 append(&mut writer, event, tenant_id).await;
             }
@@ -955,7 +955,7 @@ async fn rejects_the_complete_page_when_any_selected_row_is_corrupt() {
             .get_stream_page(tenant_id, decision_id, page_size, None)
             .await
             .err()
-            .expect("any corrupt selected row must reject the complete page");
+            .expect("any invalid signature must reject the complete page");
 
         assert_eq!(
             error,
@@ -1174,7 +1174,7 @@ async fn makes_cross_tenant_and_missing_decision_streams_indistinguishable() {
 }
 
 #[tokio::test]
-async fn rejects_a_corrupt_latest_event_without_falling_back() {
+async fn rejects_an_invalid_signature_for_exact_and_latest_reads_without_falling_back() {
     let Some(passwords) = integration_passwords() else {
         return;
     };
@@ -1188,7 +1188,7 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
         &decision_id.to_string(),
         1,
     );
-    let corrupt_latest = decision_event_at_version(
+    let invalid_latest = decision_event_at_version(
         "01910d47-6f80-7a31-8c29-1d5c4f6b8106",
         &decision_id.to_string(),
         2,
@@ -1196,7 +1196,8 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
 
     append(&mut writer, valid_older.clone(), tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
-    insert_corrupt_event(&mut writer, corrupt_latest, tenant_id).await;
+    let invalid_event_id = projected_row(&invalid_latest, tenant_id).event_id;
+    insert_event_with_invalid_signature(&mut writer, invalid_latest, tenant_id).await;
     assert!(tenant_context_is_absent(&writer).await);
 
     let older_event_id = projected_row(&valid_older, tenant_id).event_id;
@@ -1207,10 +1208,19 @@ async fn rejects_a_corrupt_latest_event_without_falling_back() {
     assert_eq!(loaded_older, Some(valid_older));
     assert!(tenant_context_is_absent(&reader).await);
 
+    let exact_error = test_reader(&mut reader)
+        .get(tenant_id, invalid_event_id)
+        .await
+        .expect_err("exact read must reject an invalid signature");
+
+    assert_eq!(exact_error, ReadDecisionEventError::StoredEventRejected);
+    assert_redacted(&exact_error);
+    assert!(tenant_context_is_absent(&reader).await);
+
     let error = test_reader(&mut reader)
         .get_latest(tenant_id, decision_id)
         .await
-        .expect_err("corrupt latest event must not fall back to an older version");
+        .expect_err("invalid latest signature must not fall back to an older version");
 
     assert_eq!(error, ReadDecisionEventError::StoredEventRejected);
     assert_redacted(&error);
@@ -1358,6 +1368,29 @@ async fn append_at(
 async fn insert_corrupt_event(client: &mut Client, event: DecisionEvent, tenant_id: &str) {
     let mut row = projected_row(&event, tenant_id);
     row.payload_sha256 = "0".repeat(64);
+    insert_scientific_event_row(client, row).await;
+}
+
+async fn insert_event_with_invalid_signature(
+    client: &mut Client,
+    event: DecisionEvent,
+    tenant_id: &str,
+) {
+    let mut row = projected_row(&event, tenant_id);
+    let signature_value = row
+        .signature
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .expect("projected signature value must be a string");
+    let mut signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_value)
+        .expect("projected signature must use canonical base64url");
+    assert_eq!(signature_bytes.len(), 64);
+    signature_bytes[0] ^= 1;
+    row.signature.insert(
+        "value".to_owned(),
+        serde_json::Value::String(URL_SAFE_NO_PAD.encode(signature_bytes)),
+    );
     insert_scientific_event_row(client, row).await;
 }
 
