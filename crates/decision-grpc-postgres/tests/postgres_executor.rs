@@ -22,8 +22,8 @@ use bioworld_contracts::v2::{
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantScope,
-    get_decision, watch_decision,
+    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantAuthority,
+    TenantScope, get_decision, watch_decision,
 };
 use bioworld_decision_grpc_jwt::{
     BIOWORLD_TENANT_CLAIM, JwtTenantAuthenticator, JwtTenantAuthenticatorConfig,
@@ -180,7 +180,13 @@ impl TenantAuthenticator for TestTenantAuthenticator {
         let result = context
             .extensions()
             .get::<VerifiedTestTenant>()
-            .map(|tenant| tenant.0.to_owned())
+            .map(|tenant| {
+                TenantAuthority::try_new(
+                    tenant.0.to_owned(),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                )
+                .expect("fixed tenant authority must be valid")
+            })
             .ok_or_else(AuthenticateTenantError::rejected);
         Box::pin(async move { result })
     }

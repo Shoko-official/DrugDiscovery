@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    future::{Future, poll_fn},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -20,14 +20,15 @@ use bioworld_contracts::{
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig, TenantAuthenticationContext,
-    TenantAuthenticator, TenantScope, TenantScopedGetDecisionExecutor,
-    TenantScopedGetDecisionFuture,
+    DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig, InvalidTenantAuthority,
+    TenantAuthenticationContext, TenantAuthenticator, TenantAuthority, TenantScope,
+    TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_query::{GetDecisionQuery, GetDecisionRequestExecutionError};
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tonic::{
     Code, Request, Status,
     codegen::{Bytes, Service, http},
@@ -35,6 +36,42 @@ use tonic::{
 
 const DECISION_ID: &str = "018f5a72-9c4b-7d31-8f6a-26f08f3f4d99";
 const SENSITIVE_RESPONSE_MARKER: &str = "sensitive-oversized-response";
+
+fn authority(tenant_id: &str) -> Result<TenantAuthority, InvalidTenantAuthority> {
+    TenantAuthority::try_new(
+        tenant_id.to_owned(),
+        Instant::now() + Duration::from_secs(60),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn tenant_authority_is_validated_opaque_and_time_bounded() {
+    let now = Instant::now();
+    let authority =
+        TenantAuthority::try_new("trusted-tenant".to_owned(), now + Duration::from_secs(5))
+            .expect("valid future tenant authority must be accepted");
+
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    assert_send_sync(&authority);
+    assert_eq!(format!("{authority:?}"), "TenantAuthority");
+
+    for (tenant_id, valid_until) in [
+        (" invalid-sensitive-tenant\0", now + Duration::from_secs(1)),
+        ("sensitive-expired-tenant", now),
+        ("sensitive-past-tenant", now - Duration::from_millis(1)),
+    ] {
+        let error = TenantAuthority::try_new(tenant_id.to_owned(), valid_until)
+            .expect_err("invalid authority must be rejected");
+        assert_eq!(error, InvalidTenantAuthority);
+        assert_eq!(format!("{error:?}"), "InvalidTenantAuthority");
+        assert_eq!(error.to_string(), "tenant authority is invalid");
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(tenant_id));
+    }
+
+    fn assert_error<T: std::error::Error + Send + Sync + Copy>(_: T) {}
+    assert_error(InvalidTenantAuthority);
+}
 
 #[test]
 fn rejects_unsafe_service_configuration_with_a_fixed_error() {
@@ -112,7 +149,7 @@ impl TenantAuthenticator for StaticAuthenticator {
         &'a self,
         _context: TenantAuthenticationContext<'a>,
     ) -> AuthenticateTenantFuture<'a> {
-        Box::pin(async { Ok("trusted-tenant".to_owned()) })
+        Box::pin(async { Ok(authority("trusted-tenant").unwrap()) })
     }
 }
 
@@ -143,14 +180,74 @@ impl TenantAuthenticator for CountingAuthenticator {
         _context: TenantAuthenticationContext<'a>,
     ) -> AuthenticateTenantFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let tenant_id = self.tenant_id.to_owned();
-        Box::pin(async move { Ok(tenant_id) })
+        let authority = authority(self.tenant_id).map_err(|_| AuthenticateTenantError::rejected());
+        Box::pin(async move { authority })
     }
 }
 
 struct TimeoutThenAuthenticate {
     calls: Arc<AtomicUsize>,
     first_dropped: Arc<AtomicBool>,
+}
+
+struct ExpiringThenAuthenticate {
+    calls: Arc<AtomicUsize>,
+}
+
+impl TenantAuthenticator for ExpiringThenAuthenticate {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        _context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        let valid_for = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(60)
+        };
+        let authority =
+            TenantAuthority::try_new("trusted-tenant".to_owned(), Instant::now() + valid_for)
+                .map_err(|_| AuthenticateTenantError::rejected());
+        Box::pin(async move { authority })
+    }
+}
+
+struct ExpiresDuringAuthentication;
+
+impl TenantAuthenticator for ExpiresDuringAuthentication {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        _context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        let authority = TenantAuthority::try_new(
+            "trusted-tenant".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(authority)
+        })
+    }
+}
+
+struct DelayedAuthorityAuthenticator {
+    delay: Duration,
+    valid_for: Duration,
+}
+
+impl TenantAuthenticator for DelayedAuthorityAuthenticator {
+    fn authenticate_tenant<'a>(
+        &'a self,
+        _context: TenantAuthenticationContext<'a>,
+    ) -> AuthenticateTenantFuture<'a> {
+        let delay = self.delay;
+        let valid_for = self.valid_for;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            TenantAuthority::try_new("trusted-tenant".to_owned(), Instant::now() + valid_for)
+                .map_err(|_| AuthenticateTenantError::rejected())
+        })
+    }
 }
 
 impl TenantAuthenticator for TimeoutThenAuthenticate {
@@ -163,7 +260,7 @@ impl TenantAuthenticator for TimeoutThenAuthenticate {
                 dropped: Arc::clone(&self.first_dropped),
             })
         } else {
-            Box::pin(async { Ok("trusted-tenant".to_owned()) })
+            Box::pin(async { Ok(authority("trusted-tenant").unwrap()) })
         }
     }
 }
@@ -173,7 +270,7 @@ struct PendingAuthentication {
 }
 
 impl Future for PendingAuthentication {
-    type Output = Result<String, AuthenticateTenantError>;
+    type Output = Result<TenantAuthority, AuthenticateTenantError>;
 
     fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Pending
@@ -830,6 +927,223 @@ async fn times_out_execution_drops_its_future_and_recovers_capacity() {
         .expect("capacity must recover after execution timeout");
     assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
     assert_eq!(executor_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn authority_expiry_drops_execution_and_recovers_capacity() {
+    let auth_calls = Arc::new(AtomicUsize::new(0));
+    let executor_calls = Arc::new(AtomicUsize::new(0));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let service = Arc::new(DecisionGrpcService::new(
+        ExpiringThenAuthenticate {
+            calls: Arc::clone(&auth_calls),
+        },
+        TimeoutThenExecute {
+            calls: Arc::clone(&executor_calls),
+            first_dropped: Arc::clone(&first_dropped),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(5)).unwrap(),
+    ));
+    let first_service = Arc::clone(&service);
+    let first = tokio::spawn(async move {
+        GeneratedDecisionService::get_decision(first_service.as_ref(), request(DECISION_ID)).await
+    });
+    while executor_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let status = first
+        .await
+        .unwrap()
+        .expect_err("expired tenant authority must stop pending execution");
+
+    assert_public_status(&status, Code::Unauthenticated, "authentication is required");
+    assert!(first_dropped.load(Ordering::SeqCst));
+
+    GeneratedDecisionService::get_decision(service.as_ref(), request(DECISION_ID))
+        .await
+        .expect("capacity must recover after authority expiry");
+    assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(executor_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn authority_expired_during_authentication_never_reaches_execution() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        ExpiresDuringAuthentication,
+        RecordingExecutor {
+            observed: Arc::clone(&observed),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(5)).unwrap(),
+    );
+    let request = GeneratedDecisionService::get_decision(&service, request(DECISION_ID));
+    tokio::pin!(request);
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let status = request
+        .await
+        .expect_err("authority expired during authentication must fail closed");
+
+    assert_public_status(&status, Code::Unauthenticated, "authentication is required");
+    assert!(observed.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn service_deadline_is_fixed_across_authentication_and_execution() {
+    let executor_calls = Arc::new(AtomicUsize::new(0));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let service = DecisionGrpcService::new(
+        DelayedAuthorityAuthenticator {
+            delay: Duration::from_secs(2),
+            valid_for: Duration::from_secs(60),
+        },
+        TimeoutThenExecute {
+            calls: Arc::clone(&executor_calls),
+            first_dropped: Arc::clone(&first_dropped),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(5)).unwrap(),
+    );
+    let mut request = Box::pin(GeneratedDecisionService::get_decision(
+        &service,
+        request(DECISION_ID),
+    ));
+    assert!(
+        poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+            .await
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    while executor_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            poll_fn(|context| {
+                Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+            })
+            .await
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(
+        poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+            .await
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let result = poll_fn(|context| {
+        Poll::Ready(match request.as_mut().poll(context) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+    let status = result
+        .expect("fixed service deadline must be ready at its original instant")
+        .expect_err("fixed service deadline must stop pending execution");
+
+    assert_public_status(
+        &status,
+        Code::DeadlineExceeded,
+        "decision request deadline exceeded",
+    );
+    assert!(first_dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn service_deadline_wins_when_authentication_completes_at_the_same_instant() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let service = DecisionGrpcService::new(
+        DelayedAuthorityAuthenticator {
+            delay: Duration::from_secs(5),
+            valid_for: Duration::from_secs(60),
+        },
+        RecordingExecutor {
+            observed: Arc::clone(&observed),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(5)).unwrap(),
+    );
+    let mut request = Box::pin(GeneratedDecisionService::get_decision(
+        &service,
+        request(DECISION_ID),
+    ));
+    assert!(
+        poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+            .await
+    );
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let result = poll_fn(|context| {
+        Poll::Ready(match request.as_mut().poll(context) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+    let status = result
+        .expect("service deadline must be ready at the shared authentication instant")
+        .expect_err("service deadline must win over simultaneous authentication completion");
+
+    assert_public_status(
+        &status,
+        Code::DeadlineExceeded,
+        "decision request deadline exceeded",
+    );
+    assert!(observed.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn service_deadline_wins_when_equal_to_authority_deadline() {
+    let executor_calls = Arc::new(AtomicUsize::new(0));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let service = DecisionGrpcService::new(
+        DelayedAuthorityAuthenticator {
+            delay: Duration::ZERO,
+            valid_for: Duration::from_secs(5),
+        },
+        TimeoutThenExecute {
+            calls: Arc::clone(&executor_calls),
+            first_dropped: Arc::clone(&first_dropped),
+            response: record(),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(5)).unwrap(),
+    );
+    let mut request = Box::pin(GeneratedDecisionService::get_decision(
+        &service,
+        request(DECISION_ID),
+    ));
+    while executor_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            poll_fn(|context| {
+                Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+            })
+            .await
+        );
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let result = poll_fn(|context| {
+        Poll::Ready(match request.as_mut().poll(context) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+    let status = result
+        .expect("equal deadline must be ready at the shared instant")
+        .expect_err("equal deadline must stop pending execution");
+
+    assert_public_status(
+        &status,
+        Code::DeadlineExceeded,
+        "decision request deadline exceeded",
+    );
+    assert!(first_dropped.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

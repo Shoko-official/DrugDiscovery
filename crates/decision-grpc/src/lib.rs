@@ -17,8 +17,9 @@ mod watch;
 pub use service::{
     AuthenticateTenantError, AuthenticateTenantFuture, DECISION_GRPC_REQUEST_DEADLINE_MESSAGE,
     DecisionGrpcService, DecisionGrpcServiceConfig, InvalidDecisionGrpcServiceConfig,
-    MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS, MAX_DECISION_GRPC_REQUEST_TIMEOUT,
-    TenantAuthenticationContext, TenantAuthenticator,
+    InvalidTenantAuthority, MAX_DECISION_GRPC_IN_FLIGHT_REQUESTS,
+    MAX_DECISION_GRPC_REQUEST_TIMEOUT, TenantAuthenticationContext, TenantAuthenticator,
+    TenantAuthority,
 };
 pub use watch::{MAX_DECISION_EVENT_WIRE_BYTES, TenantScopedWatchDecisionExecutor, watch_decision};
 

@@ -1,5 +1,6 @@
 use std::{
-    future::{Future, poll_fn},
+    collections::VecDeque,
+    future::{Future, pending, poll_fn},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -82,6 +83,33 @@ struct BlockingClock {
     calls: Arc<AtomicU64>,
     gate: BlockingPoolGate,
     now: u64,
+}
+
+#[derive(Clone)]
+struct SequenceClock {
+    timestamps: Arc<Mutex<VecDeque<Option<u64>>>>,
+}
+
+impl SequenceClock {
+    fn new(timestamps: impl IntoIterator<Item = Option<u64>>) -> Self {
+        Self {
+            timestamps: Arc::new(Mutex::new(timestamps.into_iter().collect())),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.timestamps.lock().unwrap().len()
+    }
+}
+
+impl JwtClock for SequenceClock {
+    fn unix_timestamp(&self) -> Option<u64> {
+        self.timestamps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test clock exhausted")
+    }
 }
 
 impl BlockingClock {
@@ -249,6 +277,21 @@ fn access_token_header(key_id: &str) -> Header {
 
 struct RecordingExecutor {
     tenants: Arc<Mutex<Vec<String>>>,
+}
+
+struct ObservedPendingExecutor {
+    calls: Arc<AtomicU64>,
+}
+
+impl TenantScopedGetDecisionExecutor for ObservedPendingExecutor {
+    fn execute_get_decision(
+        &self,
+        _scope: TenantScope,
+        _query: GetDecisionQuery,
+    ) -> TenantScopedGetDecisionFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(pending())
+    }
 }
 
 impl TenantScopedGetDecisionExecutor for RecordingExecutor {
@@ -670,6 +713,450 @@ async fn rejects_noncanonical_duplicate_scope_values() {
     assert!(tenants.lock().unwrap().is_empty());
 }
 
+#[test]
+fn token_expiry_bounds_authorized_execution_before_the_jwks_snapshot() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let mut claims = TestKey::claims(FIXED_NOW, TENANT_ID);
+    claims["exp"] = json!(FIXED_NOW + 30);
+    let token = key.sign(access_token_header(KEY_ID), claims);
+    let clock = FixedClock::new(FIXED_NOW);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 60,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let executor_calls = Arc::new(AtomicU64::new(0));
+    let service = DecisionGrpcService::new(
+        authenticator,
+        ObservedPendingExecutor {
+            calls: Arc::clone(&executor_calls),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(120)).unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut request = Box::pin(GeneratedDecisionService::get_decision(
+            &service,
+            request_with_token(&token),
+        ));
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        while clock.calls() < 3 {
+            tokio::task::yield_now().await;
+        }
+        while executor_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                poll_fn(|context| {
+                    Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+                })
+                .await
+            );
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(28)).await;
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = poll_fn(|context| {
+            Poll::Ready(match request.as_mut().poll(context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        let status = result
+            .expect("token authority must conservatively expire by this instant")
+            .expect_err("token authority must expire before the JWKS snapshot");
+        assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    });
+}
+
+#[test]
+fn jwks_expiry_bounds_authorized_execution_before_the_token() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = FixedClock::new(FIXED_NOW);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 30,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let executor_calls = Arc::new(AtomicU64::new(0));
+    let service = DecisionGrpcService::new(
+        authenticator,
+        ObservedPendingExecutor {
+            calls: Arc::clone(&executor_calls),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(120)).unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut request = Box::pin(GeneratedDecisionService::get_decision(
+            &service,
+            request_with_token(&token),
+        ));
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        while clock.calls() < 3 {
+            tokio::task::yield_now().await;
+        }
+        while executor_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                poll_fn(|context| {
+                    Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+                })
+                .await
+            );
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(28)).await;
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = poll_fn(|context| {
+            Poll::Ready(match request.as_mut().poll(context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        let status = result
+            .expect("JWKS authority must conservatively expire by this instant")
+            .expect_err("JWKS authority must expire before the token");
+        assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    });
+}
+
+#[tokio::test]
+async fn rejects_a_token_that_expires_during_verification() {
+    const FIXED_NOW: u64 = 1_000_000;
+    const TOKEN_EXPIRY: u64 = FIXED_NOW + 300;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), Some(TOKEN_EXPIRY)]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock).unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("token expiring during verification must be rejected");
+
+    assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reports_a_jwks_snapshot_expiring_during_verification_as_unavailable() {
+    const FIXED_NOW: u64 = 1_000_000;
+    const SNAPSHOT_EXPIRY: u64 = FIXED_NOW + 60;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), Some(SNAPSHOT_EXPIRY)]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        SNAPSHOT_EXPIRY,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock).unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("JWKS snapshot expiring during verification must stop authentication");
+
+    assert_unavailable(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reports_completion_clock_failure_as_fixed_unavailable_error() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), None]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock).unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("completion clock failure must stop authentication");
+
+    assert_unavailable(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_token_authority_too_close_for_conservative_conversion() {
+    const FIXED_NOW: u64 = 1_000_000;
+    const TOKEN_EXPIRY: u64 = FIXED_NOW + 300;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), Some(TOKEN_EXPIRY - 1)]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock).unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("subsecond token authority cannot be represented safely");
+
+    assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reports_jwks_authority_too_close_for_conservative_conversion_as_unavailable() {
+    const FIXED_NOW: u64 = 1_000_000;
+    const SNAPSHOT_EXPIRY: u64 = FIXED_NOW + 60;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), Some(SNAPSHOT_EXPIRY - 1)]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        SNAPSHOT_EXPIRY,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock).unwrap();
+    let (service, tenants) = service_with_authenticator(authenticator);
+
+    let status = GeneratedDecisionService::get_decision(&service, request_with_token(&token))
+        .await
+        .expect_err("subsecond JWKS authority cannot be represented safely");
+
+    assert_unavailable(&status, &[&token, TENANT_ID, KEY_ID]);
+    assert!(tenants.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_backward_completion_clock_cannot_extend_authority() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let clock = SequenceClock::new([Some(FIXED_NOW), Some(FIXED_NOW), Some(FIXED_NOW - 100)]);
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let executor_calls = Arc::new(AtomicU64::new(0));
+    let service = DecisionGrpcService::new(
+        authenticator,
+        ObservedPendingExecutor {
+            calls: Arc::clone(&executor_calls),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(300)).unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut request = Box::pin(GeneratedDecisionService::get_decision(
+            &service,
+            request_with_token(&token),
+        ));
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        while clock.remaining() != 0 {
+            tokio::task::yield_now().await;
+        }
+        while executor_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                poll_fn(|context| {
+                    Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+                })
+                .await
+            );
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(298)).await;
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = poll_fn(|context| {
+            Poll::Ready(match request.as_mut().poll(context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        let status = result
+            .expect("initial clock sample must cap authority despite clock regression")
+            .expect_err("regressed clock must not extend token authority");
+        assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    });
+}
+
+#[test]
+fn a_stalled_verification_clock_cannot_pause_authority_time() {
+    const FIXED_NOW: u64 = 1_000_000;
+
+    let key = TestKey::generate(KEY_ID);
+    let token = key.token(FIXED_NOW, TENANT_ID);
+    let gate = BlockingPoolGate::new();
+    let release = GateRelease(gate.clone());
+    let clock = BlockingClock::new(FIXED_NOW, gate.clone());
+    let config = JwtTenantAuthenticatorConfig::try_new(
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        REQUIRED_SCOPE.to_owned(),
+        FIXED_NOW + 3_600,
+        1,
+    )
+    .unwrap();
+    let authenticator =
+        JwtTenantAuthenticator::try_from_jwks_with_clock(config, &jwks(&[&key]), clock.clone())
+            .unwrap();
+    let executor_calls = Arc::new(AtomicU64::new(0));
+    let service = DecisionGrpcService::new(
+        authenticator,
+        ObservedPendingExecutor {
+            calls: Arc::clone(&executor_calls),
+        },
+        DecisionGrpcServiceConfig::try_new(1, Duration::from_secs(300)).unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut request = Box::pin(GeneratedDecisionService::get_decision(
+            &service,
+            request_with_token(&token),
+        ));
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        wait_for_gate(&gate).await;
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+        release.0.release();
+        while clock.calls.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        while executor_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                poll_fn(|context| {
+                    Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending))
+                })
+                .await
+            );
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(198)).await;
+        assert!(
+            poll_fn(|context| Poll::Ready(matches!(request.as_mut().poll(context), Poll::Pending)))
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = poll_fn(|context| {
+            Poll::Ready(match request.as_mut().poll(context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        let status = result
+            .expect("clock stall must consume the original monotonic authority budget")
+            .expect_err("stalled clock must not extend token authority");
+        assert_unauthenticated(&status, &[&token, TENANT_ID, KEY_ID]);
+    });
+}
+
 #[tokio::test]
 async fn rejects_a_key_snapshot_at_its_exact_expiry() {
     const FIXED_NOW: u64 = 1_000_000;
@@ -795,7 +1282,7 @@ fn cancelling_queued_crypto_prevents_orphan_verification() {
         ))
         .expect("capacity must recover after queued crypto cancellation");
 
-    assert_eq!(clock.calls(), 2);
+    assert_eq!(clock.calls(), 3);
     assert_eq!(*tenants.lock().unwrap(), vec![TENANT_ID.to_owned()]);
 }
 

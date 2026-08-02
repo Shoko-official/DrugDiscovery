@@ -20,8 +20,8 @@ use bioworld_contracts::{
 };
 use bioworld_decision_grpc::{
     AuthenticateTenantError, AuthenticateTenantFuture, DecisionGrpcService,
-    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantScope,
-    TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
+    DecisionGrpcServiceConfig, TenantAuthenticationContext, TenantAuthenticator, TenantAuthority,
+    TenantScope, TenantScopedGetDecisionExecutor, TenantScopedGetDecisionFuture,
 };
 use bioworld_decision_grpc_client::{
     AccessToken, AccessTokenFuture, AccessTokenProvider, AccessTokenProviderError,
@@ -117,7 +117,11 @@ impl TenantAuthenticator for ExactAuthenticator {
             .is_some_and(|value| value == format!("Bearer {ACCESS_TOKEN}"));
         Box::pin(async move {
             if accepted {
-                Ok("tenant-a".to_owned())
+                Ok(TenantAuthority::try_new(
+                    "tenant-a".to_owned(),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                )
+                .expect("fixed tenant authority must be valid"))
             } else {
                 Err(AuthenticateTenantError::rejected())
             }
